@@ -161,11 +161,14 @@ mod tests {
     use tower::ServiceExt; // for `oneshot`
 
     fn facilitator() -> Arc<Facilitator> {
-        Arc::new(Facilitator::new(
-            VerificationMode::StubAcceptAll,
-            "https://fullnode.testnet.sui.io:443".into(),
-            "sui:testnet".into(),
-        ))
+        Arc::new(
+            Facilitator::new(
+                VerificationMode::StubAcceptAll,
+                "https://fullnode.testnet.sui.io:443".into(),
+                "sui:testnet".into(),
+            )
+            .expect("stub mode never connects"),
+        )
     }
 
     fn requirements() -> PaymentRequirements {
@@ -317,11 +320,14 @@ mod tests {
 
     #[tokio::test]
     async fn sui_grpc_mode_reports_invalid_rather_than_verifying() {
-        let facilitator = Arc::new(Facilitator::new(
-            VerificationMode::SuiGrpc,
-            "https://fullnode.testnet.sui.io:443".into(),
-            "sui:testnet".into(),
-        ));
+        let facilitator = Arc::new(
+            Facilitator::new(
+                VerificationMode::SuiGrpc,
+                "https://fullnode.testnet.sui.io:443".into(),
+                "sui:testnet".into(),
+            )
+            .expect("connecting is lazy; the channel is not dialed until first use"),
+        );
         let response = router(facilitator)
             .oneshot(
                 Request::builder()

@@ -10,6 +10,7 @@ mod ext_proc;
 mod facilitator_api;
 mod ratelimit;
 mod session;
+mod sui;
 mod util;
 mod x402;
 
@@ -73,7 +74,8 @@ async fn main() -> Result<()> {
         config.verification_mode,
         config.sui_grpc_url.clone(),
         config.payment.network.clone(),
-    );
+    )
+    .with_context(|| format!("connecting to the Sui fullnode at {}", config.sui_grpc_url))?;
     // Connect the state store up front so a bad Redis URL fails at boot rather
     // than on the first paying request.
     let (sessions, limiter) = match config.store.backend {

@@ -362,8 +362,27 @@ pub enum FacilitatorError {
     Replay { first_seen: u64 },
     #[error("the replay cache is unavailable; refusing the payment")]
     ReplayCacheUnavailable,
-    #[error("on-chain verification is not implemented yet (verification_mode: sui-grpc)")]
-    NotImplemented,
+    #[error("could not reach the Sui fullnode: {detail}")]
+    Rpc { detail: String },
+    #[error("signature is not valid over the transaction: {detail}")]
+    InvalidSignature { detail: String },
+    #[error("transaction would not execute: {detail}")]
+    SimulationFailed { detail: String },
+    #[error("settlement failed on chain: {detail}")]
+    SettlementFailed { detail: String },
+    #[error("payment requirements are unusable: {detail}")]
+    InvalidRequirements { detail: String },
+    #[error(
+        "transaction credits {pay_to} with {credited} of {asset}, but the resource costs exactly {expected}"
+    )]
+    AmountNotCredited {
+        expected: String,
+        credited: String,
+        pay_to: String,
+        asset: String,
+    },
+    #[error("the payment authorization has expired (first seen {first_seen}, window {window}s)")]
+    AuthorizationExpired { first_seen: u64, window: u64 },
 }
 
 impl FacilitatorError {
@@ -392,19 +411,32 @@ impl FacilitatorError {
             // Closest §9 code: a replayed authorization would be rejected by
             // the chain as already-executed. See docs/spec-gaps.md.
             FacilitatorError::Replay { .. } => "invalid_transaction_state",
-            FacilitatorError::ReplayCacheUnavailable | FacilitatorError::NotImplemented => {
+            FacilitatorError::ReplayCacheUnavailable | FacilitatorError::Rpc { .. } => {
                 "unexpected_verify_error"
             }
+            // No Sui analogue of invalid_exact_evm_payload_signature exists.
+            FacilitatorError::InvalidSignature { .. } => "invalid_payload",
+            // A simulation that fails covers "would not execute" and the
+            // already-executed case alike.
+            FacilitatorError::SimulationFailed { .. } => "invalid_transaction_state",
+            FacilitatorError::SettlementFailed { .. } => "unexpected_settle_error",
+            // The step-4 failure — wrong recipient, wrong asset, wrong amount.
+            // §9's equivalents are all EVM-named, so this is the generic code.
+            FacilitatorError::InvalidRequirements { .. }
+            | FacilitatorError::AmountNotCredited { .. } => "invalid_payment_requirements",
+            // EVM gets validAfter/validBefore codes; Sui cannot enforce a
+            // second-granularity window on chain at all. See docs/spec-gaps.md.
+            FacilitatorError::AuthorizationExpired { .. } => "invalid_transaction_state",
         }
     }
 }
 
 /// Verifies and settles x402 payments.
 ///
-/// Today this is a protocol-plumbing stub. The real implementation maps onto
-/// the Sui fullnode gRPC v2 API — Sui fullnodes have removed JSON-RPC, so gRPC
-/// is the only path. The four verification steps in `scheme_exact_sui.md` map
-/// as follows:
+/// Two modes. `stub-accept-all` performs the structural checks only and moves
+/// no funds; `sui-grpc` delegates to [`crate::sui::SuiVerifier`], which runs the
+/// four `scheme_exact_sui.md` steps against a fullnode. Sui fullnodes have
+/// removed JSON-RPC, so gRPC is the only path. The steps map as follows:
 ///
 /// | Scheme step | Sui gRPC call |
 /// |---|---|
@@ -416,18 +448,28 @@ impl FacilitatorError {
 #[derive(Debug, Clone)]
 pub struct Facilitator {
     mode: VerificationMode,
-    #[allow(dead_code)] // Consumed by the sui-grpc implementation.
-    grpc_url: String,
     network: String,
+    /// Present only in `sui-grpc` mode. Its absence is what makes stub mode
+    /// structurally incapable of touching the chain.
+    sui: Option<crate::sui::SuiVerifier>,
 }
 
 impl Facilitator {
-    pub fn new(mode: VerificationMode, grpc_url: String, network: String) -> Self {
-        Self {
-            mode,
-            grpc_url,
-            network,
-        }
+    /// Build a facilitator. Connects to the fullnode in `sui-grpc` mode, so a
+    /// bad URL fails at startup rather than on the first paying request.
+    pub fn new(
+        mode: VerificationMode,
+        grpc_url: String,
+        network: String,
+    ) -> Result<Self, FacilitatorError> {
+        let sui = match mode {
+            VerificationMode::StubAcceptAll => None,
+            VerificationMode::SuiGrpc => Some(crate::sui::SuiVerifier::connect(
+                &grpc_url,
+                network.clone(),
+            )?),
+        };
+        Ok(Self { mode, network, sui })
     }
 
     /// Validate a payment and, on success, move funds.
@@ -459,9 +501,19 @@ impl Facilitator {
     ) -> Result<String, FacilitatorError> {
         let sui = self.check_terms(payload, requirements)?;
 
-        match self.mode {
-            VerificationMode::StubAcceptAll => Ok(stub_payer(&sui.transaction)),
-            VerificationMode::SuiGrpc => Err(FacilitatorError::NotImplemented),
+        match (&self.mode, &self.sui) {
+            (VerificationMode::StubAcceptAll, _) => Ok(stub_payer(&sui.transaction)),
+            (VerificationMode::SuiGrpc, Some(verifier)) => {
+                let verified: crate::sui::VerifiedPayment =
+                    verifier.verify(&sui, requirements).await?;
+                Ok(verified.payer)
+            }
+            // Unreachable: `new` always builds a verifier in sui-grpc mode.
+            // Failing closed rather than unwrapping keeps a future refactor
+            // from silently turning this into "accept everything".
+            (VerificationMode::SuiGrpc, None) => Err(FacilitatorError::Rpc {
+                detail: "sui-grpc mode selected but no fullnode client was built".into(),
+            }),
         }
     }
 
@@ -499,7 +551,28 @@ impl Facilitator {
                     extensions: None,
                 })
             }
-            VerificationMode::SuiGrpc => Err(FacilitatorError::NotImplemented),
+            VerificationMode::SuiGrpc => {
+                let verifier = self.sui.as_ref().ok_or_else(|| FacilitatorError::Rpc {
+                    detail: "sui-grpc mode selected but no fullnode client was built".into(),
+                })?;
+
+                // Verify before broadcasting. The scheme's settle step assumes
+                // verification already passed, but /settle is a public endpoint
+                // that can be called directly, so it must not be a way to get
+                // an unchecked transaction broadcast.
+                let verified = verifier.verify(&sui, requirements).await?;
+                let digest = verifier.settle(&sui).await?;
+
+                Ok(SettlementResponse {
+                    success: true,
+                    error_reason: None,
+                    payer: Some(verified.payer),
+                    transaction: digest,
+                    network: self.network.clone(),
+                    amount: Some(requirements.amount.clone()),
+                    extensions: None,
+                })
+            }
         }
     }
 
@@ -511,6 +584,18 @@ impl Facilitator {
         payload: &PaymentPayload,
         requirements: &PaymentRequirements,
     ) -> Result<SuiExactPayload, FacilitatorError> {
+        // Step 1 of scheme_exact_sui.md: the network must be the chain THIS
+        // facilitator serves. Comparing only the payload against the supplied
+        // requirements is not enough — on /verify and /settle the caller
+        // supplies both, so they trivially agree with each other while naming
+        // a chain we have no client for.
+        if requirements.network != self.network {
+            return Err(FacilitatorError::NetworkMismatch {
+                got: requirements.network.clone(),
+                expected: self.network.clone(),
+            });
+        }
+
         if payload.x402_version != X402_VERSION {
             return Err(FacilitatorError::VersionMismatch {
                 got: payload.x402_version,
@@ -792,6 +877,7 @@ mod tests {
             "https://fullnode.testnet.sui.io:443".into(),
             "sui:testnet".into(),
         )
+        .expect("stub mode never connects")
     }
 
     // ---- Header codec ----------------------------------------------------
@@ -909,6 +995,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_caller_cannot_name_a_chain_this_facilitator_does_not_serve() {
+        // On /verify and /settle the CALLER supplies both the payload and the
+        // requirements, so checking them only against each other lets any
+        // chain through. The facilitator's own network is the authority.
+        let mut requirements = requirements();
+        requirements.network = "sui:mainnet".into();
+        let mut p = payload();
+        p.accepted.network = "sui:mainnet".into();
+
+        // Internally consistent, and still refused.
+        let err = stub()
+            .verify_and_settle(&p, &requirements)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), "invalid_network", "got: {err}");
+    }
+
+    #[tokio::test]
     async fn stub_still_rejects_version_mismatch() {
         let mut p = payload();
         p.x402_version = 1;
@@ -951,19 +1055,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sui_grpc_mode_refuses_rather_than_falling_back_to_stub() {
-        // The critical safety property: selecting the real mode before it
-        // exists must deny payments, never silently accept them.
+    async fn sui_grpc_mode_never_accepts_a_stub_shaped_payload() {
+        // The critical safety property, restated now that sui-grpc is real:
+        // placeholder bytes that stub mode happily accepts must be refused,
+        // so the two modes can never be confused for one another.
+        //
+        // No network call happens — "dHg=" is not valid BCS TransactionData,
+        // so this fails at parse time.
         let facilitator = Facilitator::new(
             VerificationMode::SuiGrpc,
             "https://fullnode.testnet.sui.io:443".into(),
             "sui:testnet".into(),
+        )
+        .expect("connecting is lazy");
+
+        // Stub mode accepts exactly this payload.
+        assert!(
+            stub()
+                .verify_and_settle(&payload(), &requirements())
+                .await
+                .is_ok()
         );
+
         let err = facilitator
             .verify_and_settle(&payload(), &requirements())
             .await
             .unwrap_err();
-        assert!(matches!(err, FacilitatorError::NotImplemented));
+        assert_eq!(err.code(), "invalid_payload", "got: {err}");
     }
 
     #[test]
@@ -1029,7 +1147,23 @@ mod tests {
             },
             FacilitatorError::EmptyTransaction,
             FacilitatorError::MissingSignature,
-            FacilitatorError::NotImplemented,
+            FacilitatorError::Replay { first_seen: 0 },
+            FacilitatorError::ReplayCacheUnavailable,
+            FacilitatorError::Rpc { detail: "x".into() },
+            FacilitatorError::InvalidSignature { detail: "x".into() },
+            FacilitatorError::SimulationFailed { detail: "x".into() },
+            FacilitatorError::SettlementFailed { detail: "x".into() },
+            FacilitatorError::InvalidRequirements { detail: "x".into() },
+            FacilitatorError::AmountNotCredited {
+                expected: "1000".into(),
+                credited: "0".into(),
+                pay_to: "0xabc".into(),
+                asset: "0xa1::usdc::USDC".into(),
+            },
+            FacilitatorError::AuthorizationExpired {
+                first_seen: 0,
+                window: 60,
+            },
         ];
 
         for e in all {

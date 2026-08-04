@@ -258,15 +258,27 @@ impl X402Auth {
             // without this one signature mints unlimited sessions in stub mode,
             // and races to mint several even with real settlement.
             if let Some(id) = x402::payment_id(&payload) {
-                let claim = self
-                    .state
-                    .sessions
-                    .claim_payment(&id, requirements.max_timeout_seconds)
-                    .await;
+                // Hold the claim for longer than the advertised window, so the
+                // authorization stays blocked after it has also expired. With
+                // ttl == window the record would lapse at exactly the moment
+                // the payment became replayable again.
+                let ttl = replay_ttl(requirements.max_timeout_seconds);
+                let claim = self.state.sessions.claim_payment(&id, ttl).await;
                 if let Some(error) = match claim {
                     PaymentClaim::Fresh => None,
                     PaymentClaim::Replay { first_seen } => {
-                        Some(x402::FacilitatorError::Replay { first_seen })
+                        // Distinguish the two reasons a second sighting is
+                        // refused: still inside the window it is a replay,
+                        // past it the authorization has simply expired.
+                        let age = crate::util::now_epoch_secs().saturating_sub(first_seen);
+                        if age > requirements.max_timeout_seconds {
+                            Some(x402::FacilitatorError::AuthorizationExpired {
+                                first_seen,
+                                window: requirements.max_timeout_seconds,
+                            })
+                        } else {
+                            Some(x402::FacilitatorError::Replay { first_seen })
+                        }
                     }
                     // Fail closed: an unreachable cache must not become an
                     // unlimited-replay window.
@@ -634,6 +646,24 @@ fn resource_url(
     format!("{scheme}://{}{}", http.host, http.path)
 }
 
+/// How long a payment stays claimed, given the advertised timeout.
+///
+/// Longer than the window on purpose, and never shorter than a floor: the claim
+/// is what actually prevents a signed authorization being spent twice, and
+/// `maxTimeoutSeconds` can be advertised as low as a second or two.
+///
+/// This is single-use enforcement, which is *stricter* than the time window the
+/// spec describes — and it has to be, because Sui cannot enforce a
+/// second-granularity expiry on chain at all (see `docs/spec-gaps.md`). The
+/// chain's own object-version replay protection only binds once settlement
+/// lands, so before that this cache is the only thing standing between one
+/// signature and N sessions.
+fn replay_ttl(max_timeout_seconds: u64) -> u64 {
+    const FLOOR: u64 = 300;
+    const MULTIPLIER: u64 = 10;
+    max_timeout_seconds.saturating_mul(MULTIPLIER).max(FLOOR)
+}
+
 /// Percent-encode a `grpc-message` value.
 ///
 /// The gRPC spec restricts this header to printable ASCII with `%` escaped;
@@ -796,11 +826,14 @@ pub mod test_support {
             store: StoreConfig::default(),
             session_hmac_secret: "ab".repeat(32),
         };
-        let facilitator = Arc::new(Facilitator::new(
-            config.verification_mode,
-            config.sui_grpc_url.clone(),
-            config.payment.network.clone(),
-        ));
+        let facilitator = Arc::new(
+            Facilitator::new(
+                config.verification_mode,
+                config.sui_grpc_url.clone(),
+                config.payment.network.clone(),
+            )
+            .expect("stub mode never connects"),
+        );
         let sessions = SessionStore::Memory(MemorySessionStore::new(
             config.hmac_key().unwrap(),
             config.paid_tier.duration_secs,
@@ -1207,6 +1240,16 @@ mod tests {
             receipt.unwrap().error_reason.as_deref(),
             Some("invalid_transaction_state")
         );
+    }
+
+    #[test]
+    fn the_replay_claim_outlives_the_advertised_window() {
+        // If the claim lapsed exactly when the window did, the authorization
+        // would become replayable at the same instant it expired.
+        assert!(replay_ttl(60) > 60);
+        // And a very short advertised timeout must not produce a useless TTL.
+        assert!(replay_ttl(1) >= 300);
+        assert!(replay_ttl(0) >= 300);
     }
 
     #[tokio::test]

@@ -27,12 +27,32 @@ the chain being paid on are the same network.
 | HMAC session tokens, quota + TTL | Working |
 | Per-route pricing and wallets | Working |
 | Redis backend for multi-replica deployments | Working, integration-tested |
-| **On-chain verification and settlement** | **Not implemented** — see below |
+| On-chain verification (`sui-grpc`) | **Working**, validated against live testnet |
+| On-chain settlement | Implemented; broadcast path not yet exercised on testnet |
 
-`verification_mode: stub-accept-all` accepts any well-formed payment **without
-touching the chain and without moving funds**. It exists to develop the protocol
-plumbing. `sui-grpc` is the real mode; it currently rejects every payment rather
-than silently falling back to the stub. Nothing here has custody of anything yet.
+Two verification modes:
+
+- `stub-accept-all` — accepts any well-formed payment **without touching the
+  chain and without moving funds**. For protocol work. Receipts say
+  `stub-not-settled-on-chain` so they can never be mistaken for evidence.
+- `sui-grpc` — runs all four `scheme_exact_sui.md` verification steps against a
+  fullnode. The payer is **recovered from the signature**, never taken from a
+  client-supplied field.
+
+Validated against live Sui testnet with a real wallet-signed transfer of
+0.00001 USDC:
+
+```
+honest payment                     isValid: true,  payer: 0x83cb…
+tampered signature (byte flipped)  isValid: false, invalid_payload
+chain we do not serve              isValid: false, invalid_network
+server wants more than tx pays     isValid: false, invalid_payment_requirements
+server wants a different payee     isValid: false, invalid_payment_requirements
+```
+
+Reproduce with `scripts/pay-with-sui-cli.sh`, which builds and signs a real
+transfer using your `sui` CLI wallet. It calls `/verify` (simulation only, no
+funds move) unless you pass `--settle`.
 
 ## Quick start
 
@@ -274,6 +294,13 @@ than as an undocumented header: `PaymentRequired.extensions` carries an `info`
 and a JSON `schema`, a settled payment returns the token in the receipt's
 `extensions`, and a client may echo it back the same way. The raw
 `x-payment-session` header still works as a deprecated alias.
+
+### What still has custody of nothing
+
+`/supported` reports an empty `signers` map, and the service holds no keys. It
+never signs anything: the client signs, and settlement re-broadcasts what the
+client already signed. Sponsorship — which *would* require a funded hot wallet —
+is advertised only, never performed.
 
 ### Out of scope
 
