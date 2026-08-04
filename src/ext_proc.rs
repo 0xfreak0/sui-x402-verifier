@@ -171,6 +171,60 @@ fn parse_host(address: &str) -> Option<IpAddr> {
         .ok()
 }
 
+/// Extract the x402 policy name Envoy attached to the matched route.
+///
+/// `ext_authz` has `context_extensions` for exactly this; `ext_proc` does not —
+/// `ExtProcPerRoute` can only override the processing mode, and its
+/// `request_attributes` override is marked not-implemented upstream. The
+/// available channel is route metadata, requested as the `xds.route_metadata`
+/// attribute.
+///
+/// Envoy delivers it as a protobuf **TextFormat string**, not a structured
+/// value, so it has to be parsed:
+///
+/// ```text
+/// filter_metadata { key: "envoy.filters.http.ext_proc" value {
+///   fields { key: "x402_policy" value { string_value: "graphql" } } } }
+/// ```
+///
+/// Returning `None` falls back to the default payment terms, which is safe (the
+/// resource is still paid for) but may under-price a route, so the caller logs
+/// when a policy was expected. Getting this wrong is not hypothetical: this
+/// function exists because per-route pricing silently regressed to the base
+/// price when ext_proc replaced ext_authz as the default filter.
+fn policy_from_attributes(
+    attributes: &std::collections::HashMap<String, envoy_types::pb::google::protobuf::Struct>,
+) -> Option<String> {
+    use envoy_types::pb::google::protobuf::value::Kind;
+
+    let metadata = attributes.values().find_map(|s| {
+        match s
+            .fields
+            .get("xds.route_metadata")
+            .and_then(|v| v.kind.as_ref())
+        {
+            Some(Kind::StringValue(text)) => Some(text.as_str()),
+            _ => None,
+        }
+    })?;
+
+    parse_policy_from_text_format(metadata)
+}
+
+/// Pull `x402_policy`'s string value out of Envoy's TextFormat metadata dump.
+///
+/// Deliberately narrow: it looks for the `x402_policy` key and takes the next
+/// `string_value`, rather than attempting to parse TextFormat in general.
+fn parse_policy_from_text_format(text: &str) -> Option<String> {
+    let after_key = text.split("key: \"x402_policy\"").nth(1)?;
+    let after_marker = after_key.split("string_value:").nth(1)?;
+    let opening = after_marker.find('"')? + 1;
+    let rest = &after_marker[opening..];
+    let closing = rest.find('"')?;
+    let value = &rest[..closing];
+    (!value.is_empty()).then(|| value.to_string())
+}
+
 /// Was the upstream response a success?
 ///
 /// Only a 2xx justifies charging: the client got what they paid for. Anything
@@ -203,10 +257,18 @@ impl ExternalProcessor for X402ExtProc {
                 // Attributes ride on the ProcessingRequest, not on the header
                 // message, so capture them before matching.
                 let client_ip = client_ip_from_attributes(&message.attributes);
+                let policy = policy_from_attributes(&message.attributes);
 
                 let reply = match message.request {
                     Some(processing_request::Request::RequestHeaders(headers)) => {
-                        handle_request_headers(&state, &mut stream_state, headers, client_ip).await
+                        handle_request_headers(
+                            &state,
+                            &mut stream_state,
+                            headers,
+                            client_ip,
+                            policy.clone(),
+                        )
+                        .await
                     }
                     Some(processing_request::Request::ResponseHeaders(headers)) => {
                         handle_response_headers(&state, &mut stream_state, headers).await
@@ -233,6 +295,7 @@ async fn handle_request_headers(
     stream_state: &mut StreamState,
     headers: envoy_types::pb::envoy::service::ext_proc::v3::HttpHeaders,
     client_ip: Option<IpAddr>,
+    policy: Option<String>,
 ) -> ProcessingResponse {
     let map = header_map(headers.headers.as_ref());
     let view = HeaderView::new(Some(&map));
@@ -250,10 +313,8 @@ async fn handle_request_headers(
         format!("{scheme}://{authority}{path}")
     };
 
-    let policy = None; // context_extensions are an ext_authz concept.
-
     let decision = X402Decider { state }
-        .decide(&view, client_ip, &path, policy, &resource_url)
+        .decide(&view, client_ip, &path, policy.as_deref(), &resource_url)
         .await;
 
     match decision {
@@ -440,6 +501,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn policy_is_parsed_out_of_envoy_text_format_metadata() {
+        // The exact shape Envoy 1.39 sends for xds.route_metadata.
+        let text = r#"filter_metadata { key: "envoy.filters.http.ext_proc" value { fields { key: "x402_policy" value { string_value: "graphql" } } } } "#;
+        assert_eq!(
+            parse_policy_from_text_format(text).as_deref(),
+            Some("graphql")
+        );
+
+        let grpc = text.replace("graphql", "grpc");
+        assert_eq!(
+            parse_policy_from_text_format(&grpc).as_deref(),
+            Some("grpc")
+        );
+
+        // Absent, empty, or unrelated metadata must fall back to None rather
+        // than inventing a policy name.
+        assert_eq!(parse_policy_from_text_format(""), None);
+        assert_eq!(
+            parse_policy_from_text_format(r#"filter_metadata { key: "other" }"#),
+            None
+        );
+        assert_eq!(
+            parse_policy_from_text_format(r#"key: "x402_policy" value { string_value: "" }"#),
+            None
+        );
+    }
+    #[test]
     fn only_2xx_justifies_charging() {
         assert!(is_success("200"));
         assert!(is_success("204"));
@@ -520,7 +608,7 @@ mod tests {
         // regardless of what the client claimed in XFF.
         let state = crate::auth::test_support::app_state(100, 10);
         let mut stream_state = StreamState::default();
-        let reply = handle_request_headers(&state, &mut stream_state, headers, None).await;
+        let reply = handle_request_headers(&state, &mut stream_state, headers, None, None).await;
 
         assert!(
             matches!(

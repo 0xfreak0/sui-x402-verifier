@@ -87,6 +87,10 @@ static_resources:
                             # "localhost:10000".
                             host_rewrite_literal: fullnode.testnet.sui.io
                             timeout: 30s
+                          metadata:
+                            filter_metadata:
+                              envoy.filters.http.ext_proc:
+                                x402_policy: grpc
                           # Tell the verifier which pricing policy this route
                           # uses. Envoy stays the single source of truth for
                           # the route table; the verifier only knows what the
@@ -105,6 +109,10 @@ static_resources:
                             cluster: sui_graphql
                             host_rewrite_literal: graphql.testnet.sui.io
                             timeout: 30s
+                          metadata:
+                            filter_metadata:
+                              envoy.filters.http.ext_proc:
+                                x402_policy: graphql
                           typed_per_filter_config:
                             envoy.filters.http.ext_authz:
                               "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute
@@ -195,6 +203,8 @@ static_resources:
                       # per source IP. Ask for it explicitly.
                       request_attributes:
                         - source.address
+                        - xds.route_name
+                        - xds.route_metadata
                       grpc_service:
                         envoy_grpc:
                           cluster_name: x402_verifier
