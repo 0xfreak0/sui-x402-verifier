@@ -143,7 +143,14 @@ function log(status, note) {
   const cls = status === 200 ? 's200' : status === 402 ? 's402' : 'sErr';
   const line = document.createElement('div');
   const stamp = new Date().toLocaleTimeString();
-  line.innerHTML = `<span class="${cls}">${status}</span> · ${stamp} · ${note}`;
+
+  // `note` can contain upstream response text, so it is inserted as TEXT.
+  // Building this with innerHTML made any upstream able to script this page.
+  const badge = document.createElement('span');
+  badge.className = cls;
+  badge.textContent = status;
+  line.append(badge, document.createTextNode(` · ${stamp} · ${note}`));
+
   $('log').prepend(line);
 }
 

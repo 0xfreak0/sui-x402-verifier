@@ -8,9 +8,30 @@
 //! request timestamps.
 
 use dashmap::DashMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv6Addr};
 
 use crate::util::now_epoch_secs;
+
+/// Collapse an address to the unit the free tier is metered on.
+///
+/// IPv4 is metered per address. IPv6 is metered per **/64**, because a typical
+/// IPv6 client is *delegated* a /64 or shorter and can mint fresh addresses at
+/// will — metering per address there is not rate limiting, it is an invitation
+/// to iterate. /64 is the smallest block an end host is normally given, so it
+/// is the smallest unit that means anything.
+///
+/// The tradeoff is deliberate: several users behind one /64 share a bucket.
+/// That is the same property IPv4 NAT already has, and under-counting a
+/// determined attacker is worse than over-counting a shared network.
+fn bucket(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(_) => ip,
+        IpAddr::V6(v6) => {
+            let s = v6.segments();
+            IpAddr::V6(Ipv6Addr::new(s[0], s[1], s[2], s[3], 0, 0, 0, 0))
+        }
+    }
+}
 
 /// Per-key counters for the current and preceding window.
 #[derive(Debug, Clone, Copy)]
@@ -89,6 +110,7 @@ impl MemoryRateLimiter {
 
     /// Clock-injected variant of [`Self::check`].
     fn check_at(&self, ip: IpAddr, now: u64) -> bool {
+        let ip = bucket(ip);
         // Align to fixed window boundaries so all keys roll over together and
         // the weighting math below stays simple.
         let window_start = now - (now % self.window_secs);
@@ -171,6 +193,7 @@ impl RedisRateLimiter {
     }
 
     async fn check_at(&self, ip: IpAddr, now: u64) -> bool {
+        let ip = bucket(ip);
         let window_start = now - (now % self.window_secs);
         let previous_start = window_start.saturating_sub(self.window_secs);
 
@@ -246,6 +269,33 @@ mod tests {
     const NOW: u64 = 1_700_000_040;
     fn ip(last: u8) -> IpAddr {
         IpAddr::from([10, 0, 0, last])
+    }
+
+    #[test]
+    fn ipv6_clients_cannot_reset_the_free_tier_by_rotating_addresses() {
+        // A typical IPv6 host is delegated a /64, so per-address metering lets
+        // it iterate its way to an unlimited free tier.
+        let rl = MemoryRateLimiter::new(2, 60);
+        let a: IpAddr = "2001:db8:1:2::1".parse().unwrap();
+        let b: IpAddr = "2001:db8:1:2::9999".parse().unwrap(); // same /64
+        let c: IpAddr = "2001:db8:1:3::1".parse().unwrap(); // different /64
+
+        assert!(rl.check_at(a, NOW));
+        assert!(rl.check_at(b, NOW));
+        assert!(
+            !rl.check_at(b, NOW),
+            "a fresh address in the same /64 must not get a fresh allowance"
+        );
+        // A genuinely different network is a different bucket.
+        assert!(rl.check_at(c, NOW));
+    }
+
+    #[test]
+    fn ipv4_is_still_metered_per_address() {
+        let rl = MemoryRateLimiter::new(1, 60);
+        assert!(rl.check_at(ip(1), NOW));
+        assert!(!rl.check_at(ip(1), NOW));
+        assert!(rl.check_at(ip(2), NOW));
     }
 
     #[test]

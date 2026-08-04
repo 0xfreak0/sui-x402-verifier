@@ -702,13 +702,23 @@ impl Facilitator {
 /// caller will reject for other reasons anyway.
 pub fn payment_id(payload: &PaymentPayload) -> Option<String> {
     let sui: SuiExactPayload = serde_json::from_value(payload.payload.clone()).ok()?;
-    Some(hex::encode(Sha256::digest(sui.transaction.as_bytes())))
+    // Hash the DECODED bytes, not the base64 text. The verifier trims before
+    // decoding, so "AAAA" and "AAAA " are the same transaction — hashing the
+    // text gave them different replay keys, and a client could mint unlimited
+    // sessions from one payment just by varying whitespace.
+    let bytes = B64.decode(sui.transaction.trim()).ok()?;
+    Some(hex::encode(Sha256::digest(&bytes)))
 }
 
 /// Deterministic placeholder payer for stub mode. Never a real Sui address.
+///
+/// Canonicalised the same way as [`payment_id`], so whitespace variants of one
+/// transaction map to one pseudo-payer rather than several.
 fn stub_payer(transaction_b64: &str) -> String {
-    let digest = Sha256::digest(transaction_b64.as_bytes());
-    format!("0x{}", hex::encode(digest))
+    let canonical = B64
+        .decode(transaction_b64.trim())
+        .unwrap_or_else(|_| transaction_b64.trim().as_bytes().to_vec());
+    format!("0x{}", hex::encode(Sha256::digest(&canonical)))
 }
 
 #[cfg(test)]
@@ -817,6 +827,27 @@ mod tests {
             session_token_from_extensions(Some(&serde_json::json!({"other": {}}))),
             None
         );
+    }
+
+    #[test]
+    fn payment_id_is_canonical_across_encoding_whitespace() {
+        // The bypass this closes: the verifier trims before decoding, so these
+        // are the SAME transaction. Hashing the base64 text gave them
+        // different replay keys, making replay protection opt-out.
+        let base = payload();
+        let mut spaced = payload();
+        spaced.payload = serde_json::json!({ "signature": "c2ln", "transaction": " dHg= " });
+        let mut newline = payload();
+        newline.payload = serde_json::json!({ "signature": "c2ln", "transaction": "dHg=\n" });
+
+        let id = payment_id(&base).unwrap();
+        assert_eq!(payment_id(&spaced).as_deref(), Some(id.as_str()));
+        assert_eq!(payment_id(&newline).as_deref(), Some(id.as_str()));
+
+        // Genuinely different transactions still differ.
+        let mut other = payload();
+        other.payload = serde_json::json!({ "signature": "c2ln", "transaction": "b3RoZXI=" });
+        assert_ne!(payment_id(&other).as_deref(), Some(id.as_str()));
     }
 
     #[test]

@@ -76,8 +76,15 @@ struct StreamState {
     policy: Option<String>,
 }
 
-/// Build a `HeaderValueOption` for a response mutation.
+/// Build a `HeaderValueOption` for a mutation.
+///
+/// **Security critical: OVERWRITE, never append.** These headers are what a
+/// backend (or a ratelimit filter keying on descriptors) trusts to say who the
+/// caller is. Appending leaves a client-supplied `x-x402-tier: paid` in place
+/// alongside ours, which is self-promotion into the paid tier. The ext_authz
+/// path has always overwritten; this path did not, and it is the default.
 fn header(key: &str, value: impl Into<String>) -> HeaderValueOption {
+    const OVERWRITE_IF_EXISTS_OR_ADD: i32 = 2;
     #[allow(deprecated)]
     HeaderValueOption {
         header: Some(HeaderValue {
@@ -87,18 +94,24 @@ fn header(key: &str, value: impl Into<String>) -> HeaderValueOption {
             raw_value: value.into().into_bytes(),
         }),
         append: None,
-        append_action: 0, // APPEND_IF_EXISTS_OR_ADD
+        append_action: OVERWRITE_IF_EXISTS_OR_ADD,
         keep_empty_value: false,
     }
 }
 
 /// A `CONTINUE` response for a headers phase, optionally mutating headers.
 fn continue_with(headers: Vec<HeaderValueOption>) -> HeadersResponse {
+    continue_with_removals(headers, Vec::new())
+}
+
+/// As [`continue_with`], also removing headers before the request continues.
+fn continue_with_removals(headers: Vec<HeaderValueOption>, remove: Vec<String>) -> HeadersResponse {
+    let mutate = !headers.is_empty() || !remove.is_empty();
     HeadersResponse {
         response: Some(CommonResponse {
-            header_mutation: (!headers.is_empty()).then(|| HeaderMutation {
+            header_mutation: mutate.then(|| HeaderMutation {
                 set_headers: headers,
-                remove_headers: Vec::new(),
+                remove_headers: remove,
             }),
             ..Default::default()
         }),
@@ -338,7 +351,15 @@ async fn handle_request_headers(
 
             ProcessingResponse {
                 response: Some(processing_response::Response::RequestHeaders(
-                    continue_with(mutations),
+                    // The client's payment credentials have served their
+                    // purpose; the upstream has no business seeing them.
+                    continue_with_removals(
+                        mutations,
+                        vec![
+                            x402::HEADER_PAYMENT_SIGNATURE.to_string(),
+                            HEADER_PAYMENT_SESSION.to_string(),
+                        ],
+                    ),
                 )),
                 ..Default::default()
             }
@@ -507,6 +528,41 @@ impl X402Decider<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn identity_headers_overwrite_rather_than_append() {
+        // A client sending its own `x-x402-tier: paid` must have it replaced,
+        // not merely accompanied by ours. This is the whole security boundary
+        // for tier assertion, and ext_proc is the default filter.
+        const OVERWRITE_IF_EXISTS_OR_ADD: i32 = 2;
+        let h = header(HEADER_TIER, "free");
+        assert_eq!(
+            h.append_action, OVERWRITE_IF_EXISTS_OR_ADD,
+            "appending lets a client self-promote into the paid tier"
+        );
+    }
+
+    #[test]
+    fn client_payment_headers_are_removed_before_the_upstream() {
+        let response = continue_with_removals(
+            vec![header(HEADER_TIER, "paid")],
+            vec![
+                x402::HEADER_PAYMENT_SIGNATURE.to_string(),
+                HEADER_PAYMENT_SESSION.to_string(),
+            ],
+        );
+        let mutation = response.response.unwrap().header_mutation.unwrap();
+        assert!(
+            mutation
+                .remove_headers
+                .contains(&x402::HEADER_PAYMENT_SIGNATURE.to_string())
+        );
+        assert!(
+            mutation
+                .remove_headers
+                .contains(&HEADER_PAYMENT_SESSION.to_string())
+        );
+    }
 
     #[test]
     fn policy_is_parsed_out_of_envoy_text_format_metadata() {
