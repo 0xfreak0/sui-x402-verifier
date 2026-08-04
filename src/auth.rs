@@ -250,8 +250,34 @@ impl X402Auth {
     }
 }
 
+/// gRPC status code for a refused payment.
+///
+/// gRPC has no "payment required" code. `RESOURCE_EXHAUSTED` (8) is the closest
+/// canonical fit — it is what gRPC maps HTTP 429 to, and free-tier exhaustion is
+/// exactly a quota condition. `PERMISSION_DENIED` would imply the caller can
+/// never proceed; a payment is a retry the client can actually act on.
+const GRPC_STATUS_RESOURCE_EXHAUSTED: &str = "8";
+
+/// Does this request come from a gRPC client?
+///
+/// gRPC clients collapse any non-200 HTTP status into an opaque transport error,
+/// so a plain `402` reaches them as `code = Unknown` with the challenge buried in
+/// a string. They must instead be answered in gRPC's own error model.
+fn is_grpc_request(headers: &HeaderView<'_>) -> bool {
+    headers
+        .get("content-type")
+        .is_some_and(|ct| ct.starts_with("application/grpc"))
+}
+
 /// Convert a [`Decision`] into the response Envoy expects.
-pub fn decision_to_response(decision: Decision, client_ip: Option<IpAddr>) -> CheckResponse {
+///
+/// `grpc` selects how a denial is framed: gRPC clients get a trailers-only
+/// response carrying `grpc-status`, everyone else gets HTTP 402.
+pub fn decision_to_response(
+    decision: Decision,
+    client_ip: Option<IpAddr>,
+    grpc: bool,
+) -> CheckResponse {
     match decision {
         Decision::Allow {
             tier,
@@ -309,23 +335,42 @@ pub fn decision_to_response(decision: Decision, client_ip: Option<IpAddr>) -> Ch
 
         Decision::Deny { challenge } => {
             let mut denied = DeniedHttpResponseBuilder::new();
-            denied.set_http_status(HttpStatusCode::PaymentRequired);
 
-            match x402::encode_header(&challenge) {
-                Ok(encoded) => {
-                    denied.add_header(HEADER_PAYMENT_REQUIRED, encoded, None, false);
+            // The challenge itself is identical either way; only its framing
+            // differs. base64 keeps it valid as gRPC ASCII metadata too.
+            let encoded = match x402::encode_header(&challenge) {
+                Ok(encoded) => Some(encoded),
+                Err(e) => {
+                    tracing::error!(error = %e, "failed to encode payment challenge header");
+                    None
                 }
-                Err(e) => tracing::error!(error = %e, "failed to encode payment challenge header"),
+            };
+            if let Some(encoded) = &encoded {
+                denied.add_header(HEADER_PAYMENT_REQUIRED, encoded.clone(), None, false);
             }
 
-            // Also send the challenge as a JSON body; header-only 402s are hard
-            // to debug with ordinary HTTP clients.
-            match serde_json::to_string(&challenge) {
-                Ok(body) => {
-                    denied.add_header("content-type", "application/json", None, false);
-                    denied.set_body(body);
+            if grpc {
+                // A gRPC "trailers-only" response: HTTP 200 carrying grpc-status
+                // in the header frame. Clients surface this as a real status
+                // code rather than an opaque transport failure, and can read the
+                // challenge straight out of the response metadata.
+                denied.set_http_status(HttpStatusCode::Ok);
+                denied.add_header("content-type", "application/grpc", None, false);
+                denied.add_header("grpc-status", GRPC_STATUS_RESOURCE_EXHAUSTED, None, false);
+                denied.add_header("grpc-message", grpc_message(&challenge.error), None, false);
+            } else {
+                denied.set_http_status(HttpStatusCode::PaymentRequired);
+                // Also send the challenge as a JSON body; header-only 402s are
+                // hard to debug with ordinary HTTP clients.
+                match serde_json::to_string(&challenge) {
+                    Ok(body) => {
+                        denied.add_header("content-type", "application/json", None, false);
+                        denied.set_body(body);
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "failed to encode payment challenge body")
+                    }
                 }
-                Err(e) => tracing::error!(error = %e, "failed to encode payment challenge body"),
             }
 
             let mut response =
@@ -334,6 +379,20 @@ pub fn decision_to_response(decision: Decision, client_ip: Option<IpAddr>) -> Ch
             response
         }
     }
+}
+
+/// Percent-encode a `grpc-message` value.
+///
+/// The gRPC spec restricts this header to printable ASCII with `%` escaped;
+/// anything else must be percent-encoded or clients may reject the frame.
+fn grpc_message(reason: &str) -> String {
+    reason
+        .bytes()
+        .map(|b| match b {
+            b' '..=b'~' if b != b'%' => (b as char).to_string(),
+            other => format!("%{other:02X}"),
+        })
+        .collect()
 }
 
 /// Build the dynamic metadata Envoy's ratelimit filter can read descriptors from.
@@ -422,8 +481,11 @@ impl Authorization for X402Auth {
             .and_then(|a| a.context_extensions.get(POLICY_CONTEXT_KEY))
             .map(|s| s.as_str());
 
+        let grpc = is_grpc_request(&headers);
         let decision = self.decide(&headers, client_ip, path, policy).await;
-        Ok(Response::new(decision_to_response(decision, client_ip)))
+        Ok(Response::new(decision_to_response(
+            decision, client_ip, grpc,
+        )))
     }
 }
 
@@ -733,7 +795,7 @@ mod tests {
     // ---- Response construction -------------------------------------------
 
     fn ok_response(decision: Decision) -> envoy_types::ext_authz::v3::pb::OkHttpResponse {
-        match decision_to_response(decision, ip()).http_response {
+        match decision_to_response(decision, ip(), false).http_response {
             Some(HttpResponse::OkResponse(ok)) => ok,
             other => panic!("expected an OK response, got {other:?}"),
         }
@@ -817,7 +879,7 @@ mod tests {
     #[test]
     fn denial_uses_http_402_and_carries_the_challenge_header() {
         let challenge = PaymentRequired::new("nope", vec![]);
-        let response = decision_to_response(Decision::Deny { challenge }, ip());
+        let response = decision_to_response(Decision::Deny { challenge }, ip(), false);
 
         // Non-zero gRPC status is what makes Envoy treat this as a denial.
         assert_ne!(response.status.as_ref().unwrap().code, 0);
@@ -841,6 +903,90 @@ mod tests {
     }
 
     #[test]
+    fn grpc_denial_uses_a_trailers_only_response_not_http_402() {
+        // gRPC clients turn any non-200 HTTP status into an opaque transport
+        // error, so a denial must be spoken in gRPC's own error model.
+        let challenge = PaymentRequired::new("free tier exhausted", vec![]);
+        let response = decision_to_response(Decision::Deny { challenge }, ip(), true);
+
+        let Some(HttpResponse::DeniedResponse(denied)) = response.http_response else {
+            panic!("expected a denied response");
+        };
+
+        assert_eq!(
+            denied.status.unwrap().code,
+            HttpStatusCode::Ok as i32,
+            "gRPC denials must be HTTP 200 trailers-only, not 402"
+        );
+
+        let header = |name: &str| {
+            denied
+                .headers
+                .iter()
+                .map(|h| h.header.as_ref().unwrap())
+                .find(|h| h.key == name)
+                .map(|h| h.value.clone())
+        };
+
+        assert_eq!(header("grpc-status").as_deref(), Some("8")); // RESOURCE_EXHAUSTED
+        // Space is legal unescaped per the spec's Percent-Byte-Unescaped range.
+        assert_eq!(
+            header("grpc-message").as_deref(),
+            Some("free tier exhausted")
+        );
+        assert_eq!(header("content-type").as_deref(), Some("application/grpc"));
+        // The machine-readable challenge must still be reachable as metadata.
+        assert!(header(HEADER_PAYMENT_REQUIRED).is_some());
+        // A body would corrupt a trailers-only frame.
+        assert!(
+            denied.body.is_empty(),
+            "trailers-only response carries no body"
+        );
+    }
+
+    #[test]
+    fn http_denial_is_unchanged_by_the_grpc_path() {
+        let challenge = PaymentRequired::new("nope", vec![]);
+        let response = decision_to_response(Decision::Deny { challenge }, ip(), false);
+        let Some(HttpResponse::DeniedResponse(denied)) = response.http_response else {
+            panic!("expected a denied response");
+        };
+        assert_eq!(
+            denied.status.unwrap().code,
+            HttpStatusCode::PaymentRequired as i32
+        );
+        assert!(!denied.body.is_empty());
+    }
+
+    #[test]
+    fn grpc_requests_are_detected_by_content_type() {
+        let grpc = headers(&[("content-type", "application/grpc")]);
+        assert!(is_grpc_request(&HeaderView::new(Some(&grpc))));
+
+        // grpc-web and +proto suffixes are still gRPC.
+        let proto = headers(&[("content-type", "application/grpc+proto")]);
+        assert!(is_grpc_request(&HeaderView::new(Some(&proto))));
+
+        let json = headers(&[("content-type", "application/json")]);
+        assert!(!is_grpc_request(&HeaderView::new(Some(&json))));
+
+        let none = headers(&[]);
+        assert!(!is_grpc_request(&HeaderView::new(Some(&none))));
+    }
+
+    #[test]
+    fn grpc_message_escapes_non_ascii_and_percent() {
+        // Per the gRPC spec, Percent-Byte-Unescaped is %x20-%x24 / %x26-%x7E:
+        // space and printable ASCII pass through, only `%` and bytes outside
+        // that range are escaped.
+        assert_eq!(grpc_message("plain text"), "plain text");
+        assert_eq!(grpc_message("100%"), "100%25");
+        assert_eq!(grpc_message("café"), "caf%C3%A9");
+        // Control characters are outside the unescaped range.
+        assert_eq!(grpc_message("a\nb"), "a%0Ab");
+    }
+
+    #[test]
     fn allow_sets_rate_limit_metadata_for_envoy_descriptors() {
         let response = decision_to_response(
             Decision::Allow {
@@ -850,6 +996,7 @@ mod tests {
                 settlement: None,
             },
             ip(),
+            false,
         );
         let fields = response
             .dynamic_metadata
