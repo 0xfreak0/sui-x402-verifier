@@ -204,6 +204,18 @@ pub struct StoreConfig {
 pub struct Config {
     /// Address the ext_authz gRPC server binds to.
     pub listen_addr: SocketAddr,
+    /// Optional address for the standard facilitator HTTP API (spec §7:
+    /// `/verify`, `/settle`, `/supported`).
+    ///
+    /// **Disabled unless set.** Envoy never calls these endpoints — it uses the
+    /// ext_authz gRPC service above, where verification and settlement happen
+    /// together inside one `Check()`. §7 exists so *other* x402 resource
+    /// servers can delegate Sui work to this service.
+    ///
+    /// Unauthenticated: bind loopback or a private interface. `/settle` is the
+    /// endpoint that moves money once real settlement lands.
+    #[serde(default)]
+    pub facilitator_api_listen_addr: Option<SocketAddr>,
     /// Sui fullnode gRPC endpoint used for verification and settlement.
     pub sui_grpc_url: String,
     /// Chain the fullnode is expected to be serving (`testnet`, `mainnet`, …).

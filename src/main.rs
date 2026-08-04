@@ -6,6 +6,7 @@
 
 mod auth;
 mod config;
+mod facilitator_api;
 mod ratelimit;
 mod session;
 mod util;
@@ -134,12 +135,36 @@ async fn main() -> Result<()> {
         "starting x402 verifier"
     );
 
+    // Shared with the optional §7 HTTP API, so both surfaces enforce exactly
+    // the same rules rather than drifting into two implementations.
+    let facilitator = Arc::new(facilitator);
+
+    let facilitator_api_addr = config.facilitator_api_listen_addr;
+
     let state = Arc::new(AppState {
         config,
         sessions,
         limiter,
-        facilitator,
+        facilitator: Arc::clone(&facilitator),
     });
+
+    if let Some(addr) = facilitator_api_addr {
+        let router = facilitator_api::router(Arc::clone(&facilitator));
+        tracing::info!(
+            %addr,
+            "serving the x402 facilitator HTTP API (POST /verify, POST /settle, GET /supported)"
+        );
+        tokio::spawn(async move {
+            match tokio::net::TcpListener::bind(addr).await {
+                Ok(listener) => {
+                    if let Err(e) = axum::serve(listener, router).await {
+                        tracing::error!(error = %e, "facilitator HTTP API stopped");
+                    }
+                }
+                Err(e) => tracing::error!(error = %e, %addr, "could not bind facilitator HTTP API"),
+            }
+        });
+    }
 
     // Reap expired state so neither map grows without bound on a public
     // endpoint. Both structures are also self-healing on read, so a missed

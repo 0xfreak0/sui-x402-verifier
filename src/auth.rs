@@ -80,6 +80,13 @@ pub enum Decision {
     },
     Deny {
         challenge: PaymentRequired,
+        /// Present only when a payment was *attempted* and refused.
+        ///
+        /// This is what distinguishes "your payment was rejected, here is the
+        /// machine-readable reason" from "you never paid" — two situations that
+        /// were previously indistinguishable to a client, both arriving as a
+        /// bare 402 with only a challenge.
+        receipt: Option<SettlementResponse>,
     },
 }
 
@@ -89,7 +96,9 @@ pub struct AppState {
     pub config: Config,
     pub sessions: SessionStore,
     pub limiter: RateLimiter,
-    pub facilitator: Facilitator,
+    /// Shared with the optional facilitator HTTP API so both surfaces enforce
+    /// identical rules.
+    pub facilitator: Arc<Facilitator>,
 }
 
 /// ext_authz service.
@@ -142,8 +151,33 @@ impl X402Auth {
             mime_type: Some("application/json".to_string()),
         };
 
+        // Advertise that a settled payment buys a reusable session, using the
+        // §5.1.2 extensions mechanism rather than an undocumented header.
+        let mut challenge_extensions = Some(x402::session_extension_advertisement(
+            self.state.config.paid_tier.quota,
+            self.state.config.paid_tier.duration_secs,
+            HEADER_PAYMENT_SESSION,
+        ));
+
+        // Decode any payment up front: it may carry a session token echoed in
+        // its extensions, which must be honoured before charging again.
+        let presented_payment: Option<Result<PaymentPayload, _>> = headers
+            .get(HEADER_PAYMENT_SIGNATURE)
+            .map(x402::decode_header::<PaymentPayload>);
+
+        // A session token may arrive two ways: echoed in a payment's
+        // `extensions` (the spec-sanctioned route), or in the raw header, kept
+        // working as a deprecated alias so existing clients do not break.
+        let echoed_token = presented_payment
+            .as_ref()
+            .and_then(|p| p.as_ref().ok())
+            .and_then(|p| x402::session_token_from_extensions(p.extensions.as_ref()))
+            .map(str::to_string);
+        let session_token =
+            echoed_token.or_else(|| headers.get(HEADER_PAYMENT_SESSION).map(String::from));
+
         // ---- 1. Existing paid session -------------------------------------
-        if let Some(token) = headers.get(HEADER_PAYMENT_SESSION) {
+        if let Some(token) = &session_token {
             match self.state.sessions.consume(token).await {
                 SessionOutcome::Accepted { payer, remaining } => {
                     tracing::debug!(%payer, remaining, "paid request served from session");
@@ -162,17 +196,21 @@ impl X402Auth {
         }
 
         // ---- 2. New payment ------------------------------------------------
-        if let Some(raw) = headers.get(HEADER_PAYMENT_SIGNATURE) {
-            let payload: PaymentPayload = match x402::decode_header(raw) {
+        if let Some(decoded) = presented_payment {
+            let payload = match decoded {
                 Ok(p) => p,
                 Err(e) => {
                     tracing::warn!(error = %e, "malformed payment-signature header");
+                    let mut challenge = PaymentRequired::new(
+                        format!("malformed payment-signature header: {e}"),
+                        resource,
+                        vec![requirements],
+                    );
+                    challenge.extensions = challenge_extensions.take();
                     return Decision::Deny {
-                        challenge: PaymentRequired::new(
-                            format!("malformed payment-signature header: {e}"),
-                            resource,
-                            vec![requirements],
-                        ),
+                        challenge,
+                        // A payment WAS attempted; it just could not be parsed.
+                        receipt: Some(self.state.facilitator.failure_receipt("invalid_payload")),
                     };
                 }
             };
@@ -183,7 +221,7 @@ impl X402Auth {
                 .verify_and_settle(&payload, &requirements)
                 .await
             {
-                Ok(settlement) => {
+                Ok(mut settlement) => {
                     // The payment has already settled by this point. If the
                     // session cannot be persisted we must still serve THIS
                     // request — the client paid for it — and simply hand back
@@ -216,6 +254,16 @@ impl X402Auth {
                         },
                     };
 
+                    // Return the token through the receipt's `extensions`, the
+                    // sanctioned channel, alongside the raw response header.
+                    if let Some(token) = &token {
+                        settlement.extensions = Some(x402::session_extension_grant(
+                            token,
+                            self.state.config.paid_tier.quota,
+                            self.state.config.paid_tier.duration_secs,
+                        ));
+                    }
+
                     tracing::info!(
                         payer = settlement.payer.as_deref().unwrap_or("<unknown>"),
                         transaction = %settlement.transaction,
@@ -230,13 +278,18 @@ impl X402Auth {
                     }
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e, "payment rejected");
+                    tracing::warn!(error = %e, code = e.code(), "payment rejected");
+                    let mut challenge = PaymentRequired::new(
+                        // The human string stays here; the machine-readable
+                        // §9 code goes in the receipt's errorReason.
+                        format!("payment rejected: {e}"),
+                        resource,
+                        vec![requirements],
+                    );
+                    challenge.extensions = challenge_extensions.take();
                     Decision::Deny {
-                        challenge: PaymentRequired::new(
-                            format!("payment rejected: {e}"),
-                            resource,
-                            vec![requirements],
-                        ),
+                        challenge,
+                        receipt: Some(self.state.facilitator.failure_receipt(e.code())),
                     }
                 }
             };
@@ -247,12 +300,17 @@ impl X402Auth {
             // Without a source address the free tier cannot be metered, so fail
             // closed rather than granting unmetered access.
             tracing::warn!("no client address on CheckRequest; denying free-tier access");
+            let mut challenge = PaymentRequired::new(
+                "client address unavailable; free tier cannot be metered",
+                resource,
+                vec![requirements],
+            );
+            challenge.extensions = challenge_extensions.take();
+            // No receipt: no payment was attempted, so there is nothing to
+            // report the outcome of.
             return Decision::Deny {
-                challenge: PaymentRequired::new(
-                    "client address unavailable; free tier cannot be metered",
-                    resource,
-                    vec![requirements],
-                ),
+                challenge,
+                receipt: None,
             };
         };
 
@@ -265,12 +323,15 @@ impl X402Auth {
             }
         } else {
             tracing::debug!(%ip, "free tier exhausted; returning payment challenge");
+            let mut challenge = PaymentRequired::new(
+                "free tier rate limit exceeded; pay to unlock a higher limit",
+                resource,
+                vec![requirements],
+            );
+            challenge.extensions = challenge_extensions.take();
             Decision::Deny {
-                challenge: PaymentRequired::new(
-                    "free tier rate limit exceeded; pay to unlock a higher limit",
-                    resource,
-                    vec![requirements],
-                ),
+                challenge,
+                receipt: None,
             }
         }
     }
@@ -359,8 +420,21 @@ pub fn decision_to_response(
             response
         }
 
-        Decision::Deny { challenge } => {
+        Decision::Deny { challenge, receipt } => {
             let mut denied = DeniedHttpResponseBuilder::new();
+
+            // A refused payment reports its outcome exactly like a successful
+            // one: same header, same schema, success:false. Without this, "your
+            // payment was rejected" and "you never paid" are the same response.
+            if let Some(receipt) = &receipt {
+                match x402::encode_header(receipt) {
+                    Ok(encoded) => denied.add_header(HEADER_PAYMENT_RESPONSE, encoded, None, false),
+                    Err(e) => {
+                        tracing::error!(error = %e, "failed to encode failure receipt");
+                        &mut denied
+                    }
+                };
+            }
 
             // The challenge itself is identical either way; only its framing
             // differs. base64 keeps it valid as gRPC ASCII metadata too.
@@ -567,6 +641,7 @@ mod tests {
     use crate::config::{FreeTierConfig, PaidTierConfig, PaymentConfig, VerificationMode};
     use crate::ratelimit::MemoryRateLimiter;
     use crate::session::MemorySessionStore;
+    use crate::x402::SESSION_EXTENSION;
     use crate::x402::X402_VERSION;
     use envoy_types::ext_authz::v3::pb::HttpResponse;
     use std::collections::HashMap;
@@ -578,6 +653,7 @@ mod tests {
     fn test_config(free_limit: u64, quota: u64) -> Config {
         Config {
             listen_addr: "127.0.0.1:50051".parse().unwrap(),
+            facilitator_api_listen_addr: None,
             sui_grpc_url: "https://fullnode.testnet.sui.io:443".into(),
             sui_chain: "testnet".into(),
             verification_mode: VerificationMode::StubAcceptAll,
@@ -626,7 +702,7 @@ mod tests {
             config,
             sessions,
             limiter,
-            facilitator,
+            facilitator: Arc::new(facilitator),
         }))
     }
 
@@ -707,7 +783,7 @@ mod tests {
         ));
 
         let decision = a.decide(&view, ip(), PATH, None, RESOURCE_URL).await;
-        let Decision::Deny { challenge } = decision else {
+        let Decision::Deny { challenge, .. } = decision else {
             panic!("expected denial once the free tier was spent");
         };
         assert_eq!(challenge.x402_version, X402_VERSION);
@@ -862,7 +938,7 @@ mod tests {
             .decide(&HeaderView::new(Some(&map)), ip(), PATH, None, RESOURCE_URL)
             .await;
 
-        let Decision::Deny { challenge } = decision else {
+        let Decision::Deny { challenge, .. } = decision else {
             panic!("malformed payment should be denied, not silently demoted");
         };
         let err = challenge.error.unwrap_or_default();
@@ -875,7 +951,7 @@ mod tests {
         let wrong = payment_header_with(|p| p.accepted.network = "sui:mainnet".into());
         let map = headers(&[(HEADER_PAYMENT_SIGNATURE, &wrong)]);
 
-        let Decision::Deny { challenge } = a
+        let Decision::Deny { challenge, .. } = a
             .decide(&HeaderView::new(Some(&map)), ip(), PATH, None, RESOURCE_URL)
             .await
         else {
@@ -883,6 +959,182 @@ mod tests {
         };
         let err = challenge.error.unwrap_or_default();
         assert!(err.contains("network"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_rejected_payment_is_distinguishable_from_never_having_paid() {
+        // The single most client-hostile thing about the old behavior: both
+        // arrived as a bare 402 with only a challenge.
+        let a = auth(0, 10);
+
+        // Never paid: challenge only, no receipt.
+        let none = headers(&[]);
+        let Decision::Deny { receipt, .. } = a
+            .decide(
+                &HeaderView::new(Some(&none)),
+                ip(),
+                PATH,
+                None,
+                RESOURCE_URL,
+            )
+            .await
+        else {
+            panic!("expected denial");
+        };
+        assert!(
+            receipt.is_none(),
+            "no payment was attempted, so there is no settlement outcome to report"
+        );
+
+        // Paid, but with tampered terms: challenge AND a failure receipt.
+        let bad = payment_header_with(|p| p.accepted.amount = "1".into());
+        let map = headers(&[(HEADER_PAYMENT_SIGNATURE, &bad)]);
+        let Decision::Deny { receipt, .. } = a
+            .decide(&HeaderView::new(Some(&map)), ip(), PATH, None, RESOURCE_URL)
+            .await
+        else {
+            panic!("expected denial");
+        };
+        let receipt = receipt.expect("an attempted payment must report its outcome");
+        assert!(!receipt.success);
+        assert_eq!(
+            receipt.error_reason.as_deref(),
+            Some("invalid_payment_requirements"),
+            "errorReason must be a machine-readable §9 code, not prose"
+        );
+        assert_eq!(receipt.transaction, "", "a failed payment has no digest");
+    }
+
+    #[tokio::test]
+    async fn a_malformed_payment_still_reports_an_outcome() {
+        let a = auth(0, 10);
+        let map = headers(&[(HEADER_PAYMENT_SIGNATURE, "!!!not-base64!!!")]);
+        let Decision::Deny { receipt, .. } = a
+            .decide(&HeaderView::new(Some(&map)), ip(), PATH, None, RESOURCE_URL)
+            .await
+        else {
+            panic!("expected denial");
+        };
+        assert_eq!(
+            receipt.unwrap().error_reason.as_deref(),
+            Some("invalid_payload")
+        );
+    }
+
+    #[test]
+    fn denial_with_a_receipt_carries_payment_response() {
+        let challenge = PaymentRequired::new("nope", test_resource(), vec![]);
+        let receipt = SettlementResponse {
+            success: false,
+            error_reason: Some("invalid_payload".into()),
+            payer: None,
+            transaction: String::new(),
+            network: "sui:testnet".into(),
+            amount: None,
+            extensions: None,
+        };
+        let response = decision_to_response(
+            Decision::Deny {
+                challenge,
+                receipt: Some(receipt),
+            },
+            ip(),
+            false,
+        );
+        let Some(HttpResponse::DeniedResponse(denied)) = response.http_response else {
+            panic!("expected a denied response");
+        };
+        let names: Vec<&str> = denied
+            .headers
+            .iter()
+            .map(|h| h.header.as_ref().unwrap().key.as_str())
+            .collect();
+        assert!(names.contains(&HEADER_PAYMENT_RESPONSE), "{names:?}");
+        assert!(names.contains(&HEADER_PAYMENT_REQUIRED), "{names:?}");
+    }
+
+    #[tokio::test]
+    async fn the_challenge_advertises_the_session_extension() {
+        let a = auth(0, 10);
+        let map = headers(&[]);
+        let Decision::Deny { challenge, .. } = a
+            .decide(&HeaderView::new(Some(&map)), ip(), PATH, None, RESOURCE_URL)
+            .await
+        else {
+            panic!("expected denial");
+        };
+        let ext = challenge.extensions.expect("sessions must be advertised");
+        let entry = &ext[SESSION_EXTENSION];
+        // §5.1.2 requires both an `info` and a `schema` per extension.
+        assert!(entry["info"].is_object(), "missing info: {entry}");
+        assert!(entry["schema"].is_object(), "missing schema: {entry}");
+        assert_eq!(
+            entry["info"]["header"],
+            serde_json::json!(HEADER_PAYMENT_SESSION)
+        );
+        assert_eq!(entry["info"]["quota"], serde_json::json!(10));
+    }
+
+    #[tokio::test]
+    async fn a_settled_payment_returns_the_session_through_extensions() {
+        let a = auth(0, 10);
+        let map = headers(&[(HEADER_PAYMENT_SIGNATURE, &payment_header())]);
+        let Decision::Allow {
+            settlement,
+            session_token,
+            ..
+        } = a
+            .decide(&HeaderView::new(Some(&map)), ip(), PATH, None, RESOURCE_URL)
+            .await
+        else {
+            panic!("payment should have been accepted");
+        };
+        let token = session_token.expect("a session should be issued");
+        let ext = settlement
+            .expect("a settled payment has a receipt")
+            .extensions
+            .expect("the receipt should carry the session grant");
+        assert_eq!(
+            ext[SESSION_EXTENSION]["info"]["token"],
+            serde_json::json!(token)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_session_echoed_through_extensions_is_honored() {
+        // The spec-sanctioned route: the client echoes the extension rather
+        // than relying on the proprietary raw header.
+        let a = auth(0, 10);
+        let pay = headers(&[(HEADER_PAYMENT_SIGNATURE, &payment_header())]);
+        let Decision::Allow {
+            session_token: Some(token),
+            ..
+        } = a
+            .decide(&HeaderView::new(Some(&pay)), ip(), PATH, None, RESOURCE_URL)
+            .await
+        else {
+            panic!("expected a session token");
+        };
+
+        // Second request: a payload carrying ONLY the echoed session extension.
+        let echoed = payment_header_with(|p| {
+            p.extensions = Some(x402::session_extension_grant(&token, 10, 3600));
+        });
+        let map = headers(&[(HEADER_PAYMENT_SIGNATURE, &echoed)]);
+        let decision = a
+            .decide(&HeaderView::new(Some(&map)), ip(), PATH, None, RESOURCE_URL)
+            .await;
+        assert!(
+            matches!(
+                decision,
+                Decision::Allow {
+                    tier: Tier::Paid,
+                    session_token: None,
+                    ..
+                }
+            ),
+            "the echoed session should be spent, not charged again: {decision:?}"
+        );
     }
 
     #[tokio::test]
@@ -988,7 +1240,14 @@ mod tests {
     #[test]
     fn denial_uses_http_402_and_carries_the_challenge_header() {
         let challenge = PaymentRequired::new("nope", test_resource(), vec![]);
-        let response = decision_to_response(Decision::Deny { challenge }, ip(), false);
+        let response = decision_to_response(
+            Decision::Deny {
+                challenge,
+                receipt: None,
+            },
+            ip(),
+            false,
+        );
 
         // Non-zero gRPC status is what makes Envoy treat this as a denial.
         assert_ne!(response.status.as_ref().unwrap().code, 0);
@@ -1016,7 +1275,14 @@ mod tests {
         // gRPC clients turn any non-200 HTTP status into an opaque transport
         // error, so a denial must be spoken in gRPC's own error model.
         let challenge = PaymentRequired::new("free tier exhausted", test_resource(), vec![]);
-        let response = decision_to_response(Decision::Deny { challenge }, ip(), true);
+        let response = decision_to_response(
+            Decision::Deny {
+                challenge,
+                receipt: None,
+            },
+            ip(),
+            true,
+        );
 
         let Some(HttpResponse::DeniedResponse(denied)) = response.http_response else {
             panic!("expected a denied response");
@@ -1056,7 +1322,14 @@ mod tests {
     #[test]
     fn http_denial_is_unchanged_by_the_grpc_path() {
         let challenge = PaymentRequired::new("nope", test_resource(), vec![]);
-        let response = decision_to_response(Decision::Deny { challenge }, ip(), false);
+        let response = decision_to_response(
+            Decision::Deny {
+                challenge,
+                receipt: None,
+            },
+            ip(),
+            false,
+        );
         let Some(HttpResponse::DeniedResponse(denied)) = response.http_response else {
             panic!("expected a denied response");
         };

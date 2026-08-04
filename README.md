@@ -203,6 +203,66 @@ headers and metadata it already emits are exactly what that needs, so it is a
 config change rather than a rewrite. `envoy.yaml` has the descriptor block
 commented out and ready.
 
+## Conformance
+
+Wire format follows x402 **v2**, vendored at `docs/spec/upstream/` (coinbase/x402
+@ `dd927a26`). The spec's own JSON examples are extracted into `tests/fixtures/`
+and round-tripped through the types, so a shape that drifts fails CI rather than
+failing silently against a real client.
+
+### Deviation: this service settles *before* serving
+
+`scheme_exact_sui.md` steps 6-8 sequence the flow as **verify → resource server
+does the work → settle**. That ordering protects the client: they are charged
+only once the resource has actually been produced.
+
+This service settles **inside `ext_authz`, before the upstream is called**,
+because `ext_authz` is a *pre-upstream* filter — it runs on the request path,
+cannot see the response, and must return allow/deny before Envoy proxies
+anything. There is nowhere later to settle from.
+
+**The consequence is real: a paying client is charged even if the upstream then
+returns a 500.** For a testnet PoC in stub mode (where nothing settles at all)
+this costs nothing, but it is not the right shape for production.
+
+The production shape is an `ext_proc` filter, which *can* act on the response
+path: verify in `ext_authz` before proxying, then settle from `ext_proc` once
+the upstream has returned a success. That splits verify and settle across two
+filters and needs the payment context carried between them — which is why it is
+not what this PoC does.
+
+### Facilitator interface
+
+`POST /verify`, `POST /settle`, `GET /supported` (§7) are implemented but
+**disabled unless `facilitator_api_listen_addr` is set**. Envoy never calls
+them: it uses the ext_authz gRPC service, where verification and settlement
+happen together inside one `Check()`. §7 exists so *other* x402 resource servers
+can delegate Sui work here.
+
+Note this makes the binary **self-facilitating** — the same process is both the
+resource server and its own facilitator. That is a legitimate x402 deployment,
+but there is no trust boundary between the two halves. The endpoints are
+unauthenticated; bind them to loopback or a private interface.
+
+### Sessions are a declared extension
+
+The paid-session token is advertised through §5.1.2's `extensions` map rather
+than as an undocumented header: `PaymentRequired.extensions` carries an `info`
+and a JSON `schema`, a settled payment returns the token in the receipt's
+`extensions`, and a client may echo it back the same way. The raw
+`x-payment-session` header still works as a deprecated alias.
+
+### Out of scope
+
+- The Bazaar / discovery endpoints (§8).
+- The `a2a` and `mcp` transports — only `http` is implemented.
+- The interactive gas-station sponsorship protocol. Sponsorship is *advertised*
+  via `extra.gasStation` when configured, but the protocol itself is not
+  implemented, and this facilitator holds no signing keys (`/supported` reports
+  an empty `signers` map, which is how you can check that).
+
+Known spec gaps found while implementing: `docs/spec-gaps.md`.
+
 ## Notes from building this
 
 Things that were not true of the original design and cost real debugging time:

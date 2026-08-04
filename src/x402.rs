@@ -212,6 +212,105 @@ pub struct VerifyResponse {
     pub payer: Option<String>,
 }
 
+/// Identifier for this service's session extension.
+///
+/// §5.1.2's `extensions` map is the sanctioned way to add optional
+/// functionality beyond core payment mechanics, which is exactly what paid
+/// sessions are. Namespaced so it cannot collide with a future standard one.
+pub const SESSION_EXTENSION: &str = "sui-x402-verifier.session.v1";
+
+/// Advertise the session extension in a `PaymentRequired`.
+///
+/// `info` tells a client that a settled payment buys a reusable token rather
+/// than a single request, and `schema` describes the shape it will come back
+/// in — per §5.1.2 an extension carries both.
+pub fn session_extension_advertisement(
+    quota: u64,
+    duration_secs: u64,
+    header: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        SESSION_EXTENSION: {
+            "info": {
+                "description": "A settled payment mints a reusable session token                                 covering many requests, returned in the                                 PAYMENT-RESPONSE extensions and presented on                                 subsequent requests.",
+                "header": header,
+                "quota": quota,
+                "durationSeconds": duration_secs,
+            },
+            "schema": {
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "object",
+                "required": ["token"],
+                "properties": {
+                    "token": {
+                        "type": "string",
+                        "description": "Opaque session token. Present it on later                                         requests to reuse the paid tier.",
+                    },
+                    "quota": { "type": "integer", "minimum": 0 },
+                    "durationSeconds": { "type": "integer", "minimum": 0 },
+                },
+            },
+        }
+    })
+}
+
+/// Carry a freshly minted session token back in a settlement receipt.
+pub fn session_extension_grant(token: &str, quota: u64, duration_secs: u64) -> serde_json::Value {
+    serde_json::json!({
+        SESSION_EXTENSION: {
+            "info": { "token": token, "quota": quota, "durationSeconds": duration_secs }
+        }
+    })
+}
+
+/// Pull a session token out of a client's echoed `extensions`.
+///
+/// Returns `None` when the extension is absent or malformed; callers fall back
+/// to the deprecated raw header.
+pub fn session_token_from_extensions(extensions: Option<&serde_json::Value>) -> Option<&str> {
+    extensions?
+        .get(SESSION_EXTENSION)?
+        .get("info")?
+        .get("token")?
+        .as_str()
+}
+
+/// Facilitator `/supported` entry (§7.3.1).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SupportedKind {
+    pub x402_version: u32,
+    pub scheme: String,
+    pub network: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extra: Option<serde_json::Value>,
+}
+
+/// Facilitator `GET /supported` response (§7.3).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SupportedResponse {
+    pub kinds: Vec<SupportedKind>,
+    /// Extension identifiers this facilitator implements.
+    pub extensions: Vec<String>,
+    /// CAIP-2 pattern -> public signer addresses.
+    ///
+    /// Empty here, and deliberately so: this facilitator holds no signing keys.
+    /// It never sponsors a transaction, so there is no address for a client to
+    /// verify against — which is also what makes "this service has custody of
+    /// nothing" checkable rather than merely claimed.
+    pub signers: std::collections::BTreeMap<String, Vec<String>>,
+}
+
+/// Facilitator `/verify` and `/settle` request body (§7.1).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct FacilitatorRequest {
+    pub x402_version: u32,
+    pub payment_payload: PaymentPayload,
+    pub payment_requirements: PaymentRequirements,
+}
+
 /// Encode a value as base64(JSON) for transport in an HTTP header.
 ///
 /// Headers cannot carry raw JSON safely (commas and quotes confuse
@@ -266,15 +365,12 @@ pub enum FacilitatorError {
 impl FacilitatorError {
     /// The §9 standard error code for this failure.
     ///
-    /// Wired into the denial path in Phase 2; already exercised by tests.
-    ///
     /// The per-scheme codes upstream are all EVM-named
     /// (`invalid_exact_evm_payload_*`) and **no Sui equivalents are defined**.
     /// Rather than invent parallel Sui names in the wire format — which would
     /// be indistinguishable from a real spec code to a client — every
     /// Sui-specific failure maps onto a generic code, with the specifics left
     /// to the human-readable message. See `docs/spec-gaps.md`.
-    #[allow(dead_code)]
     pub fn code(&self) -> &'static str {
         match self {
             FacilitatorError::VersionMismatch { .. } => "invalid_x402_version",
@@ -339,6 +435,73 @@ impl Facilitator {
         payload: &PaymentPayload,
         requirements: &PaymentRequirements,
     ) -> Result<SettlementResponse, FacilitatorError> {
+        self.settle(payload, requirements).await
+    }
+
+    /// Validate a payment authorization **without** executing it (§7.1).
+    ///
+    /// Returns the payer on success. In `sui-grpc` mode this is where the four
+    /// `scheme_exact_sui.md` verification steps run; today only step 1 (network)
+    /// plus the structural checks below are implemented, so it refuses.
+    pub async fn verify(
+        &self,
+        payload: &PaymentPayload,
+        requirements: &PaymentRequirements,
+    ) -> Result<String, FacilitatorError> {
+        let sui = self.check_terms(payload, requirements)?;
+
+        match self.mode {
+            VerificationMode::StubAcceptAll => Ok(stub_payer(&sui.transaction)),
+            VerificationMode::SuiGrpc => Err(FacilitatorError::NotImplemented),
+        }
+    }
+
+    /// Execute a verified payment (§7.2).
+    pub async fn settle(
+        &self,
+        payload: &PaymentPayload,
+        requirements: &PaymentRequirements,
+    ) -> Result<SettlementResponse, FacilitatorError> {
+        let sui = self.check_terms(payload, requirements)?;
+
+        match self.mode {
+            VerificationMode::StubAcceptAll => {
+                // The spec recovers the payer from the signature. The stub
+                // cannot, and must not fall back to a client-supplied value, so
+                // it derives a deterministic pseudo-address from the
+                // transaction bytes: stable per payment (sessions behave), and
+                // untrusted input never becomes an identity claim.
+                let payer = stub_payer(&sui.transaction);
+
+                tracing::warn!(
+                    payer = %payer,
+                    "STUB MODE: accepting payment without on-chain verification or settlement"
+                );
+
+                Ok(SettlementResponse {
+                    success: true,
+                    error_reason: None,
+                    payer: Some(payer),
+                    // Clearly not a digest, so a stub receipt can never be
+                    // mistaken for evidence of an on-chain transfer.
+                    transaction: "stub-not-settled-on-chain".to_string(),
+                    network: self.network.clone(),
+                    amount: Some(requirements.amount.clone()),
+                    extensions: None,
+                })
+            }
+            VerificationMode::SuiGrpc => Err(FacilitatorError::NotImplemented),
+        }
+    }
+
+    /// Checks shared by verify and settle: the client must have accepted
+    /// exactly the terms that were advertised, and the payload must be a
+    /// well-formed Sui `exact` payload.
+    fn check_terms(
+        &self,
+        payload: &PaymentPayload,
+        requirements: &PaymentRequirements,
+    ) -> Result<SuiExactPayload, FacilitatorError> {
         if payload.x402_version != X402_VERSION {
             return Err(FacilitatorError::VersionMismatch {
                 got: payload.x402_version,
@@ -393,34 +556,7 @@ impl Facilitator {
             return Err(FacilitatorError::MissingSignature);
         }
 
-        match self.mode {
-            VerificationMode::StubAcceptAll => {
-                // The spec recovers the payer from the signature. The stub
-                // cannot, and must not fall back to a client-supplied value, so
-                // it derives a deterministic pseudo-address from the
-                // transaction bytes: stable per payment (sessions behave), and
-                // untrusted input never becomes an identity claim.
-                let payer = stub_payer(&sui.transaction);
-
-                tracing::warn!(
-                    payer = %payer,
-                    "STUB MODE: accepting payment without on-chain verification or settlement"
-                );
-
-                Ok(SettlementResponse {
-                    success: true,
-                    error_reason: None,
-                    payer: Some(payer),
-                    // Clearly not a digest, so a stub receipt can never be
-                    // mistaken for evidence of an on-chain transfer.
-                    transaction: "stub-not-settled-on-chain".to_string(),
-                    network: self.network.clone(),
-                    amount: Some(requirements.amount.clone()),
-                    extensions: None,
-                })
-            }
-            VerificationMode::SuiGrpc => Err(FacilitatorError::NotImplemented),
-        }
+        Ok(sui)
     }
 
     /// Receipt for a payment that was refused.
@@ -429,11 +565,10 @@ impl Facilitator {
     /// well as `PAYMENT-REQUIRED` when a payment was *attempted* and failed.
     ///
     /// Emitted on the denial path in Phase 2; already exercised by tests.
-    #[allow(dead_code)]
-    pub fn failure_receipt(&self, error: &FacilitatorError) -> SettlementResponse {
+    pub fn failure_receipt(&self, code: &str) -> SettlementResponse {
         SettlementResponse {
             success: false,
-            error_reason: Some(error.code().to_string()),
+            error_reason: Some(code.to_string()),
             // Unknown: the payer is recovered during verification, which is
             // exactly what did not complete.
             payer: None,
@@ -441,6 +576,23 @@ impl Facilitator {
             network: self.network.clone(),
             amount: None,
             extensions: None,
+        }
+    }
+}
+
+impl Facilitator {
+    /// What this facilitator will accept (§7.3).
+    pub fn supported(&self) -> SupportedResponse {
+        SupportedResponse {
+            kinds: vec![SupportedKind {
+                x402_version: X402_VERSION,
+                scheme: "exact".to_string(),
+                network: self.network.clone(),
+                extra: None,
+            }],
+            extensions: vec![SESSION_EXTENSION.to_string()],
+            // Deliberately empty — see the field's doc comment.
+            signers: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -509,6 +661,54 @@ mod tests {
     #[test]
     fn spec_settlement_response_roundtrips() {
         assert_roundtrip::<SettlementResponse>(SETTLEMENT_JSON);
+    }
+
+    #[test]
+    fn sponsorship_is_advertised_as_extra_gas_station() {
+        // scheme_exact_sui.md Appendix: a facilitator signals that it will
+        // sponsor transactions by publishing a gas station URL here.
+        use crate::config::PaymentConfig;
+        let mut payment = PaymentConfig {
+            scheme: "exact".into(),
+            network: "sui:testnet".into(),
+            amount: "1000".into(),
+            asset: "0xa1::usdc::USDC".into(),
+            pay_to: "0xabc".into(),
+            max_timeout_seconds: 60,
+            description: "test".into(),
+            gas_station: None,
+        };
+
+        // Unset: no `extra` at all, rather than an empty object claiming
+        // support we do not have.
+        assert!(PaymentRequirements::from_config(&payment).extra.is_none());
+
+        payment.gas_station = Some("https://gas.example.com".into());
+        let extra = PaymentRequirements::from_config(&payment).extra.unwrap();
+        assert_eq!(
+            extra["gasStation"],
+            serde_json::json!("https://gas.example.com")
+        );
+    }
+
+    #[test]
+    fn session_extension_advertisement_carries_info_and_schema() {
+        // §5.1.2 requires both halves; a client cannot validate the echo
+        // without the schema.
+        let adv = session_extension_advertisement(1000, 3600, "x-payment-session");
+        let entry = &adv[SESSION_EXTENSION];
+        assert!(entry["info"].is_object());
+        assert!(entry["schema"].is_object());
+        assert_eq!(entry["schema"]["required"], serde_json::json!(["token"]));
+
+        // And the grant round-trips back out.
+        let grant = session_extension_grant("tok", 1000, 3600);
+        assert_eq!(session_token_from_extensions(Some(&grant)), Some("tok"));
+        assert_eq!(session_token_from_extensions(None), None);
+        assert_eq!(
+            session_token_from_extensions(Some(&serde_json::json!({"other": {}}))),
+            None
+        );
     }
 
     #[test]
@@ -751,7 +951,7 @@ mod tests {
             got: "sui:mainnet".into(),
             expected: "sui:testnet".into(),
         };
-        let receipt = stub().failure_receipt(&err);
+        let receipt = stub().failure_receipt(err.code());
         assert!(!receipt.success);
         assert_eq!(receipt.error_reason.as_deref(), Some("invalid_network"));
         assert_eq!(receipt.transaction, "");
