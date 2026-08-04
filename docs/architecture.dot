@@ -1,0 +1,79 @@
+// Architecture of sui-x402-verifier.
+//
+//   dot -Tsvg docs/architecture.dot -o docs/architecture.svg
+//   dot -Tpng docs/architecture.dot -o docs/architecture.png
+//
+// Two things this diagram is trying to make obvious, because both have caused
+// real confusion:
+//
+//   1. Envoy never calls /verify or /settle. On the gateway path, verification
+//      and settlement are in-process calls inside a single ext_proc exchange.
+//      The §7 HTTP API exists for OTHER people's resource servers.
+//
+//   2. Settlement happens on the RESPONSE, after the upstream has succeeded.
+//      That is the whole reason ext_proc is preferred over ext_authz.
+
+digraph x402 {
+  rankdir=LR;
+  bgcolor="transparent";
+  node [fontname="Helvetica", fontsize=10, shape=box, style="rounded,filled", color="#4a5568", fillcolor="#f7fafc"];
+  edge [fontname="Helvetica", fontsize=9, color="#4a5568"];
+
+  client [label="client\n(curl / grpcurl / browser)", fillcolor="#e6f0ff"];
+
+  subgraph cluster_gateway {
+    label="data plane";
+    fontname="Helvetica"; fontsize=10; color="#cbd5e0"; style=dashed;
+    envoy [label="Envoy :10000\ncors → ext_proc → router", fillcolor="#fff5e6"];
+  }
+
+  subgraph cluster_verifier {
+    label="x402-verifier (one process)";
+    fontname="Helvetica"; fontsize=10; color="#cbd5e0"; style=dashed;
+
+    extproc   [label="ext_proc :50051\nresource-server role", fillcolor="#eaf7ee"];
+    extauthz  [label="ext_authz :50051\n(fallback, settles early)", fillcolor="#f0f0f0", style="rounded,filled,dashed"];
+    policy    [label="tier policy\nsession → payment → free tier"];
+    facil     [label="facilitator\nverify / settle"];
+    api       [label="§7 HTTP API\n/verify /settle /supported\n(off by default)", fillcolor="#f0f0f0", style="rounded,filled,dashed"];
+    store     [label="store\nsessions · replay · limits\nmemory | redis"];
+    metrics   [label="/metrics\n(off by default)", fillcolor="#f0f0f0", style="rounded,filled,dashed"];
+  }
+
+  subgraph cluster_upstreams {
+    label="upstreams (gated)";
+    fontname="Helvetica"; fontsize=10; color="#cbd5e0"; style=dashed;
+    graphql [label="graphql.testnet.sui.io\nHTTP / JSON", fillcolor="#e6f0ff"];
+    grpc    [label="fullnode.testnet.sui.io\ngRPC / TLS", fillcolor="#e6f0ff"];
+  }
+
+  chain [label="Sui fullnode\nVerifySignature\nSimulateTransaction\nExecuteTransaction", fillcolor="#f5e6ff"];
+  other [label="someone else's\nresource server", fillcolor="#f0f0f0", style="rounded,filled,dashed"];
+
+  client -> envoy [label="1. request"];
+  envoy  -> extproc [label="2. request headers"];
+  extproc -> policy;
+  policy -> store [label="session / limit"];
+  policy -> facil [label="3. verify only\n(no charge yet)"];
+  facil -> chain [label="steps 2-4"];
+  extproc -> envoy [label="4. CONTINUE\n(or 402)"];
+  envoy -> graphql [label="5. proxy"];
+  envoy -> grpc;
+  graphql -> envoy [label="6. response"];
+  grpc -> envoy;
+  envoy -> extproc [label="7. response headers"];
+  extproc -> facil [label="8. settle\nONLY on 2xx", color="#2f855a", fontcolor="#2f855a"];
+  facil -> chain [label="broadcast", color="#2f855a", fontcolor="#2f855a"];
+  extproc -> store [label="mint session"];
+  envoy -> client [label="9. response\n+ receipt + session"];
+
+  // The facilitator API is a separate consumer, not part of the gateway path.
+  other -> api [label="POST /verify\nPOST /settle", style=dashed];
+  api -> facil [style=dashed];
+  api -> store [label="replay claim", style=dashed];
+
+  extauthz -> policy [style=dashed, label="fallback path"];
+  envoy -> extauthz [style=dashed];
+
+  { rank=same; graphql; grpc; }
+}

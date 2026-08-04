@@ -204,6 +204,12 @@ pub struct StoreConfig {
 pub struct Config {
     /// Address the ext_authz gRPC server binds to.
     pub listen_addr: SocketAddr,
+    /// Optional address for the Prometheus exporter, serving `/metrics`.
+    ///
+    /// Disabled unless set. Bind it to a private interface: the metrics
+    /// themselves are not sensitive, but the endpoint is unauthenticated.
+    #[serde(default)]
+    pub metrics_listen_addr: Option<SocketAddr>,
     /// Optional address for the standard facilitator HTTP API (spec §7:
     /// `/verify`, `/settle`, `/supported`).
     ///

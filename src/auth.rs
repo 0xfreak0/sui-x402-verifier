@@ -24,6 +24,7 @@ use envoy_types::pb::google::protobuf::{Struct, Value, value::Kind};
 use tonic::{Request, Response, Status};
 
 use crate::config::{Config, POLICY_CONTEXT_KEY};
+use crate::metrics as m;
 use crate::ratelimit::RateLimiter;
 use crate::session::{PaymentClaim, SessionOutcome, SessionStore};
 use crate::x402::{
@@ -217,6 +218,14 @@ impl X402Auth {
         if let Some(token) = &session_token {
             match self.state.sessions.consume(token, policy).await {
                 SessionOutcome::Accepted { payer, remaining } => {
+                    metrics::counter!(m::SESSIONS, "event" => "accepted").increment(1);
+                    metrics::counter!(
+                        m::REQUESTS,
+                        "tier" => "paid",
+                        "decision" => "allow",
+                        "policy" => policy_label(policy),
+                    )
+                    .increment(1);
                     tracing::debug!(%payer, remaining, "paid request served from session");
                     return Decision::Allow {
                         tier: Tier::Paid,
@@ -227,6 +236,14 @@ impl X402Auth {
                     };
                 }
                 SessionOutcome::Rejected(reason) => {
+                    metrics::counter!(
+                        m::SESSION_REJECTIONS,
+                        "reason" => session_rejection_label(reason),
+                    )
+                    .increment(1);
+                    if matches!(reason, crate::session::SessionRejection::Backend) {
+                        metrics::counter!(m::STORE_ERRORS, "store" => "session").increment(1);
+                    }
                     // Not fatal: fall through so the client can pay again.
                     tracing::debug!(?reason, "session token not honored");
                 }
@@ -264,6 +281,11 @@ impl X402Auth {
                 // the payment became replayable again.
                 let ttl = replay_ttl(requirements.max_timeout_seconds);
                 let claim = self.state.sessions.claim_payment(&id, ttl).await;
+                metrics::counter!(m::REPLAY_CLAIMS, "outcome" => replay_claim_label(&claim))
+                    .increment(1);
+                if matches!(claim, PaymentClaim::Backend) {
+                    metrics::counter!(m::STORE_ERRORS, "store" => "replay").increment(1);
+                }
                 if let Some(error) = match claim {
                     PaymentClaim::Fresh => None,
                     PaymentClaim::Replay { first_seen } => {
@@ -301,8 +323,23 @@ impl X402Auth {
             // Under Deferred we only VERIFY here; the charge happens once the
             // upstream has actually served the request.
             if settle == SettlePolicy::Deferred {
-                return match self.state.facilitator.verify(&payload, &requirements).await {
+                let started = std::time::Instant::now();
+                let verified = self.state.facilitator.verify(&payload, &requirements).await;
+                metrics::histogram!(
+                    m::VERIFICATION_SECONDS,
+                    "mode" => mode_label(self.state.config.verification_mode),
+                )
+                .record(started.elapsed().as_secs_f64());
+
+                return match verified {
                     Ok(payer) => {
+                        metrics::counter!(
+                            m::PAYMENTS,
+                            "outcome" => "verified",
+                            "code" => "ok",
+                            "mode" => mode_label(self.state.config.verification_mode),
+                        )
+                        .increment(1);
                         tracing::debug!(%payer, "payment verified; settlement deferred until the upstream succeeds");
                         Decision::Allow {
                             tier: Tier::Paid,
@@ -319,6 +356,13 @@ impl X402Auth {
                         }
                     }
                     Err(e) => {
+                        metrics::counter!(
+                            m::PAYMENTS,
+                            "outcome" => "rejected",
+                            "code" => e.code(),
+                            "mode" => mode_label(self.state.config.verification_mode),
+                        )
+                        .increment(1);
                         tracing::warn!(error = %e, code = e.code(), "payment rejected");
                         let mut challenge = PaymentRequired::new(
                             format!("payment rejected: {e}"),
@@ -385,6 +429,16 @@ impl X402Auth {
                         ));
                     }
 
+                    metrics::counter!(
+                        m::PAYMENTS,
+                        "outcome" => "settled",
+                        "code" => "ok",
+                        "mode" => mode_label(self.state.config.verification_mode),
+                    )
+                    .increment(1);
+                    if token.is_some() {
+                        metrics::counter!(m::SESSIONS, "event" => "created").increment(1);
+                    }
                     tracing::info!(
                         payer = settlement.payer.as_deref().unwrap_or("<unknown>"),
                         transaction = %settlement.transaction,
@@ -400,6 +454,13 @@ impl X402Auth {
                     }
                 }
                 Err(e) => {
+                    metrics::counter!(
+                        m::PAYMENTS,
+                        "outcome" => "rejected",
+                        "code" => e.code(),
+                        "mode" => mode_label(self.state.config.verification_mode),
+                    )
+                    .increment(1);
                     tracing::warn!(error = %e, code = e.code(), "payment rejected");
                     let mut challenge = PaymentRequired::new(
                         // The human string stays here; the machine-readable
@@ -437,6 +498,14 @@ impl X402Auth {
         };
 
         if self.state.limiter.check(ip).await {
+            metrics::counter!(m::RATE_LIMIT, "outcome" => "allowed").increment(1);
+            metrics::counter!(
+                m::REQUESTS,
+                "tier" => "free",
+                "decision" => "allow",
+                "policy" => policy_label(policy),
+            )
+            .increment(1);
             Decision::Allow {
                 tier: Tier::Free,
                 payer: None,
@@ -445,6 +514,14 @@ impl X402Auth {
                 pending: None,
             }
         } else {
+            metrics::counter!(m::RATE_LIMIT, "outcome" => "denied").increment(1);
+            metrics::counter!(
+                m::REQUESTS,
+                "tier" => "free",
+                "decision" => "challenge",
+                "policy" => policy_label(policy),
+            )
+            .increment(1);
             tracing::debug!(%ip, "free tier exhausted; returning payment challenge");
             let mut challenge = PaymentRequired::new(
                 "free tier rate limit exceeded; pay to unlock a higher limit",
@@ -648,6 +725,44 @@ fn resource_url(
     format!("{scheme}://{}{}", http.host, http.path)
 }
 
+/// Label for a policy name, collapsing `None` to a fixed string.
+///
+/// Policy names come from operator config, not from clients, so the label space
+/// is bounded by the config file rather than by traffic.
+fn policy_label(policy: Option<&str>) -> String {
+    policy.unwrap_or("default").to_string()
+}
+
+/// Stable label for a replay-claim outcome.
+fn replay_claim_label(claim: &PaymentClaim) -> &'static str {
+    match claim {
+        PaymentClaim::Fresh => "fresh",
+        PaymentClaim::Replay { .. } => "replay",
+        PaymentClaim::Backend => "backend_error",
+    }
+}
+
+/// Stable label for the verification mode.
+fn mode_label(mode: crate::config::VerificationMode) -> &'static str {
+    match mode {
+        crate::config::VerificationMode::StubAcceptAll => "stub",
+        crate::config::VerificationMode::SuiGrpc => "sui-grpc",
+    }
+}
+
+/// Stable label for a session rejection reason.
+fn session_rejection_label(reason: crate::session::SessionRejection) -> &'static str {
+    use crate::session::SessionRejection::*;
+    match reason {
+        Malformed => "malformed",
+        Expired => "expired",
+        Unknown => "unknown",
+        WrongPolicy => "wrong_policy",
+        QuotaExhausted => "quota_exhausted",
+        Backend => "backend",
+    }
+}
+
 /// How long a payment stays claimed, given the advertised timeout.
 ///
 /// Longer than the window on purpose, and never shorter than a floor: the claim
@@ -801,6 +916,7 @@ pub mod test_support {
     pub fn app_state(free_limit: u64, quota: u64) -> Arc<AppState> {
         let config = Config {
             listen_addr: "127.0.0.1:50051".parse().unwrap(),
+            metrics_listen_addr: None,
             facilitator_api_listen_addr: None,
             sui_grpc_url: "https://fullnode.testnet.sui.io:443".into(),
             sui_chain: "testnet".into(),

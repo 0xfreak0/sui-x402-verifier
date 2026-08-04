@@ -50,6 +50,7 @@ use tonic::{Request, Response, Status, Streaming};
 use crate::auth::{
     AppState, Decision, HEADER_PAYER, HEADER_TIER, HeaderView, PendingPayment, SettlePolicy,
 };
+use crate::metrics as m;
 use crate::x402::{self, HEADER_PAYMENT_REQUIRED, HEADER_PAYMENT_RESPONSE, HEADER_PAYMENT_SESSION};
 
 /// Envoy `ext_proc` implementation.
@@ -109,7 +110,7 @@ fn continue_with_removals(headers: Vec<HeaderValueOption>, remove: Vec<String>) 
     let mutate = !headers.is_empty() || !remove.is_empty();
     HeadersResponse {
         response: Some(CommonResponse {
-            header_mutation: mutate.then(|| HeaderMutation {
+            header_mutation: mutate.then_some(HeaderMutation {
                 set_headers: headers,
                 remove_headers: remove,
             }),
@@ -439,11 +440,14 @@ async fn handle_response_headers(
 
     let mut mutations = Vec::new();
 
-    match state
+    let started = std::time::Instant::now();
+    let settled = state
         .facilitator
         .settle(&pending.payload, &pending.requirements)
-        .await
-    {
+        .await;
+    metrics::histogram!(m::SETTLEMENT_SECONDS).record(started.elapsed().as_secs_f64());
+
+    match settled {
         Ok(mut settlement) => {
             let token = match &settlement.payer {
                 None => None,
@@ -453,6 +457,11 @@ async fn handle_response_headers(
                     .await
                     .ok(),
             };
+            metrics::counter!(m::PAYMENTS, "outcome" => "settled", "code" => "ok", "mode" => "deferred")
+                .increment(1);
+            if token.is_some() {
+                metrics::counter!(m::SESSIONS, "event" => "created").increment(1);
+            }
             if let Some(token) = &token {
                 settlement.extensions = Some(x402::session_extension_grant(
                     token,
@@ -476,6 +485,15 @@ async fn handle_response_headers(
             // The resource has already been delivered. We cannot un-serve it,
             // so the operator eats this one — which is the better failure than
             // charging for something the client never received.
+            // The alert-worthy counter: revenue is being lost right now.
+            metrics::counter!(m::SETTLEMENT_AFTER_SERVE_FAILURES, "code" => e.code()).increment(1);
+            metrics::counter!(
+                m::PAYMENTS,
+                "outcome" => "settle_failed_after_serve",
+                "code" => e.code(),
+                "mode" => "deferred",
+            )
+            .increment(1);
             tracing::error!(
                 error = %e,
                 code = e.code(),

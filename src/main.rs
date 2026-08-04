@@ -8,6 +8,7 @@ mod auth;
 mod config;
 mod ext_proc;
 mod facilitator_api;
+mod metrics;
 mod ratelimit;
 mod session;
 mod sui;
@@ -67,6 +68,16 @@ async fn main() -> Result<()> {
             "verification_mode is 'stub-accept-all': payments are ACCEPTED WITHOUT \
              on-chain verification and NO FUNDS MOVE. Development use only."
         );
+    }
+
+    // Install before anything can emit. A busy port degrades to "no metrics"
+    // rather than taking the gateway down — telemetry must never be the reason
+    // payments stop working.
+    if let Some(addr) = config.metrics_listen_addr {
+        match metrics::install(addr) {
+            Ok(()) => tracing::info!(%addr, "serving Prometheus metrics at /metrics"),
+            Err(e) => tracing::error!(error = %e, %addr, "could not start the metrics exporter"),
+        }
     }
 
     let hmac_key = config.hmac_key()?;

@@ -6,8 +6,18 @@
 #
 #   export X402_SESSION_HMAC_SECRET=$(openssl rand -hex 32)
 
-# Address the ext_authz gRPC server binds to. Envoy dials this.
+# Address the ext_authz / ext_proc gRPC server binds to. Envoy dials this.
 listen_addr: "127.0.0.1:50051"
+
+# Prometheus exporter, serving /metrics. Disabled unless set. Bind it to a
+# private interface — the endpoint is unauthenticated.
+# metrics_listen_addr: "127.0.0.1:9090"
+
+# The standard facilitator HTTP API (spec §7: /verify, /settle, /supported).
+# Disabled unless set. Envoy does NOT use these — it uses the gRPC service
+# above. §7 exists so OTHER x402 resource servers can delegate Sui work here.
+# Unauthenticated: bind loopback or a private interface. /settle moves money.
+# facilitator_api_listen_addr: "127.0.0.1:50052"
 
 # Sui fullnode used for verification and settlement.
 #
