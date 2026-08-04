@@ -66,12 +66,28 @@ Tests: `sui::credits_the_exact_amount_to_the_right_address_and_asset`,
 `sums_multiple_credits_to_the_same_recipient`. Validated live on testnet against
 a wallet-signed transfer, including the four negative cases.
 
-**Gap in step 3.** A transaction already committed on chain should be rejected
-before broadcast. We rely on the simulation's status and, failing that, on the
-chain rejecting the duplicate at execution. `sui-rpc` exposes
-`execute_transaction_and_wait_for_checkpoint`, which handles duplicate
-submissions gracefully by probing the ledger; adopting it would close this
-properly. Not yet done.
+**Gap in step 3, demonstrated.** Simulation does not reject an authorization
+whose input coins have since been spent. Measured on testnet:
+
+1. Build and sign a payment pinning USDC coin `0x3a4d…`. `/verify` → `isValid: true`.
+2. Spend that same coin in an unrelated transaction (`2WUTtXX…`, Success).
+3. `/verify` again → **still `isValid: true`**.
+4. `/settle` → fails: `ExecuteTransaction: Client specified an invalid argument`.
+
+So verification passes on an authorization that is already dead. Execution
+enforces object versions; simulation, at least as we call it, does not. This
+matters most on the deferred-settlement path, where the gap between verify and
+settle is exactly the window an upstream request takes.
+
+Two things would narrow it, neither yet done:
+
+- probe the ledger for the transaction digest and for the input objects' current
+  versions during verification, rather than trusting the simulation alone;
+- use `sui-rpc`'s `execute_transaction_and_wait_for_checkpoint`, which handles
+  duplicate submissions by probing the ledger.
+
+Note this is not a flaw the scheme's ordering introduces so much as one it
+*exposes*: see "The pay-after-service window" below.
 
 ## Settlement (§ Settlement)
 
@@ -111,6 +127,42 @@ project assumed Address Balances had shipped and concluded that settlement would
 be gas-free for everyone. It has not, and it is not. The current scheme requires
 a fully-formed signed transaction where the client pays gas (observed:
 ~0.0023 SUI on a testnet transfer) unless a facilitator sponsors it.
+
+## The pay-after-service window
+
+The scheme's sequencing (verify → work → settle) protects the client: they are
+only charged once the resource has been produced. It is worth being precise
+about what it does **not** do, because "settle afterwards" sounds like it binds
+the payer and it does not.
+
+**Nothing enforces payment after the fact.** A Sui payment authorization is a
+signed transaction pinning specific coin objects *at specific versions*. Between
+verify and settle, the payer can spend those coins in any other transaction,
+and the authorization becomes permanently unexecutable. Demonstrated above: the
+settle failed with `Client specified an invalid argument` after the payer moved
+the pinned coin.
+
+So the ordering does not shift risk from the client to nobody — it shifts risk
+from the client **to the server**:
+
+| Ordering | Client risk | Server risk |
+|---|---|---|
+| settle first (`ext_authz`) | charged for a request that then fails | none |
+| settle after (`ext_proc`, spec order) | none | resource served, payment now dead |
+
+The exposure is bounded by how long the work takes. A 50 ms upstream call is a
+50 ms window; a 30-second query is a 30-second window during which a motivated
+client can invalidate the authorization deterministically, not just by luck.
+
+**Sessions reduce this by roughly the quota factor.** One settlement covers a
+whole session, so the window opens once per session rather than once per
+request. At the default 1000-request quota, a client racing successfully steals
+one session's worth of access, and cannot repeat it without signing a fresh
+payment that must itself settle.
+
+This is why the residual risk is stated plainly rather than described as solved,
+and why `x402_settlement_after_serve_failures_total` exists as an alert: it is
+the metric that counts exactly this happening.
 
 ## Where we deviate, and why
 

@@ -260,10 +260,21 @@ and settled only after a success.
 Both are served on the same port; `envoy.yaml` selects between them. **Do not
 enable both** — each would independently charge for the same request.
 
-The residual risk of deferring: if the upstream succeeds but settlement then
-fails, the resource was delivered unpaid. That costs the operator a request
-instead of charging a user for something they never received, which is the better
-failure to carry. It is logged at `error`.
+**The residual risk of deferring is real and demonstrable.** A Sui payment
+authorization pins specific coin objects at specific versions, so between verify
+and settle the payer can spend those coins elsewhere and the authorization
+becomes permanently unexecutable. Measured on testnet: `/verify` returned
+`isValid: true`, the payer then moved the pinned coin, and `/settle` failed.
+
+So the spec's ordering does not make payment enforceable after the fact — it
+moves the risk from the client to the server. The exposure is bounded by how long
+the upstream takes, and sessions shrink it by the quota factor (one settlement
+covers ~1000 requests, so the window opens once per session, not once per
+request). `x402_settlement_after_serve_failures_total` counts exactly this.
+
+Worse, and separately: **verification passes on an authorization that is already
+dead** — simulation does not reject spent input coins the way execution does.
+See `docs/sui-scheme-conformance.md`.
 
 ## The facilitator API
 
