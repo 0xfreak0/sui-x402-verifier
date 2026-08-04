@@ -13,13 +13,28 @@
 # Prerequisites: the verifier and Envoy must already be running. See
 # scripts/run-local.sh, or the README.
 #
-# Usage: scripts/e2e-test.sh [envoy_url]
+# Payment mode:
+#   default  placeholder bytes — works against verification_mode: stub-accept-all
+#   --real   a transaction built and signed by the local `sui` CLI wallet, which
+#            is what verification_mode: sui-grpc requires. NOTE: with ext_proc
+#            and a successful upstream this SETTLES, moving real testnet USDC.
+#
+# Usage: scripts/e2e-test.sh [--real] [envoy_url]
 
 set -uo pipefail
+
+PAY_MODE=placeholder
+if [[ "${1:-}" == "--real" ]]; then
+  PAY_MODE=real
+  shift
+fi
 
 ENVOY="${1:-http://localhost:10000}"
 GRPC_ADDR="${GRPC_ADDR:-localhost:10000}"
 QUERY='{"query":"{ chainIdentifier }"}'
+
+# shellcheck source=lib/build-payment.sh
+source "$(dirname "$0")/lib/build-payment.sh"
 
 pass=0
 fail=0
@@ -95,21 +110,14 @@ fi
 # ---------------------------------------------------------------------------
 step "3. Paying unlocks the paid tier and mints a session"
 # ---------------------------------------------------------------------------
-# x402 v2 PaymentPayload (spec §5.2.1). A conformant client echoes back the
-# requirements it chose in `accepted`; the server re-checks every field, so the
-# values below are lifted from the challenge decoded above rather than invented.
-#
-# In stub-accept-all mode the facilitator does not touch the chain, so the Sui
-# payload is placeholder base64. With verification_mode: sui-grpc `transaction`
-# must be real BCS-serialized TransactionData and `signature` a real signature
-# over it.
+# Build the payment from the terms the server just advertised. A conformant
+# client echoes those back rather than inventing them.
 asset=$(sed -n 's/.*"asset":"\([^"]*\)".*/\1/p' <<<"$decoded")
-timeout_secs=$(sed -n 's/.*"maxTimeoutSeconds":\([0-9]*\).*/\1/p' <<<"$decoded")
-payment_json=$(cat <<EOF
-{"x402Version":2,"accepted":{"scheme":"exact","network":"$network","amount":"$amount","asset":"$asset","payTo":"$pay_to","maxTimeoutSeconds":${timeout_secs:-60}},"payload":{"signature":"cGxhY2Vob2xkZXItc2ln","transaction":"cGxhY2Vob2xkZXItdHg="}}
-EOF
-)
-PAYMENT_SIGNATURE=$(printf '%s' "$payment_json" | base64 | tr -d '\n')
+PAYMENT_SIGNATURE=$(build_payment "$PAY_MODE" "$network" "$amount" "$asset" "$pay_to") || {
+  bad "could not build a $PAY_MODE payment"
+  PAYMENT_SIGNATURE=""
+}
+[[ "$PAY_MODE" == "real" ]] && echo "     (real wallet-signed transfer of $amount base units)"
 
 body=$(gql -H "payment-signature: $PAYMENT_SIGNATURE")
 code=$(status)

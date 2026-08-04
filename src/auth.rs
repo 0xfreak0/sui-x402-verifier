@@ -130,7 +130,7 @@ pub enum Decision {
 #[derive(Debug)]
 pub struct AppState {
     pub config: Config,
-    pub sessions: SessionStore,
+    pub sessions: Arc<SessionStore>,
     pub limiter: RateLimiter,
     /// Shared with the optional facilitator HTTP API so both surfaces enforce
     /// identical rules.
@@ -658,7 +658,7 @@ fn resource_url(
 /// chain's own object-version replay protection only binds once settlement
 /// lands, so before that this cache is the only thing standing between one
 /// signature and N sessions.
-fn replay_ttl(max_timeout_seconds: u64) -> u64 {
+pub fn replay_ttl(max_timeout_seconds: u64) -> u64 {
     const FLOOR: u64 = 300;
     const MULTIPLIER: u64 = 10;
     max_timeout_seconds.saturating_mul(MULTIPLIER).max(FLOOR)
@@ -834,11 +834,11 @@ pub mod test_support {
             )
             .expect("stub mode never connects"),
         );
-        let sessions = SessionStore::Memory(MemorySessionStore::new(
+        let sessions = Arc::new(SessionStore::Memory(MemorySessionStore::new(
             config.hmac_key().unwrap(),
             config.paid_tier.duration_secs,
             config.paid_tier.quota,
-        ));
+        )));
         let limiter = RateLimiter::Memory(MemoryRateLimiter::new(
             config.free_tier.max_requests,
             config.free_tier.window_secs,

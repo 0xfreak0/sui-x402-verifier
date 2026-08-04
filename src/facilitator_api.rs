@@ -28,19 +28,32 @@ use axum::{
     routing::{get, post},
 };
 
+use crate::session::{PaymentClaim, SessionStore};
 use crate::x402::{
-    Facilitator, FacilitatorRequest, SettlementResponse, SupportedResponse, VerifyResponse,
+    self, Facilitator, FacilitatorRequest, SettlementResponse, SupportedResponse, VerifyResponse,
     X402_VERSION,
 };
 
+/// State shared by the §7 handlers.
+#[derive(Clone)]
+pub struct ApiState {
+    pub facilitator: Arc<Facilitator>,
+    /// Shared with the gateway path so a payment spent through one surface
+    /// cannot be spent again through the other.
+    pub sessions: Arc<SessionStore>,
+}
+
 /// Build the router. Kept separate from serving so tests can exercise it
 /// without binding a port.
-pub fn router(facilitator: Arc<Facilitator>) -> Router {
+pub fn router(facilitator: Arc<Facilitator>, sessions: Arc<SessionStore>) -> Router {
     Router::new()
         .route("/verify", post(verify))
         .route("/settle", post(settle))
         .route("/supported", get(supported))
-        .with_state(facilitator)
+        .with_state(ApiState {
+            facilitator,
+            sessions,
+        })
 }
 
 /// A request whose envelope is wrong before any payment logic runs.
@@ -98,12 +111,16 @@ fn check_version(request: &FacilitatorRequest) -> Result<(), BadRequest> {
 /// successful verification that answered "no". Only a malformed envelope is a
 /// 4xx.
 async fn verify(
-    State(facilitator): State<Arc<Facilitator>>,
+    State(state): State<ApiState>,
     Json(request): Json<FacilitatorRequest>,
 ) -> Result<Json<VerifyResponse>, BadRequest> {
     check_version(&request)?;
 
-    match facilitator
+    // Deliberately does NOT claim the payment: verification is non-mutating,
+    // and burning the authorization here would make the spec's
+    // verify-then-settle sequence impossible.
+    match state
+        .facilitator
         .verify(&request.payment_payload, &request.payment_requirements)
         .await
     {
@@ -127,28 +144,56 @@ async fn verify(
 
 /// `POST /settle` — execute a verified payment (§7.2).
 async fn settle(
-    State(facilitator): State<Arc<Facilitator>>,
+    State(state): State<ApiState>,
     Json(request): Json<FacilitatorRequest>,
 ) -> Result<Json<SettlementResponse>, BadRequest> {
     check_version(&request)?;
 
-    match facilitator
+    // Claim before broadcasting. Without this a caller could POST the same
+    // payload repeatedly: the chain would reject the duplicate on its own, but
+    // only after the race, and with an error that says nothing about replay.
+    // The claim is shared with the gateway path, so a payment spent through
+    // one surface cannot be spent again through the other.
+    if let Some(id) = x402::payment_id(&request.payment_payload) {
+        let ttl = crate::auth::replay_ttl(request.payment_requirements.max_timeout_seconds);
+        match state.sessions.claim_payment(&id, ttl).await {
+            PaymentClaim::Fresh => {}
+            PaymentClaim::Replay { first_seen } => {
+                let error = x402::FacilitatorError::Replay { first_seen };
+                tracing::warn!(error = %error, "settle refused a replayed payment");
+                return Ok(Json(state.facilitator.failure_receipt(error.code())));
+            }
+            PaymentClaim::Backend => {
+                let error = x402::FacilitatorError::ReplayCacheUnavailable;
+                tracing::error!(error = %error, "settle refused: replay cache unavailable");
+                return Ok(Json(state.facilitator.failure_receipt(error.code())));
+            }
+        }
+    }
+
+    match state
+        .facilitator
         .settle(&request.payment_payload, &request.payment_requirements)
         .await
     {
         Ok(receipt) => Ok(Json(receipt)),
         Err(e) => {
             tracing::debug!(error = %e, "settle rejected a payment");
+            // The authorization was never spent, so release it: the caller can
+            // retry rather than being forced to sign a fresh transaction.
+            if let Some(id) = x402::payment_id(&request.payment_payload) {
+                state.sessions.release_payment(&id).await;
+            }
             // Per §7.2's error example this is still a SettlementResponse, with
             // success:false and an empty transaction — not an HTTP error.
-            Ok(Json(facilitator.failure_receipt(e.code())))
+            Ok(Json(state.facilitator.failure_receipt(e.code())))
         }
     }
 }
 
 /// `GET /supported` — schemes, networks and extensions on offer (§7.3).
-async fn supported(State(facilitator): State<Arc<Facilitator>>) -> Json<SupportedResponse> {
-    Json(facilitator.supported())
+async fn supported(State(state): State<ApiState>) -> Json<SupportedResponse> {
+    Json(state.facilitator.supported())
 }
 
 #[cfg(test)]
@@ -159,6 +204,15 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt; // for `oneshot`
+
+    fn sessions() -> Arc<SessionStore> {
+        use crate::session::MemorySessionStore;
+        Arc::new(SessionStore::Memory(MemorySessionStore::new(
+            vec![7u8; 32],
+            3600,
+            100,
+        )))
+    }
 
     fn facilitator() -> Arc<Facilitator> {
         Arc::new(
@@ -202,8 +256,34 @@ mod tests {
         .unwrap()
     }
 
+    /// POST against a router whose state persists across calls, so replay
+    /// behaviour is observable.
+    async fn post_twice(path: &str, body: String) -> Vec<serde_json::Value> {
+        let app = router(facilitator(), sessions());
+        let mut out = Vec::new();
+        for _ in 0..2 {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(path)
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.clone()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            out.push(serde_json::from_slice(&bytes).unwrap());
+        }
+        out
+    }
+
     async fn post(path: &str, body: String) -> (StatusCode, serde_json::Value) {
-        let response = router(facilitator())
+        let response = router(facilitator(), sessions())
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -287,8 +367,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn settle_refuses_to_spend_the_same_payment_twice() {
+        // /settle bypassed the replay cache entirely: a caller could POST the
+        // same payload repeatedly. The chain rejects the duplicate on its own,
+        // but only after the race and with an error that says nothing about
+        // replay.
+        let results = post_twice("/settle", request_body(payload(), requirements())).await;
+        assert_eq!(results[0]["success"], serde_json::json!(true));
+        assert_eq!(results[1]["success"], serde_json::json!(false));
+        assert_eq!(
+            results[1]["errorReason"],
+            serde_json::json!("invalid_transaction_state")
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_does_not_burn_the_authorization() {
+        // Verification is non-mutating; claiming here would make the spec's
+        // verify-then-settle sequence impossible.
+        let results = post_twice("/verify", request_body(payload(), requirements())).await;
+        assert_eq!(results[0]["isValid"], serde_json::json!(true));
+        assert_eq!(
+            results[1]["isValid"],
+            serde_json::json!(true),
+            "verifying twice must stay valid"
+        );
+    }
+
+    #[tokio::test]
     async fn supported_lists_scheme_network_and_extensions() {
-        let response = router(facilitator())
+        let response = router(facilitator(), sessions())
             .oneshot(
                 Request::builder()
                     .uri("/supported")
@@ -328,7 +436,7 @@ mod tests {
             )
             .expect("connecting is lazy; the channel is not dialed until first use"),
         );
-        let response = router(facilitator)
+        let response = router(facilitator, sessions())
             .oneshot(
                 Request::builder()
                     .method("POST")

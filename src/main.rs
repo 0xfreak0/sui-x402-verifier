@@ -145,15 +145,19 @@ async fn main() -> Result<()> {
 
     let facilitator_api_addr = config.facilitator_api_listen_addr;
 
+    // Shared with the §7 API so a payment cannot be spent once through the
+    // gateway and again through /settle.
+    let sessions = Arc::new(sessions);
+
     let state = Arc::new(AppState {
         config,
-        sessions,
+        sessions: Arc::clone(&sessions),
         limiter,
         facilitator: Arc::clone(&facilitator),
     });
 
     if let Some(addr) = facilitator_api_addr {
-        let router = facilitator_api::router(Arc::clone(&facilitator));
+        let router = facilitator_api::router(Arc::clone(&facilitator), Arc::clone(&sessions));
         tracing::info!(
             %addr,
             "serving the x402 facilitator HTTP API (POST /verify, POST /settle, GET /supported)"

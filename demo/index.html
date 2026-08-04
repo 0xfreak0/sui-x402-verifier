@@ -109,9 +109,14 @@
   </div>
 
   <p class="hint">
-    The verifier is running in <code>stub-accept-all</code> mode: payments are accepted
-    without touching the chain and <strong>no funds move</strong>, so no wallet is needed.
-    With real settlement this button would hand off to a Sui wallet to sign the transfer.
+    <strong>Which mode is the gateway in?</strong> In <code>stub-accept-all</code> the
+    Pay button works as-is: payments are accepted without touching the chain and
+    <strong>no funds move</strong>. In <code>sui-grpc</code> the signature is verified
+    on chain and the transfer is simulated, so this button's placeholder payment is
+    correctly refused — a real payment needs a wallet signature
+    (<code>@mysten/dapp-kit</code>'s <code>signTransaction</code>, or
+    <code>scripts/pay-with-sui-cli.sh</code>). Either way the free tier, the 402
+    challenge and the session flow above behave identically.
   </p>
 </div>
 
@@ -199,6 +204,24 @@ async function callApi(extraHeaders = {}) {
       try { hint += '\nReceipt: ' + JSON.stringify(JSON.parse(atob(receipt))); } catch {}
     }
     $('session-hint').textContent = hint;
+  }
+
+  // A refused payment carries a receipt with a machine-readable reason, which
+  // is how a client distinguishes "rejected" from "you never paid".
+  if (receipt && res.status === 402) {
+    try {
+      const parsed = JSON.parse(atob(receipt));
+      if (parsed.errorReason === 'invalid_payload') {
+        $('session-hint').textContent =
+          'This gateway is running verification_mode: sui-grpc, so it verifies the ' +
+          'signature on chain and the placeholder payment above cannot satisfy it. ' +
+          'That is the correct answer, not a bug. Produce a real wallet-signed ' +
+          'payment with: scripts/pay-with-sui-cli.sh — or run the gateway in ' +
+          'stub-accept-all mode to exercise the protocol without a wallet.';
+      } else {
+        $('session-hint').textContent = 'Payment refused: ' + parsed.errorReason;
+      }
+    } catch {}
   }
 
   if (res.status === 200) {

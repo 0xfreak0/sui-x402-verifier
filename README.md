@@ -61,8 +61,29 @@ you have neither `envoy` nor `func-e` installed).
 
 ```bash
 scripts/run-local.sh          # builds, starts the verifier + Envoy
-scripts/e2e-test.sh           # in another shell: 13 assertions over the full flow
+scripts/e2e-test.sh           # in another shell: 14 assertions over the full flow
 ```
+
+Against a gateway in `sui-grpc` mode, run the same suite with a **real**
+wallet-signed payment. This settles on chain and moves testnet USDC:
+
+```bash
+scripts/e2e-test.sh --real
+```
+
+Verified doing exactly that — a 0.00001 USDC payment through Envoy, settled
+after the upstream succeeded:
+
+```
+✓ payment accepted, HTTP 200 while the free tier is still exhausted
+✓ session token issued
+✓ PAYMENT-RESPONSE receipt: {"success":true,"transaction":"5WWWLaQNw6Xd…"}
+✓ session reused without re-paying
+Result: 14 passed, 0 failed
+```
+
+On chain: `effects.status.success = true`, checkpoint `368081861`, recipient
+credited exactly 10 base units.
 
 By hand — the first 5 requests succeed, the 6th gets a challenge:
 
