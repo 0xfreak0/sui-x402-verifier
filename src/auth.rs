@@ -215,7 +215,7 @@ impl X402Auth {
 
         // ---- 1. Existing paid session -------------------------------------
         if let Some(token) = &session_token {
-            match self.state.sessions.consume(token).await {
+            match self.state.sessions.consume(token, policy).await {
                 SessionOutcome::Accepted { payer, remaining } => {
                     tracing::debug!(%payer, remaining, "paid request served from session");
                     return Decision::Allow {
@@ -358,19 +358,21 @@ impl X402Auth {
                             );
                             None
                         }
-                        Some(payer) => match self.state.sessions.create_session(payer).await {
-                            Ok(token) => Some(token),
-                            Err(e) => {
-                                tracing::error!(
-                                    error = %e,
-                                    %payer,
-                                    transaction = %settlement.transaction,
-                                    "payment settled but the session could not be stored; \
-                                     serving this request without issuing a session"
-                                );
-                                None
+                        Some(payer) => {
+                            match self.state.sessions.create_session(payer, policy).await {
+                                Ok(token) => Some(token),
+                                Err(e) => {
+                                    tracing::error!(
+                                        error = %e,
+                                        %payer,
+                                        transaction = %settlement.transaction,
+                                        "payment settled but the session could not be stored; \
+                                         serving this request without issuing a session"
+                                    );
+                                    None
+                                }
                             }
-                        },
+                        }
                     };
 
                     // Return the token through the receipt's `extensions`, the
@@ -1193,6 +1195,67 @@ mod tests {
         };
         let err = challenge.error.unwrap_or_default();
         assert!(err.contains("network"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_session_bought_on_one_policy_does_not_unlock_another() {
+        // The pricing bypass this closes: policies price routes differently,
+        // so an unscoped session lets you pay the cheap route's price and use
+        // the expensive route.
+        let a = auth(0, 10);
+        let pay = headers(&[(HEADER_PAYMENT_SIGNATURE, &payment_header())]);
+        let Decision::Allow {
+            session_token: Some(token),
+            ..
+        } = a
+            .decide(
+                &HeaderView::new(Some(&pay)),
+                ip(),
+                PATH,
+                Some("cheap"),
+                RESOURCE_URL,
+                SettlePolicy::Immediate,
+            )
+            .await
+        else {
+            panic!("expected a session token");
+        };
+
+        let map = headers(&[(HEADER_PAYMENT_SESSION, &token)]);
+        let view = HeaderView::new(Some(&map));
+
+        // Works on the policy it was bought for.
+        assert!(matches!(
+            a.decide(
+                &view,
+                ip(),
+                PATH,
+                Some("cheap"),
+                RESOURCE_URL,
+                SettlePolicy::Immediate
+            )
+            .await,
+            Decision::Allow {
+                tier: Tier::Paid,
+                ..
+            }
+        ));
+        // Not on a different one — falls through to the (exhausted) free tier.
+        assert!(
+            matches!(
+                a.decide(
+                    &view,
+                    ip(),
+                    PATH,
+                    Some("expensive"),
+                    RESOURCE_URL,
+                    SettlePolicy::Immediate
+                )
+                .await,
+                Decision::Deny { .. }
+            ),
+            "a session must not cross policies"
+        );
     }
 
     #[tokio::test]

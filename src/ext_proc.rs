@@ -71,6 +71,9 @@ impl X402ExtProc {
 #[derive(Debug, Default)]
 struct StreamState {
     pending: Option<Box<PendingPayment>>,
+    /// Policy the request phase resolved, so the session minted on the response
+    /// path is scoped to what was actually paid for.
+    policy: Option<String>,
 }
 
 /// Build a `HeaderValueOption` for a response mutation.
@@ -326,6 +329,7 @@ async fn handle_request_headers(
         } => {
             // Hold the verified payment for the response phase.
             stream_state.pending = pending;
+            stream_state.policy = policy;
 
             let mut mutations = vec![header(HEADER_TIER, tier.as_str())];
             if let Some(payer) = payer {
@@ -422,7 +426,11 @@ async fn handle_response_headers(
         Ok(mut settlement) => {
             let token = match &settlement.payer {
                 None => None,
-                Some(payer) => state.sessions.create_session(payer).await.ok(),
+                Some(payer) => state
+                    .sessions
+                    .create_session(payer, stream_state.policy.as_deref())
+                    .await
+                    .ok(),
             };
             if let Some(token) = &token {
                 settlement.extensions = Some(x402::session_extension_grant(
