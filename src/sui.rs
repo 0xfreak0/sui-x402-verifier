@@ -205,11 +205,14 @@ impl SuiVerifier {
                         pb::Transaction::default().with_bcs(pb::Bcs::from(transaction_bytes)),
                     )
                     .with_signatures(vec![pb::UserSignature::from(signature)])
+                    // NOTE the asymmetry with SimulateTransaction above.
+                    // Execute's read_mask selects fields of *ExecutedTransaction*
+                    // ("digest", "effects.status"), while Simulate's selects
+                    // fields of its *response* ("transaction.digest", …). Using
+                    // the simulate form here is rejected outright with
+                    // `invalid read_mask path: transaction.effects.status`.
                     .with_read_mask(prost_types::FieldMask {
-                        paths: vec![
-                            "transaction.digest".into(),
-                            "transaction.effects.status".into(),
-                        ],
+                        paths: vec!["digest".into(), "effects.status".into()],
                     }),
             )
             .await
