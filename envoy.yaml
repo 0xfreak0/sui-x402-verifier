@@ -47,8 +47,10 @@ static_resources:
                           allow_origin_string_match:
                             - safe_regex: { regex: ".*" }
                           allow_methods: "GET, POST, OPTIONS"
-                          allow_headers: "content-type, payment-signature, x-payment-session"
-                          expose_headers: "payment-required, payment-response, x-payment-session"
+                          allow_headers: "content-type, payment-signature, x-payment-session, x-grpc-web, grpc-timeout, x-user-agent"
+                          # grpc-status/grpc-message must be exposed too, or a
+                          # grpc-web client cannot read the denial status.
+                          expose_headers: "payment-required, payment-response, x-payment-session, grpc-status, grpc-message"
                           max_age: "86400"
                       routes:
                         # gRPC method paths are /<package>.<Service>/<Method>,
@@ -123,6 +125,15 @@ static_resources:
                   # 2. ext_authz BEFORE router (and before any ratelimit filter)
                   #    so the headers it injects exist by the time descriptors
                   #    are built.
+                  # Browsers cannot speak native gRPC — fetch/XHR give no control
+                  # over HTTP/2 frames, and HTTP/2 trailers are unreadable from
+                  # JS. grpc-web carries trailers in the response body instead.
+                  # This filter translates grpc-web <-> gRPC, so the upstream
+                  # fullnode sees ordinary gRPC and needs no changes.
+                  - name: envoy.filters.http.grpc_web
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.grpc_web.v3.GrpcWeb
+
                   - name: envoy.filters.http.cors
                     typed_config:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.cors.v3.Cors

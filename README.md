@@ -82,10 +82,39 @@ web page cannot use it at all:
   `OPTIONS` is itself metered and answered with `402`, and the browser never
   sends the real request.
 
-What a browser *cannot* do alone is sign a Sui transaction. That needs a wallet
-(`@mysten/dapp-kit` with Slush/Sui Wallet, or zkLogin) — but it is not a proxy
-concern: the verifier only reads a header and does not care how the signature was
-produced. In `stub-accept-all` mode no wallet is needed at all.
+### grpc-web
+
+Browsers cannot speak native gRPC — `fetch`/XHR expose no control over HTTP/2
+frames, and HTTP/2 trailers are unreadable from JS. grpc-web solves this by
+carrying trailers in the response body, and Envoy's `grpc_web` filter translates
+it so the upstream fullnode needs no changes. Verified working from a browser
+origin, both directions:
+
+```
+allowed:  HTTP 200, content-type: application/grpc-web+proto → real Sui data
+denied:   HTTP 200, grpc-status: 8, grpc-message: free tier rate limit exceeded…
+          payment-required: <base64 challenge>
+```
+
+`grpc-status` and `grpc-message` must be in `expose_headers` or a grpc-web client
+cannot read the denial, and `x-grpc-web` / `grpc-timeout` must be in
+`allow_headers` or the preflight fails. Both are set.
+
+### Signing in the browser
+
+A browser cannot sign a Sui transaction on its own — that needs a wallet
+extension (Slush, Suiet, …) through the Wallet Standard, normally via
+`@mysten/dapp-kit`, or zkLogin.
+
+The important detail: use **`signTransaction`, not
+`signAndExecuteTransaction`**. x402 wants a signed-but-unsubmitted
+authorization, because the *facilitator* is what submits it. `useSignTransaction`
+returns `{ bytes, signature }`, which map straight onto `transactionBytes` and
+`signatures[0]` in the payment payload — so wiring a real wallet into
+`demo/index.html` means replacing two placeholder strings.
+
+None of this is a proxy concern: the verifier reads a header and does not care
+how the signature was produced. In `stub-accept-all` mode no wallet is needed.
 
 ## Configuration
 

@@ -90,6 +90,14 @@ impl PaymentRequired {
 /// `signatures` are base64 `flag || sig || pubkey` blobs — exactly the shape
 /// Sui's `TransactionExecutionService.ExecuteTransaction` expects, so
 /// settlement is a passthrough rather than a re-encode.
+///
+/// # Producing this in a browser
+///
+/// A wallet extension (Slush, Suiet, …) via `@mysten/dapp-kit` fills these two
+/// fields directly. Use **`signTransaction`, not `signAndExecuteTransaction`**:
+/// x402 needs a signed-but-unsubmitted authorization, because the *facilitator*
+/// is what submits it. `useSignTransaction` returns `{ bytes, signature }`,
+/// which map onto `transaction_bytes` and `signatures[0]` unchanged.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct SuiExactPayload {

@@ -963,9 +963,21 @@ mod tests {
         let grpc = headers(&[("content-type", "application/grpc")]);
         assert!(is_grpc_request(&HeaderView::new(Some(&grpc))));
 
-        // grpc-web and +proto suffixes are still gRPC.
-        let proto = headers(&[("content-type", "application/grpc+proto")]);
-        assert!(is_grpc_request(&HeaderView::new(Some(&proto))));
+        // Suffixed variants are still gRPC and must get gRPC-shaped denials.
+        for ct in [
+            "application/grpc+proto",
+            // grpc-web is what browsers actually use — they cannot speak native
+            // gRPC. The prefix match covers it deliberately.
+            "application/grpc-web",
+            "application/grpc-web+proto",
+            "application/grpc-web-text",
+        ] {
+            let h = headers(&[("content-type", ct)]);
+            assert!(
+                is_grpc_request(&HeaderView::new(Some(&h))),
+                "{ct} should be treated as gRPC"
+            );
+        }
 
         let json = headers(&[("content-type", "application/json")]);
         assert!(!is_grpc_request(&HeaderView::new(Some(&json))));
