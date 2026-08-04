@@ -189,7 +189,16 @@ Envoy does not know about tiers — the verifier tells it on every request, by
 injecting `x-x402-tier: free|paid` and `x-x402-payer: 0x…` into the request, plus
 the same values as dynamic metadata.
 
-Two constraints make or break this:
+**`use_remote_address: true` is security critical.** With Envoy's default
+(`false`) it treats itself as an internal proxy and derives the downstream
+remote address **from the `x-forwarded-for` header** — which is the address the
+free tier is metered on. A client could then send `X-Forwarded-For: <random>`
+on every request and get an unlimited free tier. Setting it to `true` makes
+Envoy use the real TCP peer, which a client cannot forge. If you put a load
+balancer in front, keep it `true` and set `xff_num_trusted_hops` to the number
+of proxies you actually control.
+
+Two further constraints make or break this:
 
 - **`ext_authz` must precede `ratelimit`** in `http_filters`, or descriptors get
   built from headers that do not exist yet.
@@ -210,26 +219,40 @@ Wire format follows x402 **v2**, vendored at `docs/spec/upstream/` (coinbase/x40
 and round-tripped through the types, so a shape that drifts fails CI rather than
 failing silently against a real client.
 
-### Deviation: this service settles *before* serving
+### Settlement ordering: `ext_proc` (default) vs `ext_authz`
 
 `scheme_exact_sui.md` steps 6-8 sequence the flow as **verify → resource server
-does the work → settle**. That ordering protects the client: they are charged
-only once the resource has actually been produced.
+does the work → settle**, so a client is charged only once the resource has
+actually been produced. Which filter you use decides whether that is achievable:
 
-This service settles **inside `ext_authz`, before the upstream is called**,
-because `ext_authz` is a *pre-upstream* filter — it runs on the request path,
-cannot see the response, and must return allow/deny before Envoy proxies
-anything. There is nowhere later to settle from.
+| Filter | Sequencing | Charged for a failed request? |
+|---|---|---|
+| **`ext_proc`** (default) | verify → upstream → settle on 2xx | no |
+| `ext_authz` | verify+settle → upstream | **yes** |
 
-**The consequence is real: a paying client is charged even if the upstream then
-returns a 500.** For a testnet PoC in stub mode (where nothing settles at all)
-this costs nothing, but it is not the right shape for production.
+`ext_authz` is a *pre-upstream* filter: it runs on the request path, cannot see
+the response, and must answer allow/deny before Envoy proxies anything. There is
+nowhere later to settle from.
 
-The production shape is an `ext_proc` filter, which *can* act on the response
-path: verify in `ext_authz` before proxying, then settle from `ext_proc` once
-the upstream has returned a success. That splits verify and settle across two
-filters and needs the payment context carried between them — which is why it is
-not what this PoC does.
+`ext_proc` can, because Envoy opens **one bidirectional gRPC stream per HTTP
+request** and sends request headers then response headers on that same stream.
+The verified-but-unsettled payment is held as ordinary stream-local state — no
+shared map, no correlation id, no eviction policy — and settled only after a 2xx.
+
+Both are implemented and served on the same port; `envoy.yaml` selects between
+them. Do not enable both, or each will independently charge for the same request.
+
+Verified end to end: a payment on a path where the upstream 404s produces **no
+`PAYMENT-RESPONSE` and no session**, while the same payment on a working path
+settles normally. An unsettled claim is also *released* from the replay cache, so
+the client can retry with the same signed transaction rather than signing a new
+one for a failure that was not theirs.
+
+**Residual risk, stated plainly:** deferring settlement moves the failure rather
+than removing it. If the upstream succeeds but settlement then fails, the
+resource has already been delivered unpaid. That is the opposite exposure to
+`ext_authz`'s, and the better one to carry — it costs the operator a request
+instead of charging a user for something they never received.
 
 ### Facilitator interface
 

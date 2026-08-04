@@ -31,6 +31,24 @@ static_resources:
                 stat_prefix: ingress_http
                 # AUTO accepts both h1 (curl → GraphQL) and h2 (grpcurl → gRPC).
                 codec_type: AUTO
+
+                # SECURITY CRITICAL — this is what makes the free tier real.
+                #
+                # With the default (false), Envoy treats itself as an internal
+                # proxy and derives the downstream remote address FROM the
+                # x-forwarded-for header. That address is what feeds the
+                # `source.address` attribute the verifier meters on, so any
+                # client could send `X-Forwarded-For: <random>` on each request
+                # and get an unlimited free tier.
+                #
+                # `true` makes Envoy use the real TCP peer, which a client
+                # cannot forge. Correct because this Envoy IS the edge proxy.
+                #
+                # If you put something in front of it (an L7 load balancer,
+                # Caddy), keep this true and set xff_num_trusted_hops to the
+                # number of proxies you actually control — never leave the
+                # decision to the client.
+                use_remote_address: true
                 route_config:
                   name: local_route
                   virtual_hosts:
@@ -116,6 +134,22 @@ static_resources:
                           #           skip_if_absent: true
 
                 http_filters:
+                  # SETTLEMENT ORDERING — the choice between these two filters
+                  # decides whether a client can be charged for a request the
+                  # upstream then failed to serve.
+                  #
+                  #   ext_proc   verify on the request, settle on the RESPONSE,
+                  #              and only on a 2xx. This is the sequencing
+                  #              scheme_exact_sui.md actually specifies
+                  #              (verify -> do the work -> settle).
+                  #   ext_authz  pre-upstream only. Cannot see the response, so
+                  #              it must settle before the work happens.
+                  #
+                  # ext_proc is enabled below. To fall back to ext_authz — for a
+                  # gateway that does not support ext_proc — comment out the
+                  # ext_proc filter and uncomment the ext_authz one. Do not run
+                  # both: each would independently charge for the same request.
+                  #
                   # ORDERING IS LOAD-BEARING, twice over:
                   #
                   # 1. cors BEFORE ext_authz. The CORS filter answers preflight
@@ -138,17 +172,43 @@ static_resources:
                     typed_config:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.cors.v3.Cors
 
-                  - name: envoy.filters.http.ext_authz
+                  - name: envoy.filters.http.ext_proc
                     typed_config:
-                      "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthz
-                      transport_api_version: V3
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor
                       # Fail closed: if the verifier is down, deny rather than
                       # silently serving everyone at unlimited rate.
                       failure_mode_allow: false
+                      # Headers only, both directions. Bodies are never sent:
+                      # payment lives entirely in headers, and streaming request
+                      # bodies through the verifier would add latency and memory
+                      # for nothing.
+                      processing_mode:
+                        request_header_mode: SEND
+                        response_header_mode: SEND
+                        request_body_mode: NONE
+                        response_body_mode: NONE
+                        request_trailer_mode: SKIP
+                        response_trailer_mode: SKIP
+                      message_timeout: 5s
+                      # ext_proc does not carry the peer address in the header
+                      # map the way ext_authz does, and the free tier is metered
+                      # per source IP. Ask for it explicitly.
+                      request_attributes:
+                        - source.address
                       grpc_service:
-                        timeout: 5s
                         envoy_grpc:
                           cluster_name: x402_verifier
+
+                  # --- Fallback: pre-upstream only, settles early ------------
+                  # - name: envoy.filters.http.ext_authz
+                  #   typed_config:
+                  #     "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthz
+                  #     transport_api_version: V3
+                  #     failure_mode_allow: false
+                  #     grpc_service:
+                  #       timeout: 5s
+                  #       envoy_grpc:
+                  #         cluster_name: x402_verifier
 
                   - name: envoy.filters.http.router
                     typed_config:

@@ -25,7 +25,7 @@ use tonic::{Request, Response, Status};
 
 use crate::config::{Config, POLICY_CONTEXT_KEY};
 use crate::ratelimit::RateLimiter;
-use crate::session::{SessionOutcome, SessionStore};
+use crate::session::{PaymentClaim, SessionOutcome, SessionStore};
 use crate::x402::{
     self, Facilitator, HEADER_PAYMENT_REQUIRED, HEADER_PAYMENT_RESPONSE, HEADER_PAYMENT_SESSION,
     HEADER_PAYMENT_SIGNATURE, PaymentPayload, PaymentRequired, PaymentRequirements, ResourceInfo,
@@ -46,6 +46,39 @@ pub const HEADER_PAYER: &str = "x-x402-payer";
 /// `x-x402-tier: paid` and have ours merely added alongside it, self-promoting
 /// into the paid bucket. Overwriting makes the verifier the sole authority.
 const AUTHORITATIVE_APPEND: HeaderAppendAction = HeaderAppendAction::OverwriteIfExistsOrAdd;
+
+/// When settlement happens relative to serving the request.
+///
+/// The x402 Sui scheme sequences this as verify -> resource server does the
+/// work -> settle, so a client is only charged once the resource has actually
+/// been produced. Which of these is achievable depends entirely on the filter:
+/// `ext_authz` runs before the upstream and cannot see the response, so it can
+/// only settle early.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettlePolicy {
+    /// Settle during authorization, before the upstream is called.
+    ///
+    /// The only option for `ext_authz`. A paying client is charged even if the
+    /// upstream then fails.
+    Immediate,
+    /// Verify during authorization, settle after the upstream succeeds.
+    ///
+    /// Matches the spec's sequencing. Requires a filter that can act on the
+    /// response path — see [`crate::ext_proc`].
+    Deferred,
+}
+
+/// A payment that verified but has not been settled yet.
+///
+/// Carried across the request/response boundary by the ext_proc stream so the
+/// charge can happen only after the upstream has actually delivered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingPayment {
+    pub payload: PaymentPayload,
+    pub requirements: PaymentRequirements,
+    /// Replay-cache key, so an unsettled payment can be released for retry.
+    pub payment_id: Option<String>,
+}
 
 /// Which tier a request resolved to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,6 +110,9 @@ pub enum Decision {
         session_token: Option<String>,
         /// Present only when a payment settled this request.
         settlement: Option<SettlementResponse>,
+        /// Present only under [`SettlePolicy::Deferred`]: verified, not yet
+        /// charged. The caller must settle it once the upstream succeeds.
+        pending: Option<Box<PendingPayment>>,
     },
     Deny {
         challenge: PaymentRequired,
@@ -124,6 +160,7 @@ impl X402Auth {
         path: &str,
         policy: Option<&str>,
         resource_url: &str,
+        settle: SettlePolicy,
     ) -> Decision {
         // A policy name Envoy sent but this config does not define almost
         // always means the two configs have drifted. Serve the defaults, but
@@ -186,6 +223,7 @@ impl X402Auth {
                         payer: Some(payer),
                         session_token: None,
                         settlement: None,
+                        pending: None,
                     };
                 }
                 SessionOutcome::Rejected(reason) => {
@@ -214,6 +252,75 @@ impl X402Auth {
                     };
                 }
             };
+
+            // Claim the payment before doing anything with it. Sui's own
+            // replay protection only binds once settlement lands on chain, so
+            // without this one signature mints unlimited sessions in stub mode,
+            // and races to mint several even with real settlement.
+            if let Some(id) = x402::payment_id(&payload) {
+                let claim = self
+                    .state
+                    .sessions
+                    .claim_payment(&id, requirements.max_timeout_seconds)
+                    .await;
+                if let Some(error) = match claim {
+                    PaymentClaim::Fresh => None,
+                    PaymentClaim::Replay { first_seen } => {
+                        Some(x402::FacilitatorError::Replay { first_seen })
+                    }
+                    // Fail closed: an unreachable cache must not become an
+                    // unlimited-replay window.
+                    PaymentClaim::Backend => Some(x402::FacilitatorError::ReplayCacheUnavailable),
+                } {
+                    tracing::warn!(error = %error, code = error.code(), "payment refused");
+                    let mut challenge = PaymentRequired::new(
+                        format!("payment rejected: {error}"),
+                        resource,
+                        vec![requirements],
+                    );
+                    challenge.extensions = challenge_extensions.take();
+                    return Decision::Deny {
+                        challenge,
+                        receipt: Some(self.state.facilitator.failure_receipt(error.code())),
+                    };
+                }
+            }
+
+            // Under Deferred we only VERIFY here; the charge happens once the
+            // upstream has actually served the request.
+            if settle == SettlePolicy::Deferred {
+                return match self.state.facilitator.verify(&payload, &requirements).await {
+                    Ok(payer) => {
+                        tracing::debug!(%payer, "payment verified; settlement deferred until the upstream succeeds");
+                        Decision::Allow {
+                            tier: Tier::Paid,
+                            payer: Some(payer),
+                            // No session yet: it is minted when the payment
+                            // actually settles.
+                            session_token: None,
+                            settlement: None,
+                            pending: Some(Box::new(PendingPayment {
+                                payment_id: x402::payment_id(&payload),
+                                payload,
+                                requirements,
+                            })),
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, code = e.code(), "payment rejected");
+                        let mut challenge = PaymentRequired::new(
+                            format!("payment rejected: {e}"),
+                            resource,
+                            vec![requirements],
+                        );
+                        challenge.extensions = challenge_extensions.take();
+                        Decision::Deny {
+                            challenge,
+                            receipt: Some(self.state.facilitator.failure_receipt(e.code())),
+                        }
+                    }
+                };
+            }
 
             return match self
                 .state
@@ -275,6 +382,7 @@ impl X402Auth {
                         payer: settlement.payer.clone(),
                         session_token: token,
                         settlement: Some(settlement),
+                        pending: None,
                     }
                 }
                 Err(e) => {
@@ -320,6 +428,7 @@ impl X402Auth {
                 payer: None,
                 session_token: None,
                 settlement: None,
+                pending: None,
             }
         } else {
             tracing::debug!(%ip, "free tier exhausted; returning payment challenge");
@@ -371,6 +480,7 @@ pub fn decision_to_response(
             payer,
             session_token,
             settlement,
+            ..
         } => {
             let mut ok = OkHttpResponseBuilder::new();
 
@@ -626,8 +736,18 @@ impl Authorization for X402Auth {
             .map(|s| s.as_str());
 
         let grpc = is_grpc_request(&headers);
+        // ext_authz is a pre-upstream filter: it cannot observe the response,
+        // so settlement can only happen here. See `ext_proc` for the ordering
+        // the spec actually asks for.
         let decision = self
-            .decide(&headers, client_ip, path, policy, &resource_url)
+            .decide(
+                &headers,
+                client_ip,
+                path,
+                policy,
+                &resource_url,
+                SettlePolicy::Immediate,
+            )
             .await;
         Ok(Response::new(decision_to_response(
             decision, client_ip, grpc,
@@ -635,23 +755,19 @@ impl Authorization for X402Auth {
     }
 }
 
+/// Shared test scaffolding, used by this module and `ext_proc`.
 #[cfg(test)]
-mod tests {
+pub mod test_support {
     use super::*;
-    use crate::config::{FreeTierConfig, PaidTierConfig, PaymentConfig, VerificationMode};
-    use crate::ratelimit::MemoryRateLimiter;
-    use crate::session::MemorySessionStore;
-    use crate::x402::SESSION_EXTENSION;
-    use crate::x402::X402_VERSION;
-    use envoy_types::ext_authz::v3::pb::HttpResponse;
-    use std::collections::HashMap;
+    use crate::config::{
+        FreeTierConfig, PaidTierConfig, PaymentConfig, StoreConfig, VerificationMode,
+    };
+    use crate::ratelimit::{MemoryRateLimiter, RateLimiter};
+    use crate::session::{MemorySessionStore, SessionStore};
 
-    const PAYER: &str = "0xdeadbeef";
-    const PATH: &str = "/sui.rpc.v2.LedgerService/GetServiceInfo";
-    const RESOURCE_URL: &str = "https://api.example.com/sui.rpc.v2.LedgerService/GetServiceInfo";
-
-    fn test_config(free_limit: u64, quota: u64) -> Config {
-        Config {
+    /// An in-memory `AppState` in stub mode, with the given tier limits.
+    pub fn app_state(free_limit: u64, quota: u64) -> Arc<AppState> {
+        let config = Config {
             listen_addr: "127.0.0.1:50051".parse().unwrap(),
             facilitator_api_listen_addr: None,
             sui_grpc_url: "https://fullnode.testnet.sui.io:443".into(),
@@ -667,6 +783,8 @@ mod tests {
                 description: "test".into(),
                 gas_station: None,
             },
+            policies: std::collections::HashMap::new(),
+            routes: Vec::new(),
             free_tier: FreeTierConfig {
                 max_requests: free_limit,
                 window_secs: 60,
@@ -675,20 +793,14 @@ mod tests {
                 quota,
                 duration_secs: 3600,
             },
-            policies: std::collections::HashMap::new(),
-            routes: Vec::new(),
-            store: crate::config::StoreConfig::default(),
+            store: StoreConfig::default(),
             session_hmac_secret: "ab".repeat(32),
-        }
-    }
-
-    fn auth(free_limit: u64, quota: u64) -> X402Auth {
-        let config = test_config(free_limit, quota);
-        let facilitator = Facilitator::new(
+        };
+        let facilitator = Arc::new(Facilitator::new(
             config.verification_mode,
             config.sui_grpc_url.clone(),
             config.payment.network.clone(),
-        );
+        ));
         let sessions = SessionStore::Memory(MemorySessionStore::new(
             config.hmac_key().unwrap(),
             config.paid_tier.duration_secs,
@@ -698,12 +810,29 @@ mod tests {
             config.free_tier.max_requests,
             config.free_tier.window_secs,
         ));
-        X402Auth::new(Arc::new(AppState {
+        Arc::new(AppState {
             config,
             sessions,
             limiter,
-            facilitator: Arc::new(facilitator),
-        }))
+            facilitator,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::x402::SESSION_EXTENSION;
+    use crate::x402::X402_VERSION;
+    use envoy_types::ext_authz::v3::pb::HttpResponse;
+    use std::collections::HashMap;
+
+    const PAYER: &str = "0xdeadbeef";
+    const PATH: &str = "/sui.rpc.v2.LedgerService/GetServiceInfo";
+    const RESOURCE_URL: &str = "https://api.example.com/sui.rpc.v2.LedgerService/GetServiceInfo";
+
+    fn auth(free_limit: u64, quota: u64) -> X402Auth {
+        X402Auth::new(test_support::app_state(free_limit, quota))
     }
 
     fn test_resource() -> ResourceInfo {
@@ -756,7 +885,14 @@ mod tests {
         let a = auth(5, 10);
         let map = headers(&[]);
         let decision = a
-            .decide(&HeaderView::new(Some(&map)), ip(), PATH, None, RESOURCE_URL)
+            .decide(
+                &HeaderView::new(Some(&map)),
+                ip(),
+                PATH,
+                None,
+                RESOURCE_URL,
+                SettlePolicy::Immediate,
+            )
             .await;
         assert!(matches!(
             decision,
@@ -775,14 +911,31 @@ mod tests {
         let view = HeaderView::new(Some(&map));
 
         assert!(matches!(
-            a.decide(&view, ip(), PATH, None, RESOURCE_URL).await,
+            a.decide(
+                &view,
+                ip(),
+                PATH,
+                None,
+                RESOURCE_URL,
+                SettlePolicy::Immediate
+            )
+            .await,
             Decision::Allow {
                 tier: Tier::Free,
                 ..
             }
         ));
 
-        let decision = a.decide(&view, ip(), PATH, None, RESOURCE_URL).await;
+        let decision = a
+            .decide(
+                &view,
+                ip(),
+                PATH,
+                None,
+                RESOURCE_URL,
+                SettlePolicy::Immediate,
+            )
+            .await;
         let Decision::Deny { challenge, .. } = decision else {
             panic!("expected denial once the free tier was spent");
         };
@@ -803,13 +956,21 @@ mod tests {
         let map = headers(&[(HEADER_PAYMENT_SIGNATURE, &payment_header())]);
 
         let decision = a
-            .decide(&HeaderView::new(Some(&map)), ip(), PATH, None, RESOURCE_URL)
+            .decide(
+                &HeaderView::new(Some(&map)),
+                ip(),
+                PATH,
+                None,
+                RESOURCE_URL,
+                SettlePolicy::Immediate,
+            )
             .await;
         let Decision::Allow {
             tier,
             payer,
             session_token,
             settlement,
+            ..
         } = decision
         else {
             panic!("payment should have been accepted");
@@ -834,6 +995,7 @@ mod tests {
                 PATH,
                 None,
                 RESOURCE_URL,
+                SettlePolicy::Immediate,
             )
             .await
         else {
@@ -849,6 +1011,7 @@ mod tests {
                 PATH,
                 None,
                 RESOURCE_URL,
+                SettlePolicy::Immediate,
             )
             .await;
         assert!(
@@ -878,6 +1041,7 @@ mod tests {
                 PATH,
                 None,
                 RESOURCE_URL,
+                SettlePolicy::Immediate,
             )
             .await
         else {
@@ -889,7 +1053,15 @@ mod tests {
 
         // Spend the single paid request.
         assert!(matches!(
-            a.decide(&view, ip(), PATH, None, RESOURCE_URL).await,
+            a.decide(
+                &view,
+                ip(),
+                PATH,
+                None,
+                RESOURCE_URL,
+                SettlePolicy::Immediate
+            )
+            .await,
             Decision::Allow {
                 tier: Tier::Paid,
                 ..
@@ -897,7 +1069,15 @@ mod tests {
         ));
         // Quota gone: degrade to free rather than erroring.
         assert!(matches!(
-            a.decide(&view, ip(), PATH, None, RESOURCE_URL).await,
+            a.decide(
+                &view,
+                ip(),
+                PATH,
+                None,
+                RESOURCE_URL,
+                SettlePolicy::Immediate
+            )
+            .await,
             Decision::Allow {
                 tier: Tier::Free,
                 ..
@@ -916,7 +1096,14 @@ mod tests {
         let map = headers(&[(HEADER_PAYMENT_SESSION, &forged)]);
 
         let decision = a
-            .decide(&HeaderView::new(Some(&map)), ip(), PATH, None, RESOURCE_URL)
+            .decide(
+                &HeaderView::new(Some(&map)),
+                ip(),
+                PATH,
+                None,
+                RESOURCE_URL,
+                SettlePolicy::Immediate,
+            )
             .await;
         assert!(
             matches!(
@@ -935,7 +1122,14 @@ mod tests {
         let a = auth(5, 10);
         let map = headers(&[(HEADER_PAYMENT_SIGNATURE, "!!!not-base64!!!")]);
         let decision = a
-            .decide(&HeaderView::new(Some(&map)), ip(), PATH, None, RESOURCE_URL)
+            .decide(
+                &HeaderView::new(Some(&map)),
+                ip(),
+                PATH,
+                None,
+                RESOURCE_URL,
+                SettlePolicy::Immediate,
+            )
             .await;
 
         let Decision::Deny { challenge, .. } = decision else {
@@ -952,13 +1146,98 @@ mod tests {
         let map = headers(&[(HEADER_PAYMENT_SIGNATURE, &wrong)]);
 
         let Decision::Deny { challenge, .. } = a
-            .decide(&HeaderView::new(Some(&map)), ip(), PATH, None, RESOURCE_URL)
+            .decide(
+                &HeaderView::new(Some(&map)),
+                ip(),
+                PATH,
+                None,
+                RESOURCE_URL,
+                SettlePolicy::Immediate,
+            )
             .await
         else {
             panic!("cross-network payment must be denied");
         };
         let err = challenge.error.unwrap_or_default();
         assert!(err.contains("network"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn the_same_payment_cannot_mint_two_sessions() {
+        // The hole this closes: in stub mode nothing ever settles, so without a
+        // replay cache one PAYMENT-SIGNATURE was worth unlimited sessions.
+        let a = auth(0, 10);
+        let header = payment_header();
+        let map = headers(&[(HEADER_PAYMENT_SIGNATURE, &header)]);
+        let view = HeaderView::new(Some(&map));
+
+        assert!(
+            matches!(
+                a.decide(
+                    &view,
+                    ip(),
+                    PATH,
+                    None,
+                    RESOURCE_URL,
+                    SettlePolicy::Immediate
+                )
+                .await,
+                Decision::Allow {
+                    tier: Tier::Paid,
+                    ..
+                }
+            ),
+            "first use should be accepted"
+        );
+
+        let Decision::Deny { receipt, .. } = a
+            .decide(
+                &view,
+                ip(),
+                PATH,
+                None,
+                RESOURCE_URL,
+                SettlePolicy::Immediate,
+            )
+            .await
+        else {
+            panic!("replaying the same payment must be refused");
+        };
+        assert_eq!(
+            receipt.unwrap().error_reason.as_deref(),
+            Some("invalid_transaction_state")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_different_payment_is_not_treated_as_a_replay() {
+        let a = auth(0, 10);
+        let first = payment_header();
+        let second = payment_header_with(|p| {
+            p.payload = serde_json::json!({ "signature": "c2ln", "transaction": "b3RoZXI=" });
+        });
+
+        for header in [&first, &second] {
+            let map = headers(&[(HEADER_PAYMENT_SIGNATURE, header)]);
+            assert!(
+                matches!(
+                    a.decide(
+                        &HeaderView::new(Some(&map)),
+                        ip(),
+                        PATH,
+                        None,
+                        RESOURCE_URL,
+                        SettlePolicy::Immediate
+                    )
+                    .await,
+                    Decision::Allow {
+                        tier: Tier::Paid,
+                        ..
+                    }
+                ),
+                "distinct transactions are distinct payments"
+            );
+        }
     }
 
     #[tokio::test]
@@ -976,6 +1255,7 @@ mod tests {
                 PATH,
                 None,
                 RESOURCE_URL,
+                SettlePolicy::Immediate,
             )
             .await
         else {
@@ -990,7 +1270,14 @@ mod tests {
         let bad = payment_header_with(|p| p.accepted.amount = "1".into());
         let map = headers(&[(HEADER_PAYMENT_SIGNATURE, &bad)]);
         let Decision::Deny { receipt, .. } = a
-            .decide(&HeaderView::new(Some(&map)), ip(), PATH, None, RESOURCE_URL)
+            .decide(
+                &HeaderView::new(Some(&map)),
+                ip(),
+                PATH,
+                None,
+                RESOURCE_URL,
+                SettlePolicy::Immediate,
+            )
             .await
         else {
             panic!("expected denial");
@@ -1010,7 +1297,14 @@ mod tests {
         let a = auth(0, 10);
         let map = headers(&[(HEADER_PAYMENT_SIGNATURE, "!!!not-base64!!!")]);
         let Decision::Deny { receipt, .. } = a
-            .decide(&HeaderView::new(Some(&map)), ip(), PATH, None, RESOURCE_URL)
+            .decide(
+                &HeaderView::new(Some(&map)),
+                ip(),
+                PATH,
+                None,
+                RESOURCE_URL,
+                SettlePolicy::Immediate,
+            )
             .await
         else {
             panic!("expected denial");
@@ -1058,7 +1352,14 @@ mod tests {
         let a = auth(0, 10);
         let map = headers(&[]);
         let Decision::Deny { challenge, .. } = a
-            .decide(&HeaderView::new(Some(&map)), ip(), PATH, None, RESOURCE_URL)
+            .decide(
+                &HeaderView::new(Some(&map)),
+                ip(),
+                PATH,
+                None,
+                RESOURCE_URL,
+                SettlePolicy::Immediate,
+            )
             .await
         else {
             panic!("expected denial");
@@ -1084,7 +1385,14 @@ mod tests {
             session_token,
             ..
         } = a
-            .decide(&HeaderView::new(Some(&map)), ip(), PATH, None, RESOURCE_URL)
+            .decide(
+                &HeaderView::new(Some(&map)),
+                ip(),
+                PATH,
+                None,
+                RESOURCE_URL,
+                SettlePolicy::Immediate,
+            )
             .await
         else {
             panic!("payment should have been accepted");
@@ -1110,7 +1418,14 @@ mod tests {
             session_token: Some(token),
             ..
         } = a
-            .decide(&HeaderView::new(Some(&pay)), ip(), PATH, None, RESOURCE_URL)
+            .decide(
+                &HeaderView::new(Some(&pay)),
+                ip(),
+                PATH,
+                None,
+                RESOURCE_URL,
+                SettlePolicy::Immediate,
+            )
             .await
         else {
             panic!("expected a session token");
@@ -1122,7 +1437,14 @@ mod tests {
         });
         let map = headers(&[(HEADER_PAYMENT_SIGNATURE, &echoed)]);
         let decision = a
-            .decide(&HeaderView::new(Some(&map)), ip(), PATH, None, RESOURCE_URL)
+            .decide(
+                &HeaderView::new(Some(&map)),
+                ip(),
+                PATH,
+                None,
+                RESOURCE_URL,
+                SettlePolicy::Immediate,
+            )
             .await;
         assert!(
             matches!(
@@ -1142,7 +1464,14 @@ mod tests {
         let a = auth(100, 10);
         let map = headers(&[]);
         let decision = a
-            .decide(&HeaderView::new(Some(&map)), None, PATH, None, RESOURCE_URL)
+            .decide(
+                &HeaderView::new(Some(&map)),
+                None,
+                PATH,
+                None,
+                RESOURCE_URL,
+                SettlePolicy::Immediate,
+            )
             .await;
         assert!(
             matches!(decision, Decision::Deny { .. }),
@@ -1167,6 +1496,7 @@ mod tests {
             payer: Some(PAYER.into()),
             session_token: None,
             settlement: None,
+            pending: None,
         });
 
         let tier = ok
@@ -1198,6 +1528,7 @@ mod tests {
             payer: None,
             session_token: None,
             settlement: None,
+            pending: None,
         });
         assert!(
             ok.headers_to_remove
@@ -1226,6 +1557,7 @@ mod tests {
                 amount: Some("1000".into()),
                 extensions: None,
             }),
+            pending: None,
         });
 
         let names: Vec<&str> = ok
@@ -1388,6 +1720,7 @@ mod tests {
                 payer: Some(PAYER.into()),
                 session_token: None,
                 settlement: None,
+                pending: None,
             },
             ip(),
             false,

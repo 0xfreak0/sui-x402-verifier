@@ -1652,6 +1652,7 @@ dependencies = [
  "sha2",
  "thiserror",
  "tokio",
+ "tokio-stream",
  "tonic",
  "tower",
  "tracing",

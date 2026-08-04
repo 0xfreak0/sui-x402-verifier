@@ -6,6 +6,7 @@
 
 mod auth;
 mod config;
+mod ext_proc;
 mod facilitator_api;
 mod ratelimit;
 mod session;
@@ -18,6 +19,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::Parser;
 use envoy_types::ext_authz::v3::pb::AuthorizationServer;
+use envoy_types::pb::envoy::service::ext_proc::v3::external_processor_server::ExternalProcessorServer;
 use tonic::transport::Server;
 
 use crate::auth::{AppState, X402Auth};
@@ -190,7 +192,14 @@ async fn main() -> Result<()> {
         }
     });
 
+    // Both filters are served on the same port: they are distinct gRPC
+    // services, so Envoy picks whichever the config points at. ext_proc is the
+    // spec-correct one (settles only after the upstream succeeds); ext_authz
+    // remains for gateways that support nothing else.
     Server::builder()
+        .add_service(ExternalProcessorServer::new(ext_proc::X402ExtProc::new(
+            Arc::clone(&state),
+        )))
         .add_service(AuthorizationServer::new(X402Auth::new(state)))
         .serve_with_shutdown(listen_addr, shutdown_signal())
         .await

@@ -158,6 +158,33 @@ fn new_session_id() -> String {
 
 /// Redis key prefix for session state.
 const REDIS_SESSION_PREFIX: &str = "x402:sess:";
+/// Redis key prefix for the payment replay cache.
+const REDIS_REPLAY_PREFIX: &str = "x402:seen:";
+
+/// Atomically claim a payment, reporting whether it had already been used.
+///
+/// Must be a script: a GET-then-SET from Rust leaves a window in which two
+/// replicas both observe "unused" and both mint a session for the same
+/// payment. Redis runs this indivisibly.
+///
+/// Returns `{1, now}` on first use and `{0, first_seen}` on a replay.
+const CLAIM_SCRIPT: &str = r#"
+local existing = redis.call('GET', KEYS[1])
+if existing then return {0, existing} end
+redis.call('SET', KEYS[1], ARGV[1], 'EX', tonumber(ARGV[2]))
+return {1, ARGV[1]}
+"#;
+
+/// Outcome of claiming a payment against the replay cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaymentClaim {
+    /// First time this payment has been seen; it is now recorded.
+    Fresh,
+    /// Already used, at this Unix timestamp.
+    Replay { first_seen: u64 },
+    /// The store could not be reached. Fails closed at the call site.
+    Backend,
+}
 
 /// Atomically spend one request from a session.
 ///
@@ -186,6 +213,8 @@ return {quota - 1, payer}
 #[derive(Debug)]
 pub struct MemorySessionStore {
     sessions: DashMap<String, Session>,
+    /// Payment id -> first-seen Unix timestamp. See [`PaymentClaim`].
+    seen_payments: DashMap<String, u64>,
     codec: TokenCodec,
     ttl_secs: u64,
     quota: u64,
@@ -195,6 +224,7 @@ impl MemorySessionStore {
     pub fn new(hmac_key: Vec<u8>, ttl_secs: u64, quota: u64) -> Self {
         Self {
             sessions: DashMap::new(),
+            seen_payments: DashMap::new(),
             codec: TokenCodec::new(hmac_key),
             ttl_secs,
             quota,
@@ -266,6 +296,33 @@ impl MemorySessionStore {
         }
     }
 
+    /// Record first use of a payment, or report it as a replay.
+    fn claim_payment_at(&self, payment_id: &str, ttl_secs: u64, now: u64) -> PaymentClaim {
+        use dashmap::mapref::entry::Entry;
+        match self.seen_payments.entry(payment_id.to_string()) {
+            Entry::Occupied(entry) => {
+                let first_seen = *entry.get();
+                // Expired entries are indistinguishable from never-seen, which
+                // is why the TTL must outlive settlement latency.
+                if now.saturating_sub(first_seen) >= ttl_secs {
+                    entry.replace_entry(now);
+                    PaymentClaim::Fresh
+                } else {
+                    PaymentClaim::Replay { first_seen }
+                }
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(now);
+                PaymentClaim::Fresh
+            }
+        }
+    }
+
+    /// Undo a claim, so an unspent payment can be retried.
+    fn release_payment(&self, payment_id: &str) {
+        self.seen_payments.remove(payment_id);
+    }
+
     /// Drop sessions whose deadline has passed. Called by a background task.
     pub fn cleanup_expired(&self) -> usize {
         self.cleanup_expired_at(now_epoch_secs())
@@ -274,7 +331,14 @@ impl MemorySessionStore {
     fn cleanup_expired_at(&self, now: u64) -> usize {
         let before = self.sessions.len();
         self.sessions.retain(|_, s| now < s.expires_at);
-        before - self.sessions.len()
+        let reaped = before - self.sessions.len();
+
+        // Replay records are bounded by the same sweep; without this the map
+        // grows once per distinct payment forever.
+        self.seen_payments
+            .retain(|_, first_seen| now.saturating_sub(*first_seen) < self.ttl_secs);
+
+        reaped
     }
 }
 
@@ -339,6 +403,26 @@ impl RedisSessionStore {
         format!("{REDIS_SESSION_PREFIX}{session_id}")
     }
 
+    async fn claim_payment(&self, payment_id: &str, ttl_secs: u64) -> PaymentClaim {
+        let now = now_epoch_secs();
+        let mut conn = self.conn.clone();
+        let result: Result<(i64, u64), _> = redis::Script::new(CLAIM_SCRIPT)
+            .key(format!("{REDIS_REPLAY_PREFIX}{payment_id}"))
+            .arg(now)
+            .arg(ttl_secs)
+            .invoke_async(&mut conn)
+            .await;
+
+        match result {
+            Ok((1, _)) => PaymentClaim::Fresh,
+            Ok((_, first_seen)) => PaymentClaim::Replay { first_seen },
+            Err(e) => {
+                tracing::error!(error = %e, "redis replay check failed; refusing the payment");
+                PaymentClaim::Backend
+            }
+        }
+    }
+
     async fn create_session(&self, payer: &str) -> Result<String, StoreError> {
         let session_id = new_session_id();
         let expires_at = now_epoch_secs().saturating_add(self.ttl_secs);
@@ -359,6 +443,20 @@ impl RedisSessionStore {
             .await?;
 
         Ok(self.codec.mint(payer, expires_at, &session_id))
+    }
+
+    async fn release_payment(&self, payment_id: &str) {
+        let mut conn = self.conn.clone();
+        let key = format!("{REDIS_REPLAY_PREFIX}{payment_id}");
+        if let Err(e) = redis::cmd("DEL")
+            .arg(&key)
+            .query_async::<i64>(&mut conn)
+            .await
+        {
+            // Not fatal: the claim simply expires on its own TTL, costing the
+            // client a retry rather than any money.
+            tracing::warn!(error = %e, "could not release an unsettled payment claim");
+        }
     }
 
     async fn consume(&self, token: &str) -> SessionOutcome {
@@ -413,6 +511,37 @@ impl SessionStore {
         match self {
             SessionStore::Memory(s) => s.consume(token),
             SessionStore::Redis(s) => s.consume(token).await,
+        }
+    }
+
+    /// Claim a payment so it can only be spent once.
+    ///
+    /// Sui's own replay protection (object-version pinning) only binds once
+    /// settlement lands on chain, which leaves two holes this closes: in stub
+    /// mode nothing ever settles, so one signature would otherwise mint
+    /// unlimited sessions; and even with real settlement, concurrent replays
+    /// race to mint N sessions before the first transaction commits.
+    ///
+    /// `ttl_secs` therefore only needs to outlive settlement latency, not the
+    /// life of the transaction — after it lapses the chain is the backstop.
+    /// In stub mode there is no such backstop, which is one more reason not to
+    /// run it anywhere real.
+    pub async fn claim_payment(&self, payment_id: &str, ttl_secs: u64) -> PaymentClaim {
+        match self {
+            SessionStore::Memory(s) => s.claim_payment_at(payment_id, ttl_secs, now_epoch_secs()),
+            SessionStore::Redis(s) => s.claim_payment(payment_id, ttl_secs).await,
+        }
+    }
+
+    /// Release a claimed payment that was never settled.
+    ///
+    /// Called when the upstream fails: the authorization was verified but never
+    /// spent, so holding the claim would burn a perfectly good payment and force
+    /// the client to sign a fresh transaction to retry.
+    pub async fn release_payment(&self, payment_id: &str) {
+        match self {
+            SessionStore::Memory(s) => s.release_payment(payment_id),
+            SessionStore::Redis(s) => s.release_payment(payment_id).await,
         }
     }
 
@@ -759,6 +888,87 @@ mod tests {
             total, QUOTA as usize,
             "exactly the configured quota should ever be granted"
         );
+    }
+
+    #[test]
+    fn a_payment_can_only_be_claimed_once() {
+        let s = store(3600, 5);
+        assert_eq!(s.claim_payment_at("tx-a", 60, NOW), PaymentClaim::Fresh);
+        assert_eq!(
+            s.claim_payment_at("tx-a", 60, NOW),
+            PaymentClaim::Replay { first_seen: NOW }
+        );
+        // Independent payments do not collide.
+        assert_eq!(s.claim_payment_at("tx-b", 60, NOW), PaymentClaim::Fresh);
+    }
+
+    #[test]
+    fn a_released_claim_can_be_used_again() {
+        // An upstream failure must not burn a payment that was never spent.
+        let s = store(3600, 5);
+        assert_eq!(s.claim_payment_at("tx", 60, NOW), PaymentClaim::Fresh);
+        assert_eq!(
+            s.claim_payment_at("tx", 60, NOW),
+            PaymentClaim::Replay { first_seen: NOW }
+        );
+        s.release_payment("tx");
+        assert_eq!(
+            s.claim_payment_at("tx", 60, NOW),
+            PaymentClaim::Fresh,
+            "a released payment is retryable"
+        );
+    }
+
+    #[test]
+    fn a_claim_lapses_once_its_ttl_passes() {
+        // Documented consequence: after the TTL the chain is the only replay
+        // backstop, and in stub mode there is none. The TTL must therefore
+        // outlive settlement latency.
+        let s = store(3600, 5);
+        assert_eq!(s.claim_payment_at("tx", 60, NOW), PaymentClaim::Fresh);
+        assert_eq!(
+            s.claim_payment_at("tx", 60, NOW + 59),
+            PaymentClaim::Replay { first_seen: NOW }
+        );
+        assert_eq!(s.claim_payment_at("tx", 60, NOW + 60), PaymentClaim::Fresh);
+    }
+
+    #[test]
+    fn cleanup_bounds_the_replay_cache() {
+        // Without this the map grows once per distinct payment forever.
+        let s = store(60, 5);
+        s.claim_payment_at("old", 60, NOW);
+        s.claim_payment_at("new", 60, NOW + 100);
+        assert_eq!(s.seen_payments.len(), 2);
+        s.cleanup_expired_at(NOW + 100);
+        assert_eq!(s.seen_payments.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn redis_payment_claim_is_atomic_across_concurrent_callers() {
+        // The reason CLAIM_SCRIPT is Lua: a GET-then-SET from Rust lets two
+        // replicas both observe "unused" and both mint a session.
+        let Some(s) = redis_store(3600, 5).await else {
+            return;
+        };
+        let s = Arc::new(s);
+        let id = format!("concurrent-{}", now_epoch_secs());
+
+        let tasks: Vec<_> = (0..8)
+            .map(|_| {
+                let s = Arc::clone(&s);
+                let id = id.clone();
+                tokio::spawn(async move { s.claim_payment(&id, 60).await })
+            })
+            .collect();
+
+        let mut fresh = 0;
+        for t in tasks {
+            if matches!(t.await.unwrap(), PaymentClaim::Fresh) {
+                fresh += 1;
+            }
+        }
+        assert_eq!(fresh, 1, "exactly one caller may claim a given payment");
     }
 
     #[test]

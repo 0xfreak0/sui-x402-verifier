@@ -358,6 +358,10 @@ pub enum FacilitatorError {
     EmptyTransaction,
     #[error("payment payload carries no signature")]
     MissingSignature,
+    #[error("this payment has already been used (first seen {first_seen})")]
+    Replay { first_seen: u64 },
+    #[error("the replay cache is unavailable; refusing the payment")]
+    ReplayCacheUnavailable,
     #[error("on-chain verification is not implemented yet (verification_mode: sui-grpc)")]
     NotImplemented,
 }
@@ -385,7 +389,12 @@ impl FacilitatorError {
             FacilitatorError::MalformedPayload { .. }
             | FacilitatorError::EmptyTransaction
             | FacilitatorError::MissingSignature => "invalid_payload",
-            FacilitatorError::NotImplemented => "unexpected_verify_error",
+            // Closest §9 code: a replayed authorization would be rejected by
+            // the chain as already-executed. See docs/spec-gaps.md.
+            FacilitatorError::Replay { .. } => "invalid_transaction_state",
+            FacilitatorError::ReplayCacheUnavailable | FacilitatorError::NotImplemented => {
+                "unexpected_verify_error"
+            }
         }
     }
 }
@@ -595,6 +604,20 @@ impl Facilitator {
             signers: std::collections::BTreeMap::new(),
         }
     }
+}
+
+/// Stable identifier for a payment, used to detect replays.
+///
+/// Derived from the transaction bytes rather than a parsed Sui digest so it
+/// works identically in both verification modes and needs no BCS decoding: the
+/// same bytes are the same payment, which is exactly the property replay
+/// detection needs.
+///
+/// Returns `None` when the payload is not a Sui `exact` payload, which the
+/// caller will reject for other reasons anyway.
+pub fn payment_id(payload: &PaymentPayload) -> Option<String> {
+    let sui: SuiExactPayload = serde_json::from_value(payload.payload.clone()).ok()?;
+    Some(hex::encode(Sha256::digest(sui.transaction.as_bytes())))
 }
 
 /// Deterministic placeholder payer for stub mode. Never a real Sui address.
