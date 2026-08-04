@@ -1,0 +1,201 @@
+//! x402 payment-gated Envoy `ext_authz` verifier for Sui.
+//!
+//! Sits beside an Envoy proxy and answers authorization callouts: anonymous
+//! clients get a rate-limited free tier, and clients presenting a valid x402
+//! payment get an elevated tier backed by a time- and quota-limited session.
+
+mod auth;
+mod config;
+mod ratelimit;
+mod session;
+mod util;
+mod x402;
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::{Context, Result};
+use clap::Parser;
+use envoy_types::ext_authz::v3::pb::AuthorizationServer;
+use tonic::transport::Server;
+
+use crate::auth::{AppState, X402Auth};
+use crate::config::{Config, StoreBackend, VerificationMode};
+use crate::ratelimit::{MemoryRateLimiter, RateLimiter, RedisRateLimiter};
+use crate::session::{MemorySessionStore, RedisSessionStore, SessionStore};
+use crate::x402::Facilitator;
+
+/// How often expired sessions and idle rate-limit keys are reaped.
+const CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
+
+#[derive(Parser, Debug)]
+#[command(name = "x402-verifier", about, version)]
+struct Args {
+    /// Path to the YAML configuration file.
+    #[arg(short, long, default_value = "config.example.yaml")]
+    config: String,
+
+    /// Override the configured listen address.
+    #[arg(short, long)]
+    listen: Option<std::net::SocketAddr>,
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "x402_verifier=info".into()),
+        )
+        .init();
+
+    let args = Args::parse();
+
+    let mut config = Config::load(&args.config)
+        .with_context(|| format!("loading configuration from {}", args.config))?;
+    if let Some(listen) = args.listen {
+        config.listen_addr = listen;
+    }
+
+    // Make it impossible to run the stub in production without knowing it.
+    if config.verification_mode == VerificationMode::StubAcceptAll {
+        tracing::warn!(
+            "verification_mode is 'stub-accept-all': payments are ACCEPTED WITHOUT \
+             on-chain verification and NO FUNDS MOVE. Development use only."
+        );
+    }
+
+    let hmac_key = config.hmac_key()?;
+    let facilitator = Facilitator::new(
+        config.verification_mode,
+        config.sui_grpc_url.clone(),
+        config.payment.network.clone(),
+    );
+    // Connect the state store up front so a bad Redis URL fails at boot rather
+    // than on the first paying request.
+    let (sessions, limiter) = match config.store.backend {
+        StoreBackend::Memory => {
+            tracing::warn!(
+                "store.backend is 'memory': state is per-process. Run exactly ONE replica — \
+                 with N replicas the effective rate limit becomes N x the configured value and \
+                 sessions are replica-affine. Use 'redis' to scale out."
+            );
+            (
+                SessionStore::Memory(MemorySessionStore::new(
+                    hmac_key,
+                    config.paid_tier.duration_secs,
+                    config.paid_tier.quota,
+                )),
+                RateLimiter::Memory(MemoryRateLimiter::new(
+                    config.free_tier.max_requests,
+                    config.free_tier.window_secs,
+                )),
+            )
+        }
+        StoreBackend::Redis => {
+            let url = &config.store.redis_url;
+            tracing::info!(redis_url = %url, "connecting to redis state store");
+            let sessions = RedisSessionStore::connect(
+                url,
+                hmac_key,
+                config.paid_tier.duration_secs,
+                config.paid_tier.quota,
+            )
+            .await
+            .with_context(|| format!("connecting to redis at {url}"))?;
+            let limiter = RedisRateLimiter::connect(
+                url,
+                config.free_tier.max_requests,
+                config.free_tier.window_secs,
+            )
+            .await
+            .with_context(|| format!("connecting to redis at {url}"))?;
+            (SessionStore::Redis(sessions), RateLimiter::Redis(limiter))
+        }
+    };
+
+    let listen_addr = config.listen_addr;
+    tracing::info!(
+        %listen_addr,
+        network = %config.payment.network,
+        sui_grpc_url = %config.sui_grpc_url,
+        sui_chain = %config.sui_chain,
+        pay_to = %config.payment.pay_to,
+        asset = %config.payment.asset,
+        price = %config.payment.max_amount_required,
+        free_tier = format!(
+            "{}/{}s",
+            config.free_tier.max_requests, config.free_tier.window_secs
+        ),
+        paid_tier = format!(
+            "{} req/{}s",
+            config.paid_tier.quota, config.paid_tier.duration_secs
+        ),
+        "starting x402 verifier"
+    );
+
+    let state = Arc::new(AppState {
+        config,
+        sessions,
+        limiter,
+        facilitator,
+    });
+
+    // Reap expired state so neither map grows without bound on a public
+    // endpoint. Both structures are also self-healing on read, so a missed
+    // tick costs memory but never correctness.
+    let cleanup_state = Arc::clone(&state);
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(CLEANUP_INTERVAL);
+        // The first tick fires immediately; skip it so startup does no work.
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            let expired_sessions = cleanup_state.sessions.cleanup_expired().await;
+            let idle_ips = cleanup_state.limiter.cleanup_idle().await;
+            if expired_sessions > 0 || idle_ips > 0 {
+                tracing::debug!(
+                    expired_sessions,
+                    idle_ips,
+                    live_sessions = cleanup_state.sessions.len(),
+                    tracked_ips = cleanup_state.limiter.len(),
+                    "reaped stale state"
+                );
+            }
+        }
+    });
+
+    Server::builder()
+        .add_service(AuthorizationServer::new(X402Auth::new(state)))
+        .serve_with_shutdown(listen_addr, shutdown_signal())
+        .await
+        .context("ext_authz gRPC server failed")?;
+
+    tracing::info!("shutdown complete");
+    Ok(())
+}
+
+/// Resolve on SIGINT/SIGTERM so container stops are graceful rather than abrupt.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => tracing::info!("received SIGINT; shutting down"),
+        _ = terminate => tracing::info!("received SIGTERM; shutting down"),
+    }
+}

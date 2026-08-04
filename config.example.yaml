@@ -1,0 +1,106 @@
+# x402 verifier configuration.
+#
+# Copy to config.yaml and edit. The HMAC secret below is a well-known
+# placeholder — generate a real one and prefer supplying it via the
+# X402_SESSION_HMAC_SECRET environment variable so it never lands in git:
+#
+#   export X402_SESSION_HMAC_SECRET=$(openssl rand -hex 32)
+
+# Address the ext_authz gRPC server binds to. Envoy dials this.
+listen_addr: "127.0.0.1:50051"
+
+# Sui fullnode used for verification and settlement.
+#
+# NOTE: public Sui fullnodes have REMOVED JSON-RPC. gRPC (sui.rpc.v2.*) is the
+# only supported interface, which is why this is a gRPC URL.
+sui_grpc_url: "https://fullnode.testnet.sui.io:443"
+sui_chain: "testnet"
+
+# How payments are checked. Two values:
+#
+#   stub-accept-all  Accept any well-formed payment WITHOUT touching the chain.
+#                    No funds move. Development only — the service logs a loud
+#                    warning at startup when this is set.
+#   sui-grpc         Verify and settle against the fullnode. Not implemented
+#                    yet; currently rejects every payment rather than falling
+#                    back to the stub.
+verification_mode: stub-accept-all
+
+# Placeholder key (32 bytes of 0xab). REPLACE THIS.
+session_hmac_secret: "abababababababababababababababababababababababababababababababab"
+
+payment:
+  # Only "exact" is implemented.
+  scheme: "exact"
+  network: "sui:testnet"
+
+  # Price in the asset's smallest unit, as a string. USDC has 6 decimals,
+  # so "1000" == 0.001 USDC.
+  max_amount_required: "1000"
+
+  # Circle's USDC on Sui testnet (verified on-chain: 6 decimals, REGULATED).
+  # Faucet: https://faucet.circle.com — select "Sui Testnet".
+  asset: "0xa1ec7fc00a6f40db9693ad1415d0c193ad3906494428cf252621037bd7117e29::usdc::USDC"
+
+  # Address that receives payment.
+  #
+  # This is the ZERO ADDRESS placeholder and the service REFUSES TO START
+  # with it — settling here would burn funds. Set your own receiving wallet,
+  # preferably via the environment so it never lands in git:
+  #
+  #   export X402_PAY_TO=0x<your 64-hex-char Sui address>
+  pay_to: "0x0000000000000000000000000000000000000000000000000000000000000000"
+
+  # How long a signed authorization stays acceptable.
+  max_timeout_seconds: 60
+
+  description: "Elevated rate limit for the Sui testnet GraphQL + gRPC proxy"
+
+# Anonymous tier, metered per source IP. Deliberately small so the 402 flow is
+# easy to trigger by hand during local testing.
+free_tier:
+  max_requests: 5
+  window_secs: 60
+
+# Unlocked by one settled payment. The session ends at whichever comes first:
+# quota exhaustion or duration_secs.
+paid_tier:
+  quota: 1000
+  duration_secs: 3600
+
+# Where session and rate-limit state lives.
+#
+#   memory  In-process maps. Zero dependencies, but PER-PROCESS: running two
+#           replicas behind one Envoy means each enforces the limits
+#           independently (effective limit = N x configured), and a session
+#           minted by one replica is unknown to the other. Single replica only.
+#   redis   Shared state across replicas. Required for any real deployment.
+#           Quota decrements and rate-limit windows are Lua scripts, so they
+#           stay atomic across replicas. Connected at startup: a bad URL fails
+#           at boot, not on the first paying request.
+store:
+  backend: memory
+  # redis_url: "redis://127.0.0.1:6379"
+
+# Named payment policies, selected by Envoy per route via
+# `context_extensions: { x402_policy: <name> }` (see envoy.yaml).
+#
+# PREFERRED over the `routes:` mechanism below: Envoy already knows which route
+# matched, so it just names the policy. This file never repeats a path prefix,
+# which means the two configs cannot drift on routing.
+#
+# Each policy may also set `pay_to:` to credit a different wallet per route.
+policies:
+  graphql:
+    max_amount_required: "100"
+    description: "Sui testnet GraphQL queries"
+  grpc:
+    max_amount_required: "5000"
+    description: "Sui testnet fullnode gRPC calls"
+
+# Path-prefix overrides, matched by the verifier itself. Fallback for gateways
+# that cannot attach per-route metadata to an ext_authz callout (Kong, APISIX).
+# This DOES duplicate path knowledge, so prefer `policies` with Envoy.
+# routes:
+#   - path_prefix: "/sui.rpc.v2."
+#     max_amount_required: "5000"

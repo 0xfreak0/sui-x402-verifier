@@ -1,0 +1,203 @@
+# Envoy config for the local x402 end-to-end test.
+#
+#                                    ┌─▶ graphql.testnet.sui.io  (HTTP/JSON)
+#   client ──▶ Envoy :10000 ─────────┤
+#                    │               └─▶ fullnode.testnet.sui.io (gRPC/TLS)
+#                    │
+#                    └──ext_authz──▶ x402-verifier :50051
+#
+# Both upstreams are the Sui testnet itself, so the API being rate limited and
+# the chain being paid on are the same network.
+#
+# GraphQL is the better surface for exercising x402: a 402 challenge is an
+# ordinary HTTP response that curl can read directly. gRPC clients collapse a
+# non-200 HTTP status into an opaque transport error, so the challenge headers
+# are much harder to observe there.
+
+admin:
+  address:
+    socket_address: { address: 127.0.0.1, port_value: 9901 }
+
+static_resources:
+  listeners:
+    - name: ingress
+      address:
+        socket_address: { address: 0.0.0.0, port_value: 10000 }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress_http
+                # AUTO accepts both h1 (curl → GraphQL) and h2 (grpcurl → gRPC).
+                codec_type: AUTO
+                route_config:
+                  name: local_route
+                  virtual_hosts:
+                    - name: sui_testnet
+                      domains: ["*"]
+                      routes:
+                        # gRPC method paths are /<package>.<Service>/<Method>,
+                        # so these prefixes cleanly separate them from GraphQL.
+                        #
+                        # grpc.reflection.* must be routed here too, not just
+                        # sui.rpc.v2.*: grpcurl resolves method descriptors via
+                        # reflection before it can issue the real call, and
+                        # sending that to the GraphQL cluster fails with a
+                        # confusing "server does not support the reflection API".
+                        - match: { safe_regex: { regex: "^/(sui\\.rpc\\.v2|grpc\\.reflection|grpc\\.health)\\..*" } }
+                          route:
+                            cluster: sui_fullnode_grpc
+                            # The upstream routes on :authority and terminates
+                            # TLS for this SNI, so it must not stay
+                            # "localhost:10000".
+                            host_rewrite_literal: fullnode.testnet.sui.io
+                            timeout: 30s
+                          # Tell the verifier which pricing policy this route
+                          # uses. Envoy stays the single source of truth for
+                          # the route table; the verifier only knows what the
+                          # policy *name* costs. No path prefixes are
+                          # duplicated between the two configs.
+                          typed_per_filter_config:
+                            envoy.filters.http.ext_authz:
+                              "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute
+                              check_settings:
+                                context_extensions:
+                                  x402_policy: grpc
+
+                        # Everything else goes to GraphQL.
+                        - match: { prefix: "/" }
+                          route:
+                            cluster: sui_graphql
+                            host_rewrite_literal: graphql.testnet.sui.io
+                            timeout: 30s
+                          typed_per_filter_config:
+                            envoy.filters.http.ext_authz:
+                              "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute
+                              check_settings:
+                                context_extensions:
+                                  x402_policy: graphql
+
+                          # ---------------------------------------------------
+                          # Descriptors for an external ratelimit service.
+                          # Commented out because this demo lets the verifier
+                          # enforce limits in-process. Uncomment together with
+                          # a `ratelimit` http_filter once you run
+                          # envoyproxy/ratelimit + Redis.
+                          #
+                          # These key on headers the verifier injects with
+                          # OverwriteIfExistsOrAdd, so a client cannot forge
+                          # its own tier.
+                          # ---------------------------------------------------
+                          # rate_limits:
+                          #   - actions:
+                          #       - request_headers:
+                          #           header_name: x-x402-tier
+                          #           descriptor_key: tier
+                          #       - request_headers:
+                          #           header_name: x-x402-payer
+                          #           descriptor_key: payer
+                          #           skip_if_absent: true
+
+                http_filters:
+                  # ORDERING IS LOAD-BEARING: ext_authz must run before the
+                  # router (and before any ratelimit filter) so the headers it
+                  # injects exist by the time descriptors are built.
+                  - name: envoy.filters.http.ext_authz
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthz
+                      transport_api_version: V3
+                      # Fail closed: if the verifier is down, deny rather than
+                      # silently serving everyone at unlimited rate.
+                      failure_mode_allow: false
+                      grpc_service:
+                        timeout: 5s
+                        envoy_grpc:
+                          cluster_name: x402_verifier
+
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+  clusters:
+    # The verifier. HTTP/2 is mandatory — this is a gRPC service.
+    - name: x402_verifier
+      type: STRICT_DNS
+      connect_timeout: 1s
+      lb_policy: ROUND_ROBIN
+      typed_extension_protocol_options:
+        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config:
+            http2_protocol_options: {}
+      load_assignment:
+        cluster_name: x402_verifier
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      # Use host.docker.internal if Envoy runs in Docker while
+                      # the verifier runs natively on the host.
+                      address: 127.0.0.1
+                      port_value: 50051
+
+    # Sui testnet GraphQL. Plain HTTP/1.1 upstream over TLS.
+    - name: sui_graphql
+      type: STRICT_DNS
+      connect_timeout: 5s
+      lb_policy: ROUND_ROBIN
+      # Envoy's default (AUTO) prefers AAAA. Networks running DNS64/NAT64 hand
+      # back a synthesized 64:ff9b::/96 address that is unroutable without a
+      # working NAT64 gateway, which shows up as a 503 "connection timeout"
+      # even though IPv4 to the same host works fine.
+      dns_lookup_family: V4_ONLY
+      transport_socket:
+        name: envoy.transport_sockets.tls
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+          sni: graphql.testnet.sui.io
+          common_tls_context:
+            validation_context:
+              trusted_ca:
+                filename: /etc/ssl/cert.pem
+      load_assignment:
+        cluster_name: sui_graphql
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: graphql.testnet.sui.io
+                      port_value: 443
+
+    # Sui testnet fullnode gRPC (sui.rpc.v2.*). Requires HTTP/2.
+    - name: sui_fullnode_grpc
+      type: STRICT_DNS
+      connect_timeout: 5s
+      lb_policy: ROUND_ROBIN
+      # See the note on sui_graphql.
+      dns_lookup_family: V4_ONLY
+      typed_extension_protocol_options:
+        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config:
+            http2_protocol_options: {}
+      transport_socket:
+        name: envoy.transport_sockets.tls
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+          sni: fullnode.testnet.sui.io
+          common_tls_context:
+            validation_context:
+              trusted_ca:
+                filename: /etc/ssl/cert.pem
+      load_assignment:
+        cluster_name: sui_fullnode_grpc
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: fullnode.testnet.sui.io
+                      port_value: 443

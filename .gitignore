@@ -1,0 +1,13 @@
+/target
+
+# Local run artifacts
+/.local-logs
+/.local-logs-*.log
+
+# Real configuration. Only config.example.yaml is tracked — a working config
+# carries a receiving wallet and an HMAC secret, neither of which belongs in git.
+/config.yaml
+/config.*.yaml
+!/config.example.yaml
+
+.DS_Store
