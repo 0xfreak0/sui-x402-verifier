@@ -368,6 +368,14 @@ pub enum FacilitatorError {
     InvalidSignature { detail: String },
     #[error("transaction would not execute: {detail}")]
     SimulationFailed { detail: String },
+    #[error(
+        "input object {object_id} is pinned at version {pinned} but the chain is at {current:?};          the payment authorization is no longer executable"
+    )]
+    StaleInput {
+        object_id: String,
+        pinned: u64,
+        current: Option<u64>,
+    },
     #[error("settlement failed on chain: {detail}")]
     SettlementFailed { detail: String },
     #[error("payment requirements are unusable: {detail}")]
@@ -418,7 +426,12 @@ impl FacilitatorError {
             FacilitatorError::InvalidSignature { .. } => "invalid_payload",
             // A simulation that fails covers "would not execute" and the
             // already-executed case alike.
-            FacilitatorError::SimulationFailed { .. } => "invalid_transaction_state",
+            // The authorization references coins that have moved on, so it can
+            // never execute. "Already executed / rejected by the chain" is the
+            // closest §9 code.
+            FacilitatorError::SimulationFailed { .. } | FacilitatorError::StaleInput { .. } => {
+                "invalid_transaction_state"
+            }
             FacilitatorError::SettlementFailed { .. } => "unexpected_settle_error",
             // The step-4 failure — wrong recipient, wrong asset, wrong amount.
             // §9's equivalents are all EVM-named, so this is the generic code.
@@ -1183,6 +1196,11 @@ mod tests {
             FacilitatorError::Rpc { detail: "x".into() },
             FacilitatorError::InvalidSignature { detail: "x".into() },
             FacilitatorError::SimulationFailed { detail: "x".into() },
+            FacilitatorError::StaleInput {
+                object_id: "0x1".into(),
+                pinned: 1,
+                current: Some(2),
+            },
             FacilitatorError::SettlementFailed { detail: "x".into() },
             FacilitatorError::InvalidRequirements { detail: "x".into() },
             FacilitatorError::AmountNotCredited {

@@ -176,6 +176,15 @@ impl SuiVerifier {
             });
         }
 
+        // ---- Step 3b: the inputs it pins are still live --------------------
+        //
+        // Simulation does NOT enforce this: an authorization whose coins have
+        // since been spent still simulates successfully, then fails at
+        // execution. Without this check a client can spend the pinned coin,
+        // present the (now dead) payment, be verified, receive the resource,
+        // and have settlement fail — free service, no race required.
+        self.assert_inputs_are_live(&transaction).await?;
+
         // ---- Step 4: it pays the right party the right amount -------------
         assert_credits(&executed.balance_changes, requirements)?;
 
@@ -183,6 +192,84 @@ impl SuiVerifier {
             payer: sender,
             digest: executed.digest.unwrap_or_default(),
         })
+    }
+
+    /// Confirm every object the transaction pins still exists at the pinned
+    /// version.
+    ///
+    /// A Sui transaction references owned objects as `(id, version, digest)`.
+    /// Execution rejects a stale version; **simulation does not**, which is the
+    /// gap this closes. Shared inputs are skipped: they are versioned by
+    /// consensus at execution time, not pinned by the client.
+    async fn assert_inputs_are_live(
+        &self,
+        transaction: &sui_sdk_types::Transaction,
+    ) -> Result<(), FacilitatorError> {
+        use sui_sdk_types::{Input, TransactionKind};
+
+        let mut pinned: Vec<(String, u64)> = Vec::new();
+
+        if let TransactionKind::ProgrammableTransaction(ptb) = &transaction.kind {
+            for input in &ptb.inputs {
+                match input {
+                    // Owned and receiving inputs carry a client-pinned version.
+                    Input::ImmutableOrOwned(r) | Input::Receiving(r) => {
+                        pinned.push((r.object_id().to_string(), r.version()));
+                    }
+                    // Shared objects are versioned at execution by consensus.
+                    Input::Shared(_) => {}
+                    _ => {}
+                }
+            }
+        }
+
+        // Gas coins are pinned the same way and are just as spendable.
+        for r in &transaction.gas_payment.objects {
+            pinned.push((r.object_id().to_string(), r.version()));
+        }
+
+        if pinned.is_empty() {
+            return Ok(());
+        }
+
+        let mut ledger = self.client.clone().ledger_client();
+        for (object_id, version) in pinned {
+            let response = ledger
+                .get_object(
+                    pb::GetObjectRequest::default()
+                        .with_object_id(object_id.clone())
+                        .with_read_mask(prost_types::FieldMask {
+                            paths: vec!["object_id".into(), "version".into()],
+                        }),
+                )
+                .await;
+
+            let current = match response {
+                Ok(response) => response.into_inner().object.and_then(|o| o.version),
+                // A pinned object that no longer exists reads as NotFound. That
+                // is exactly the "already spent" case, not an infrastructure
+                // failure, so treat it as a dead input rather than an RPC error.
+                Err(status) if status.code() == tonic::Code::NotFound => None,
+                Err(e) => {
+                    return Err(FacilitatorError::Rpc {
+                        detail: format!("GetObject({object_id}): {e}"),
+                    });
+                }
+            };
+
+            match current {
+                Some(current) if current == version => {}
+                other => {
+                    return Err(FacilitatorError::StaleInput {
+                        object_id,
+                        pinned: version,
+                        current: other,
+                    });
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Broadcast the client-signed transaction (`scheme_exact_sui.md`,

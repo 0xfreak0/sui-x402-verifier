@@ -272,9 +272,13 @@ the upstream takes, and sessions shrink it by the quota factor (one settlement
 covers ~1000 requests, so the window opens once per session, not once per
 request). `x402_settlement_after_serve_failures_total` counts exactly this.
 
-Worse, and separately: **verification passes on an authorization that is already
-dead** — simulation does not reject spent input coins the way execution does.
-See `docs/sui-scheme-conformance.md`.
+That window only means anything because verification rejects already-dead
+authorizations. Simulation alone does **not** — an authorization whose coins have
+been spent still simulates fine — so verification additionally checks that every
+pinned input object still exists at its pinned version. Without that check there
+was no race to win: spend the coin first, present the dead payment, get served
+for free. With it, invalidating a payment means landing a competing transaction
+inside the upstream-latency window (~100 ms) against ~400 ms chain finality.
 
 ## The facilitator API
 

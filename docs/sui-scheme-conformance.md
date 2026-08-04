@@ -49,7 +49,7 @@ JSON examples, so drift fails CI.
 |---|---|---|---|
 | 1 | Network is the agreed-upon chain | **Y** | `Facilitator::check_terms` compares against the facilitator's **own** configured network, not merely the client's claim against the supplied requirements |
 | 2 | Signature is valid over the provided transaction | **Y** | `SignatureVerificationService.VerifySignature`, with the address recovered from the BCS-decoded transaction rather than taken from the client |
-| 3 | Simulate: would succeed, not already executed | **P** | `SimulateTransaction`, rejecting a non-success status. "Already executed" is covered only insofar as the simulation reports it; we do not separately query the ledger for the digest |
+| 3 | Simulate: would succeed, not already executed | **Y** | `SimulateTransaction` rejecting a non-success status, **plus** an explicit check that every pinned input object still exists at its pinned version — simulation alone does not enforce that |
 | 4 | `payTo` sees a balance change equal to `amount` in `asset` | **Y** | `sui::assert_credits` over the simulation's `balance_changes`, summed per (address, coin type), compared for **equality** |
 
 Step 4 notes:
@@ -66,28 +66,28 @@ Tests: `sui::credits_the_exact_amount_to_the_right_address_and_asset`,
 `sums_multiple_credits_to_the_same_recipient`. Validated live on testnet against
 a wallet-signed transfer, including the four negative cases.
 
-**Gap in step 3, demonstrated.** Simulation does not reject an authorization
-whose input coins have since been spent. Measured on testnet:
+**Step 3 needed more than simulation.** Simulation does *not* reject an
+authorization whose input coins have since been spent. Measured on testnet
+before the fix:
 
-1. Build and sign a payment pinning USDC coin `0x3a4d…`. `/verify` → `isValid: true`.
-2. Spend that same coin in an unrelated transaction (`2WUTtXX…`, Success).
+1. Sign a payment pinning USDC coin `0x3a4d…`. `/verify` → `isValid: true`.
+2. Spend that coin in an unrelated transaction (Success).
 3. `/verify` again → **still `isValid: true`**.
-4. `/settle` → fails: `ExecuteTransaction: Client specified an invalid argument`.
+4. `/settle` → `ExecuteTransaction: Client specified an invalid argument`.
 
-So verification passes on an authorization that is already dead. Execution
-enforces object versions; simulation, at least as we call it, does not. This
-matters most on the deferred-settlement path, where the gap between verify and
-settle is exactly the window an upstream request takes.
+That is free service with no race required: spend the coin first, then present
+the dead authorization, be verified, be served, and watch settlement fail.
 
-Two things would narrow it, neither yet done:
+`SuiVerifier::assert_inputs_are_live` now reads every pinned input — owned and
+receiving inputs from the PTB, plus the gas objects — and confirms each still
+exists at the pinned version. Shared inputs are skipped, since consensus
+versions those at execution rather than the client pinning them. A `NotFound`
+object is treated as spent rather than as an RPC failure.
 
-- probe the ledger for the transaction digest and for the input objects' current
-  versions during verification, rather than trusting the simulation alone;
-- use `sui-rpc`'s `execute_transaction_and_wait_for_checkpoint`, which handles
-  duplicate submissions by probing the ledger.
+Re-measured after the fix: step 3 now returns `isValid: false`
+(`invalid_transaction_state`) once the coin is spent.
 
-Note this is not a flaw the scheme's ordering introduces so much as one it
-*exposes*: see "The pay-after-service window" below.
+This matters for more than tidiness — see the next section.
 
 ## Settlement (§ Settlement)
 
@@ -150,9 +150,16 @@ from the client **to the server**:
 | settle first (`ext_authz`) | charged for a request that then fails | none |
 | settle after (`ext_proc`, spec order) | none | resource served, payment now dead |
 
-The exposure is bounded by how long the work takes. A 50 ms upstream call is a
-50 ms window; a 30-second query is a 30-second window during which a motivated
-client can invalidate the authorization deterministically, not just by luck.
+The exposure is bounded by how long the work takes, and that bound only means
+something because verification now rejects already-dead authorizations. Before
+that fix there was no race at all: a client could spend the coin first and still
+verify. With it, invalidating a payment means landing a competing transaction
+*inside the upstream-latency window* — on the order of 100 ms for a GraphQL
+query — against Sui finality of roughly 400 ms. That is a losing race in the
+general case rather than a free lunch.
+
+It is still a race, not a guarantee. A slow upstream widens it, which is a good
+reason to keep expensive endpoints on `ext_authz` or to cap upstream timeouts.
 
 **Sessions reduce this by roughly the quota factor.** One settlement covers a
 whole session, so the window opens once per session rather than once per
@@ -186,10 +193,12 @@ the metric that counts exactly this happening.
 
 ## Summary
 
-Of the four verification steps the scheme defines, three are fully implemented
-and one (step 3, "not already executed") is partial. The payload shape, the
+All four verification steps the scheme defines are implemented. The payload shape, the
 settlement mechanism and the network check are conformant. The two `N`s are
 sponsorship, which is deliberately out of scope and correctly advertised as
 absent.
 
-The most material gap is step 3's already-executed check.
+All four verification steps are now implemented. The remaining exposure is the
+pay-after-service window described above, which is inherent to the spec's
+ordering rather than to this implementation, and is bounded by upstream latency
+against chain finality.
