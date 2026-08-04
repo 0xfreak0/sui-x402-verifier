@@ -79,7 +79,29 @@ static_resources:
                         # reflection before it can issue the real call, and
                         # sending that to the GraphQL cluster fails with a
                         # confusing "server does not support the reflection API".
-                        - match: { safe_regex: { regex: "^/(sui\\.rpc\\.v2|grpc\\.reflection|grpc\\.health)\\..*" } }
+                        # gRPC service discovery and health, NOT gated.
+                        #
+                        # A gRPC client resolves method descriptors via
+                        # reflection before it can issue the real call, and
+                        # clients attach their headers to that call too. Gating
+                        # it means the reflection request consumes the payment
+                        # and the actual call is then refused as a replay —
+                        # which is correct behaviour producing a useless client.
+                        #
+                        # Reflection is service-discovery metadata, not the paid
+                        # resource, so it is exempt. The responses are small and
+                        # cacheable; the resource itself stays gated below.
+                        - match: { safe_regex: { regex: "^/(grpc\\.reflection|grpc\\.health)\\..*" } }
+                          route:
+                            cluster: sui_fullnode_grpc
+                            host_rewrite_literal: fullnode.testnet.sui.io
+                            timeout: 30s
+                          typed_per_filter_config:
+                            envoy.filters.http.ext_proc:
+                              "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExtProcPerRoute
+                              disabled: true
+
+                        - match: { safe_regex: { regex: "^/sui\\.rpc\\.v2\\..*" } }
                           route:
                             cluster: sui_fullnode_grpc
                             # The upstream routes on :authority and terminates

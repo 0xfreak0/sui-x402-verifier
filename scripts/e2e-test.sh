@@ -178,19 +178,39 @@ fi
 step "6. gRPC passthrough to the Sui fullnode"
 # ---------------------------------------------------------------------------
 if command -v grpcurl >/dev/null 2>&1; then
-  if [[ -n "$session" ]]; then
-    out=$(grpcurl -plaintext -max-time 20 \
-            -H "x-payment-session: $session" \
-            -d '{}' "$GRPC_ADDR" \
-            sui.rpc.v2.LedgerService/GetServiceInfo 2>&1)
-    if grep -q '"chain"' <<<"$out"; then
-      ok "gRPC proxied to the fullnode: $(grep -o '"chain": *"[^"]*"' <<<"$out" | head -1)"
-    else
-      bad "gRPC passthrough failed: $(head -c 200 <<<"$out")"
-    fi
+  # The gRPC route has its own policy, so it has its own price AND its own
+  # session scope. A session bought on the GraphQL route is deliberately NOT
+  # accepted here — paying for the cheap route must not unlock the dear one.
+  grpc_challenge=$(grpcurl -plaintext -max-time 20 -d '{}' "$GRPC_ADDR" \
+      sui.rpc.v2.LedgerService/GetServiceInfo 2>&1 || true)
+  grpc_amount=$(sed -n 's/.*"amount":"\([0-9]*\)".*/\1/p' <<<"$grpc_challenge" | head -1)
+
+  if [[ -n "$grpc_amount" ]]; then
+    ok "gRPC route advertises its own price: $grpc_amount"
+    grpc_pay=$(build_payment "$PAY_MODE" "$network" "$grpc_amount" "$asset" "$pay_to") || grpc_pay=""
   else
-    bad "skipping gRPC test — no session token"
+    # Free tier still had room, so no challenge was issued.
+    grpc_pay=""
   fi
+
+  out=$(grpcurl -plaintext -max-time 20 \
+          ${grpc_pay:+-H "payment-signature: $grpc_pay"} \
+          -d '{}' "$GRPC_ADDR" \
+          sui.rpc.v2.LedgerService/GetServiceInfo 2>&1)
+  if grep -q '"chain"' <<<"$out"; then
+    ok "gRPC proxied to the fullnode: $(grep -o '"chain": *"[^"]*"' <<<"$out" | head -1)"
+  else
+    bad "gRPC passthrough failed: $(head -c 200 <<<"$out")"
+  fi
+
+  # NOTE: cross-policy session scoping (a GraphQL session must not unlock the
+  # gRPC route) is NOT asserted here. A refused session falls through to the
+  # free tier, and from outside that is indistinguishable from the session
+  # having been accepted — so any assertion here is either flaky or vacuous,
+  # depending on where the sliding window happens to be. The property is
+  # covered deterministically by unit tests:
+  #   session::a_session_is_scoped_to_the_policy_that_bought_it
+  #   auth::a_session_bought_on_one_policy_does_not_unlock_another
 else
   echo "  – skipping: grpcurl not installed (brew install grpcurl)"
 fi
