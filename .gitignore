@@ -11,3 +11,12 @@
 !/config.example.yaml
 
 .DS_Store
+
+# Local working notes and parked deploy work — see LOCAL-NOTES.md.
+# Deliberately untracked until the x402 conformance work lands; deploying a
+# non-conformant demo would show clients something they cannot talk to.
+/LOCAL-NOTES.md
+/X402-CONFORMANCE-PROMPT.md
+/Dockerfile
+/.dockerignore
+/deploy/

@@ -57,15 +57,25 @@ pub struct PaymentConfig {
     /// Price in the asset's smallest unit, as a decimal string. A string (not
     /// an integer) because x402 carries amounts as strings to dodge the
     /// 2^53 precision cliff in JSON parsers.
-    pub max_amount_required: String,
+    ///
+    /// Named `amount` to match the v2 wire field exactly — v1 called this
+    /// `maxAmountRequired`. Keeping one name end-to-end means there is no
+    /// translation table between config and protocol to get wrong.
+    pub amount: String,
     /// Fully-qualified Move coin type to be paid in.
     pub asset: String,
     /// Sui address that receives payment. Must be this operator's wallet.
     pub pay_to: String,
     /// How long a signed authorization stays acceptable, in seconds.
     pub max_timeout_seconds: u64,
-    /// Human-readable description surfaced to the paying client.
+    /// Human-readable description of the resource. In v2 this belongs to the
+    /// top-level `resource` object, not to each `accepts` entry.
     pub description: String,
+    /// Gas station URL advertised as `extra.gasStation` when set, signalling
+    /// to clients that this facilitator will sponsor transactions. Advertising
+    /// only — the interactive sponsorship protocol itself is not implemented.
+    #[serde(default)]
+    pub gas_station: Option<String>,
 }
 
 /// Key Envoy uses to name a payment policy in `context_extensions`.
@@ -84,7 +94,7 @@ pub struct PaymentOverride {
     pub pay_to: Option<String>,
     /// Price for this policy.
     #[serde(default)]
-    pub max_amount_required: Option<String>,
+    pub amount: Option<String>,
     /// Description surfaced in the challenge.
     #[serde(default)]
     pub description: Option<String>,
@@ -96,8 +106,8 @@ impl PaymentOverride {
         if let Some(pay_to) = &self.pay_to {
             payment.pay_to = pay_to.clone();
         }
-        if let Some(amount) = &self.max_amount_required {
-            payment.max_amount_required = amount.clone();
+        if let Some(amount) = &self.amount {
+            payment.amount = amount.clone();
         }
         if let Some(description) = &self.description {
             payment.description = description.clone();
@@ -109,12 +119,10 @@ impl PaymentOverride {
         if let Some(pay_to) = &self.pay_to {
             validate_pay_to(pay_to).with_context(|| context.to_string())?;
         }
-        if let Some(amount) = &self.max_amount_required
+        if let Some(amount) = &self.amount
             && amount.parse::<u128>().is_err()
         {
-            bail!(
-                "{context}: max_amount_required must be a decimal integer string, got {amount:?}"
-            );
+            bail!("{context}: amount must be a decimal integer string, got {amount:?}");
         }
         Ok(())
     }
@@ -292,10 +300,10 @@ impl Config {
 
         // An empty or malformed amount would be advertised to clients verbatim
         // and then fail to compare at verification time, so catch it here.
-        if self.payment.max_amount_required.parse::<u128>().is_err() {
+        if self.payment.amount.parse::<u128>().is_err() {
             bail!(
-                "payment.max_amount_required must be a decimal integer string, got {:?}",
-                self.payment.max_amount_required
+                "payment.amount must be a decimal integer string, got {:?}",
+                self.payment.amount
             );
         }
 
@@ -421,7 +429,7 @@ session_hmac_secret: "{}"
 payment:
   scheme: "exact"
   network: "sui:testnet"
-  max_amount_required: "1000"
+  amount: "1000"
   asset: "0xa1ec7fc00a6f40db9693ad1415d0c193ad3906494428cf252621037bd7117e29::usdc::USDC"
   pay_to: "{}"
   max_timeout_seconds: 60
@@ -489,10 +497,7 @@ paid_tier:
 
     #[test]
     fn rejects_non_numeric_amount() {
-        let yaml = base_yaml().replace(
-            r#"max_amount_required: "1000""#,
-            r#"max_amount_required: "1.5""#,
-        );
+        let yaml = base_yaml().replace(r#"amount: "1000""#, r#"amount: "1.5""#);
         let err = parse(&yaml).unwrap_err().to_string();
         assert!(err.contains("decimal integer"), "got: {err}");
     }
@@ -532,11 +537,11 @@ paid_tier:
             r#"{}
 routes:
   - path_prefix: "/"
-    max_amount_required: "100"
+    amount: "100"
     description: "cheap default"
   - path_prefix: "/sui.rpc.v2."
     pay_to: "0x{}"
-    max_amount_required: "5000"
+    amount: "5000"
     description: "gRPC calls"
 "#,
             base_yaml(),
@@ -549,7 +554,7 @@ routes:
         let config = parse(&base_yaml()).unwrap();
         let terms = config.payment_for("/anything", None);
         assert_eq!(terms.pay_to, TEST_PAY_TO);
-        assert_eq!(terms.max_amount_required, "1000");
+        assert_eq!(terms.amount, "1000");
     }
 
     #[test]
@@ -560,11 +565,11 @@ routes:
         // "/" rule is listed first.
         let grpc = config.payment_for("/sui.rpc.v2.LedgerService/GetServiceInfo", None);
         assert_eq!(grpc.pay_to, format!("0x{}", "3".repeat(64)));
-        assert_eq!(grpc.max_amount_required, "5000");
+        assert_eq!(grpc.amount, "5000");
         assert_eq!(grpc.description, "gRPC calls");
 
         let graphql = config.payment_for("/graphql", None);
-        assert_eq!(graphql.max_amount_required, "100");
+        assert_eq!(graphql.amount, "100");
         assert_eq!(graphql.description, "cheap default");
     }
 
@@ -585,13 +590,13 @@ routes:
 policies:
   grpc:
     pay_to: "0x{}"
-    max_amount_required: "5000"
+    amount: "5000"
     description: "gRPC calls"
   graphql:
-    max_amount_required: "100"
+    amount: "100"
 routes:
   - path_prefix: "/graphql"
-    max_amount_required: "77"
+    amount: "77"
 "#,
             base_yaml(),
             "4".repeat(64)
@@ -605,7 +610,7 @@ routes:
         // is the point — Envoy already matched the route.
         let terms = config.payment_for("/whatever", Some("grpc"));
         assert_eq!(terms.pay_to, format!("0x{}", "4".repeat(64)));
-        assert_eq!(terms.max_amount_required, "5000");
+        assert_eq!(terms.amount, "5000");
     }
 
     #[test]
@@ -613,7 +618,7 @@ routes:
         let config = parse(&policy_yaml()).unwrap();
         // "/graphql" matches the routes[] rule (77), but the policy wins (100).
         let terms = config.payment_for("/graphql", Some("graphql"));
-        assert_eq!(terms.max_amount_required, "100");
+        assert_eq!(terms.amount, "100");
     }
 
     #[test]
@@ -622,7 +627,7 @@ routes:
         assert!(config.is_unknown_policy("typo"));
         // Falls through to the path-prefix rule rather than erroring.
         let terms = config.payment_for("/graphql", Some("typo"));
-        assert_eq!(terms.max_amount_required, "77");
+        assert_eq!(terms.amount, "77");
     }
 
     #[test]
@@ -644,10 +649,7 @@ routes:
 
     #[test]
     fn rejects_a_route_with_a_non_numeric_amount() {
-        let yaml = routed_yaml().replace(
-            r#"max_amount_required: "5000""#,
-            r#"max_amount_required: "free""#,
-        );
+        let yaml = routed_yaml().replace(r#"amount: "5000""#, r#"amount: "free""#);
         assert!(parse(&yaml).is_err());
     }
 

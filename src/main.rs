@@ -122,7 +122,7 @@ async fn main() -> Result<()> {
         sui_chain = %config.sui_chain,
         pay_to = %config.payment.pay_to,
         asset = %config.payment.asset,
-        price = %config.payment.max_amount_required,
+        price = %config.payment.amount,
         free_tier = format!(
             "{}/{}s",
             config.free_tier.max_requests, config.free_tier.window_secs

@@ -77,10 +77,17 @@ if [[ -n "$challenge" ]]; then
 
   pay_to=$(sed -n 's/.*"payTo":"\([^"]*\)".*/\1/p' <<<"$decoded")
   network=$(sed -n 's/.*"network":"\([^"]*\)".*/\1/p' <<<"$decoded")
-  amount=$(sed -n 's/.*"maxAmountRequired":"\([^"]*\)".*/\1/p' <<<"$decoded")
+  amount=$(sed -n 's/.*"amount":"\([^"]*\)".*/\1/p' <<<"$decoded")
+  resource_url=$(sed -n 's/.*"resource":{"url":"\([^"]*\)".*/\1/p' <<<"$decoded")
   [[ -n "$pay_to"  ]] && ok "challenge advertises payTo=$pay_to"   || bad "no payTo in challenge"
   [[ "$network" == "sui:testnet" ]] && ok "challenge network=$network" || bad "unexpected network: $network"
-  [[ -n "$amount"  ]] && ok "challenge price=$amount (USDC base units)" || bad "no amount in challenge"
+  [[ -n "$amount"  ]] && ok "challenge price=$amount (USDC base units, v2 'amount' field)" || bad "no amount in challenge"
+  # v2 requires a full URL in a top-level resource object, not a bare path.
+  if [[ "$resource_url" == http*://* ]]; then
+    ok "challenge resource.url=$resource_url"
+  else
+    bad "resource.url is not a full URL: ${resource_url:-<missing>}"
+  fi
 else
   bad "PAYMENT-REQUIRED header missing from the 402"
 fi
@@ -88,13 +95,18 @@ fi
 # ---------------------------------------------------------------------------
 step "3. Paying unlocks the paid tier and mints a session"
 # ---------------------------------------------------------------------------
-# In stub-accept-all mode the facilitator does not touch the chain, so these
-# transaction bytes are placeholders. With verification_mode: sui-grpc this
-# must be a real BCS-serialized, client-signed transaction.
-# Synthetic address. Never put a real wallet in a committed script.
-PAYER="0x2222222222222222222222222222222222222222222222222222222222222222"
+# x402 v2 PaymentPayload (spec §5.2.1). A conformant client echoes back the
+# requirements it chose in `accepted`; the server re-checks every field, so the
+# values below are lifted from the challenge decoded above rather than invented.
+#
+# In stub-accept-all mode the facilitator does not touch the chain, so the Sui
+# payload is placeholder base64. With verification_mode: sui-grpc `transaction`
+# must be real BCS-serialized TransactionData and `signature` a real signature
+# over it.
+asset=$(sed -n 's/.*"asset":"\([^"]*\)".*/\1/p' <<<"$decoded")
+timeout_secs=$(sed -n 's/.*"maxTimeoutSeconds":\([0-9]*\).*/\1/p' <<<"$decoded")
 payment_json=$(cat <<EOF
-{"x402Version":2,"scheme":"exact","network":"sui:testnet","payload":{"transactionBytes":"AAAAplaceholder","signatures":["AAAAplaceholdersig"],"payer":"$PAYER"}}
+{"x402Version":2,"accepted":{"scheme":"exact","network":"$network","amount":"$amount","asset":"$asset","payTo":"$pay_to","maxTimeoutSeconds":${timeout_secs:-60}},"payload":{"signature":"cGxhY2Vob2xkZXItc2ln","transaction":"cGxhY2Vob2xkZXItdHg="}}
 EOF
 )
 PAYMENT_SIGNATURE=$(printf '%s' "$payment_json" | base64 | tr -d '\n')
@@ -145,7 +157,7 @@ fi
 step "5. A forged session token does not escalate privilege"
 # ---------------------------------------------------------------------------
 # Correct shape, wrong MAC. Must fall back to the (exhausted) free tier.
-FORGED="${PAYER}:99999999999:$(printf 'aa%.0s' {1..16}):$(printf 'bb%.0s' {1..32})"
+FORGED="0x2222222222222222222222222222222222222222222222222222222222222222:99999999999:$(printf 'aa%.0s' {1..16}):$(printf 'bb%.0s' {1..32})"
 gql -H "x-payment-session: $FORGED" >/dev/null
 code=$(status)
 if [[ "$code" == "402" ]]; then

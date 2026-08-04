@@ -121,8 +121,11 @@
 const $ = (id) => document.getElementById(id);
 const QUERY = JSON.stringify({ query: '{ chainIdentifier }' });
 
-// Synthetic payer. With real settlement this comes from a connected wallet.
-const PAYER = '0x' + '2'.repeat(64);
+// Terms captured from the last 402 challenge. A conformant client echoes the
+// requirements it chose back in PaymentPayload.accepted — it does not invent
+// them — so we cannot pay until the server has told us the price.
+let accepted = null;
+let resourceInfo = null;
 
 let session = null;
 let stats = { total: 0, ok: 0, blocked: 0 };
@@ -156,10 +159,13 @@ function showChallenge(b64) {
     const decoded = JSON.parse(atob(b64));
     $('challenge').textContent = JSON.stringify(decoded, null, 2);
     $('challenge').hidden = false;
-    const terms = decoded.accepts && decoded.accepts[0];
-    $('challenge-hint').textContent = terms
-      ? `Pay ${terms.maxAmountRequired} base units of ${terms.asset.split('::').pop()} to ${terms.payTo.slice(0, 14)}… on ${terms.network}.`
-      : decoded.error;
+    // v2: `resource` is a top-level object; `accepts[]` entries carry `amount`
+    // (v1 called it maxAmountRequired) and no longer repeat the resource.
+    accepted = (decoded.accepts && decoded.accepts[0]) || null;
+    resourceInfo = decoded.resource || null;
+    $('challenge-hint').textContent = accepted
+      ? `Pay ${accepted.amount} base units of ${accepted.asset.split('::').pop()} to ${accepted.payTo.slice(0, 14)}… on ${accepted.network}.`
+      : (decoded.error || 'Payment required.');
   } catch (e) {
     $('challenge').textContent = 'Could not decode challenge: ' + e;
     $('challenge').hidden = false;
@@ -221,17 +227,26 @@ $('spam').onclick = async (e) => {
 };
 
 $('pay').onclick = async (e) => {
+  if (!accepted) {
+    log('—', 'nothing to pay yet — call the API until it returns a 402 with terms');
+    return;
+  }
   e.target.disabled = true;
-  // In stub mode the transaction bytes are placeholders. With sui-grpc
-  // verification these must be a real BCS-serialized, wallet-signed transaction.
+
+  // x402 v2 PaymentPayload (spec §5.2.1). `accepted` is echoed verbatim from
+  // the challenge: the server re-checks every field, so altering the amount,
+  // asset or payTo here is refused rather than honoured.
   const payload = {
     x402Version: 2,
-    scheme: 'exact',
-    network: 'sui:testnet',
+    ...(resourceInfo ? { resource: resourceInfo } : {}),
+    accepted,
+    // Sui `exact` scheme payload: exactly { signature, transaction }, both
+    // base64. In stub mode these are placeholders and no funds move. With a
+    // real wallet, @mysten/dapp-kit's useSignTransaction returns
+    // { bytes, signature } which map to { transaction, signature }.
     payload: {
-      transactionBytes: 'AAAAplaceholder',
-      signatures: ['AAAAplaceholdersig'],
-      payer: PAYER,
+      signature: btoa('placeholder-signature'),
+      transaction: btoa('placeholder-transaction'),
     },
   };
   await callApi({ 'payment-signature': btoa(JSON.stringify(payload)) });

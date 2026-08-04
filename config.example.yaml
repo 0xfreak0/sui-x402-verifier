@@ -36,7 +36,10 @@ payment:
 
   # Price in the asset's smallest unit, as a string. USDC has 6 decimals,
   # so "1000" == 0.001 USDC.
-  max_amount_required: "1000"
+  #
+  # Called `amount` to match the x402 v2 wire field. v1 named this
+  # `maxAmountRequired`; the scheme is `exact`, so it is a price, not a ceiling.
+  amount: "1000"
 
   # Circle's USDC on Sui testnet (verified on-chain: 6 decimals, REGULATED).
   # Faucet: https://faucet.circle.com — select "Sui Testnet".
@@ -55,6 +58,11 @@ payment:
   max_timeout_seconds: 60
 
   description: "Elevated rate limit for the Sui testnet GraphQL + gRPC proxy"
+
+  # Optional. Advertised to clients as `extra.gasStation`, signalling that this
+  # facilitator will sponsor (pay gas for) transactions. Advertising only — the
+  # interactive gas station protocol itself is not implemented.
+  # gas_station: "https://gas.example.com"
 
 # Anonymous tier, metered per source IP. Deliberately small so the 402 flow is
 # easy to trigger by hand during local testing.
@@ -92,10 +100,10 @@ store:
 # Each policy may also set `pay_to:` to credit a different wallet per route.
 policies:
   graphql:
-    max_amount_required: "100"
+    amount: "100"
     description: "Sui testnet GraphQL queries"
   grpc:
-    max_amount_required: "5000"
+    amount: "5000"
     description: "Sui testnet fullnode gRPC calls"
 
 # Path-prefix overrides, matched by the verifier itself. Fallback for gateways
@@ -103,4 +111,4 @@ policies:
 # This DOES duplicate path knowledge, so prefer `policies` with Envoy.
 # routes:
 #   - path_prefix: "/sui.rpc.v2."
-#     max_amount_required: "5000"
+#     amount: "5000"
