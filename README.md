@@ -260,25 +260,69 @@ and settled only after a success.
 Both are served on the same port; `envoy.yaml` selects between them. **Do not
 enable both** — each would independently charge for the same request.
 
-**The residual risk of deferring is real and demonstrable.** A Sui payment
-authorization pins specific coin objects at specific versions, so between verify
-and settle the payer can spend those coins elsewhere and the authorization
-becomes permanently unexecutable. Measured on testnet: `/verify` returned
-`isValid: true`, the payer then moved the pinned coin, and `/settle` failed.
+See **Pay after service** below for what deferring settlement buys, what it
+costs, and how to opt out of the tradeoff entirely.
 
-So the spec's ordering does not make payment enforceable after the fact — it
-moves the risk from the client to the server. The exposure is bounded by how long
-the upstream takes, and sessions shrink it by the quota factor (one settlement
-covers ~1000 requests, so the window opens once per session, not once per
-request). `x402_settlement_after_serve_failures_total` counts exactly this.
+## Pay after service — yes, and it is the default
 
-That window only means anything because verification rejects already-dead
-authorizations. Simulation alone does **not** — an authorization whose coins have
-been spent still simulates fine — so verification additionally checks that every
-pinned input object still exists at its pinned version. Without that check there
-was no race to win: spend the coin first, present the dead payment, get served
-for free. With it, invalidating a payment means landing a competing transaction
-inside the upstream-latency window (~100 ms) against ~400 ms chain finality.
+The Sui scheme sequences payment as **verify → do the work → settle**, so a
+client is only charged once the resource has actually been produced. This
+implements that, on the `ext_proc` path, which is the default.
+
+Both halves, measured on testnet against a real wallet-signed payment:
+
+```
+CASE A — the upstream succeeds
+  upstream returned   {"data":{"chainIdentifier":"69WiPg3DAQ…"}}
+  receipt             {"success":true,"transaction":"AJ…"}
+  payee balance       20300 → 20310        charged AFTER delivery
+
+CASE B — the upstream 404s
+  upstream status     HTTP/1.1 404 Not Found
+  PAYMENT-RESPONSE    absent               never settled
+  x-payment-session   absent               no session issued
+  payee balance       20310 → 20310        UNCHANGED, not charged
+```
+
+The verifier's own timeline for those two requests:
+
+```
+payment verified; settlement deferred until the upstream succeeds
+payment settled after the upstream succeeded
+upstream did not succeed; discarding the verified payment unsettled  status=404
+```
+
+An unsettled payment also has its replay claim **released**, so the client can
+retry with the same signed transaction rather than being made to sign a new one
+for a failure that was not theirs.
+
+### What this costs you
+
+Deferring settlement moves risk from the client to the server. A Sui payment
+authorization pins coin objects at specific *versions*, so in principle a payer
+could spend those coins during the window and leave you having served the
+resource for nothing.
+
+That window is small, and it is only small because verification rejects
+already-dead authorizations — simulation alone does **not** catch spent inputs,
+so verification separately checks that every pinned input still exists at its
+pinned version. Without that check there was no race at all: spend the coin
+first, present the dead payment, get served for free. With it, invalidating a
+verified payment means landing a competing transaction inside the
+upstream-latency window (~100 ms for a GraphQL query) against roughly 400 ms of
+chain finality.
+
+`x402_settlement_after_serve_failures_total` counts this if it ever happens.
+
+**If you would rather not carry that risk at all**, switch to `ext_authz`, which
+settles before the upstream runs. There is then no window — the client instead
+bears the risk of being charged for a request that later errors, which is how
+most paid APIs already behave. Both modes are implemented; `envoy.yaml` selects
+between them. This is a policy choice, not a limitation.
+
+Note that the exposure is a property of the **spec's ordering**, not of running
+at a gateway: in-app middleware doing verify → work → settle has exactly the same
+window.
 
 ## The facilitator API
 

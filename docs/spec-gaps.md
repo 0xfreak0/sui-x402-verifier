@@ -81,9 +81,19 @@ resource has actually been produced.
 
 An Envoy `ext_authz` service is a **pre-upstream** filter. It runs before the
 request reaches the backend and cannot observe the response, so it can only
-settle *before* the work happens. See the README for the consequence and the
-`ext_proc` shape that would fix it.
+settle *before* the work happens — the opposite of what the scheme asks for.
 
-This is a deployment-topology gap rather than a spec defect, but the spec would
-be more useful if it named the constraint, since gateway-level enforcement is an
-obvious way to deploy x402.
+**Resolved in this implementation.** `ext_proc` is a bidirectional stream, one
+per HTTP request, carrying request headers *and* response headers. That makes the
+spec's ordering achievable at the gateway: verify on the way in, hold the
+verified payment as stream-local state, settle on the way out only after a 2xx.
+It is the default here, and `ext_authz` is kept only as a fallback for gateways
+that do not support ext_proc.
+
+Still worth raising upstream: the spec assumes the resource server can call the
+facilitator twice around its own work, which silently rules out the entire class
+of pre-upstream authorization filters (`ext_authz`, Kong plugins, NGINX
+`auth_request`). Those are an obvious way to deploy x402, and an implementer
+reaching for one will produce a conformant-looking service with the payment
+ordering inverted and no indication anything is wrong. Naming the constraint —
+and that response-path processing is required — would prevent that.
