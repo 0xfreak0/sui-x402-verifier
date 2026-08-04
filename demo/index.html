@@ -1,0 +1,252 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>x402 on Sui — pay for rate limit</title>
+<style>
+  :root {
+    --bg: #fbfbfd; --panel: #fff; --ink: #16181d; --muted: #6b7280;
+    --line: #e5e7eb; --accent: #4a7dff; --ok: #0f8a5f; --warn: #b45309; --err: #c2334d;
+    --code-bg: #f4f4f7;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0e1014; --panel: #161a21; --ink: #e8eaed; --muted: #9aa3b2;
+      --line: #262c37; --accent: #7aa2ff; --ok: #46c78d; --warn: #e0a33e; --err: #ff6b85;
+      --code-bg: #0b0d11;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 2rem 1.25rem 4rem;
+    font: 15px/1.55 ui-sans-serif, -apple-system, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg); color: var(--ink);
+  }
+  .wrap { max-width: 860px; margin: 0 auto; }
+  h1 { font-size: 1.5rem; margin: 0 0 .3rem; letter-spacing: -0.02em; }
+  .sub { color: var(--muted); margin: 0 0 1.75rem; }
+  .panel {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 12px; padding: 1.1rem 1.25rem; margin-bottom: 1rem;
+  }
+  .row { display: flex; gap: .6rem; flex-wrap: wrap; align-items: center; }
+  label { font-size: .8rem; color: var(--muted); display: block; margin-bottom: .3rem; }
+  input {
+    font: 13px ui-monospace, SFMono-Regular, Menlo, monospace;
+    padding: .5rem .6rem; border: 1px solid var(--line); border-radius: 7px;
+    background: var(--bg); color: var(--ink); width: 100%;
+  }
+  button {
+    font: 600 14px/1 ui-sans-serif, system-ui, sans-serif;
+    padding: .65rem 1.1rem; border-radius: 8px; border: 1px solid transparent;
+    background: var(--accent); color: #fff; cursor: pointer;
+  }
+  button.ghost { background: transparent; border-color: var(--line); color: var(--ink); }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: .75rem; }
+  .stat { background: var(--code-bg); border-radius: 9px; padding: .7rem .8rem; }
+  .stat .k { font-size: .72rem; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+  .stat .v { font: 600 1.25rem ui-monospace, Menlo, monospace; margin-top: .2rem; }
+  .tier-free { color: var(--warn); } .tier-paid { color: var(--ok); } .tier-none { color: var(--muted); }
+  pre {
+    background: var(--code-bg); border-radius: 9px; padding: .8rem;
+    font: 12px/1.5 ui-monospace, Menlo, monospace; overflow-x: auto; margin: .6rem 0 0;
+    white-space: pre-wrap; word-break: break-word;
+  }
+  .log { max-height: 300px; overflow-y: auto; font: 12px/1.7 ui-monospace, Menlo, monospace; }
+  .log div { padding: .18rem 0; border-bottom: 1px solid var(--line); }
+  .s200 { color: var(--ok); } .s402 { color: var(--warn); } .sErr { color: var(--err); }
+  .hint { font-size: .82rem; color: var(--muted); margin-top: .7rem; }
+  code { font: 12px ui-monospace, Menlo, monospace; background: var(--code-bg); padding: .1rem .3rem; border-radius: 4px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Pay for your rate limit</h1>
+  <p class="sub">
+    An <strong>x402</strong> demo against Sui testnet. Anonymous calls are rate limited;
+    exhausting the free tier returns <code>402 Payment Required</code> with machine-readable
+    terms instead of a dead-end <code>429</code>. Paying unlocks a higher-limit session.
+  </p>
+
+  <div class="panel">
+    <label for="endpoint">Gateway endpoint</label>
+    <input id="endpoint" value="http://localhost:10000" spellcheck="false">
+    <div class="row" style="margin-top:.9rem">
+      <button id="call">Call the API</button>
+      <button id="spam" class="ghost">Call it 10&times;</button>
+      <button id="pay" class="ghost">Pay &amp; unlock</button>
+      <button id="reset" class="ghost">Reset session</button>
+    </div>
+  </div>
+
+  <div class="panel stats">
+    <div class="stat"><div class="k">Requests</div><div class="v" id="s-total">0</div></div>
+    <div class="stat"><div class="k">Served 200</div><div class="v s200" id="s-ok">0</div></div>
+    <div class="stat"><div class="k">Blocked 402</div><div class="v s402" id="s-402">0</div></div>
+    <div class="stat"><div class="k">Tier</div><div class="v tier-none" id="s-tier">none</div></div>
+  </div>
+
+  <div class="panel">
+    <strong>Payment challenge</strong>
+    <div class="hint" id="challenge-hint">
+      Keep calling until the free tier is spent — the decoded <code>PAYMENT-REQUIRED</code>
+      header will appear here.
+    </div>
+    <pre id="challenge" hidden></pre>
+  </div>
+
+  <div class="panel">
+    <strong>Session</strong>
+    <div class="hint" id="session-hint">No session. Pay to get one.</div>
+    <pre id="session" hidden></pre>
+  </div>
+
+  <div class="panel">
+    <strong>Request log</strong>
+    <div class="log" id="log"></div>
+  </div>
+
+  <p class="hint">
+    The verifier is running in <code>stub-accept-all</code> mode: payments are accepted
+    without touching the chain and <strong>no funds move</strong>, so no wallet is needed.
+    With real settlement this button would hand off to a Sui wallet to sign the transfer.
+  </p>
+</div>
+
+<script>
+// Deliberately dependency-free: no build step, no CDN, so this page can be
+// dropped next to the gateway and opened anywhere.
+const $ = (id) => document.getElementById(id);
+const QUERY = JSON.stringify({ query: '{ chainIdentifier }' });
+
+// Synthetic payer. With real settlement this comes from a connected wallet.
+const PAYER = '0x' + '2'.repeat(64);
+
+let session = null;
+let stats = { total: 0, ok: 0, blocked: 0 };
+
+function endpoint() {
+  return $('endpoint').value.replace(/\/+$/, '');
+}
+
+function log(status, note) {
+  const cls = status === 200 ? 's200' : status === 402 ? 's402' : 'sErr';
+  const line = document.createElement('div');
+  const stamp = new Date().toLocaleTimeString();
+  line.innerHTML = `<span class="${cls}">${status}</span> · ${stamp} · ${note}`;
+  $('log').prepend(line);
+}
+
+function render() {
+  $('s-total').textContent = stats.total;
+  $('s-ok').textContent = stats.ok;
+  $('s-402').textContent = stats.blocked;
+  const tier = $('s-tier');
+  tier.textContent = session ? 'paid' : (stats.total ? 'free' : 'none');
+  tier.className = 'v ' + (session ? 'tier-paid' : stats.total ? 'tier-free' : 'tier-none');
+}
+
+// The browser can only read these headers because Envoy sends
+// Access-Control-Expose-Headers. Without that, JS sees the 402 status but not
+// the terms — which is what makes x402 unusable from a page by default.
+function showChallenge(b64) {
+  try {
+    const decoded = JSON.parse(atob(b64));
+    $('challenge').textContent = JSON.stringify(decoded, null, 2);
+    $('challenge').hidden = false;
+    const terms = decoded.accepts && decoded.accepts[0];
+    $('challenge-hint').textContent = terms
+      ? `Pay ${terms.maxAmountRequired} base units of ${terms.asset.split('::').pop()} to ${terms.payTo.slice(0, 14)}… on ${terms.network}.`
+      : decoded.error;
+  } catch (e) {
+    $('challenge').textContent = 'Could not decode challenge: ' + e;
+    $('challenge').hidden = false;
+  }
+}
+
+async function callApi(extraHeaders = {}) {
+  const headers = { 'Content-Type': 'application/json', ...extraHeaders };
+  if (session && !headers['payment-signature']) headers['x-payment-session'] = session;
+
+  let res;
+  try {
+    res = await fetch(endpoint() + '/graphql', { method: 'POST', headers, body: QUERY });
+  } catch (e) {
+    stats.total++; render();
+    log('ERR', 'network error — is the gateway running and reachable? ' + e.message);
+    return null;
+  }
+
+  stats.total++;
+  const challenge = res.headers.get('payment-required');
+  const newSession = res.headers.get('x-payment-session');
+  const receipt = res.headers.get('payment-response');
+
+  if (newSession) {
+    session = newSession;
+    $('session').textContent = session;
+    $('session').hidden = false;
+    let hint = 'Session active — subsequent calls ride this token, no further payment.';
+    if (receipt) {
+      try { hint += '\nReceipt: ' + JSON.stringify(JSON.parse(atob(receipt))); } catch {}
+    }
+    $('session-hint').textContent = hint;
+  }
+
+  if (res.status === 200) {
+    stats.ok++;
+    const body = await res.json().catch(() => ({}));
+    const id = body?.data?.chainIdentifier;
+    log(200, session ? `paid tier · chainIdentifier ${id ?? '—'}` : `free tier · chainIdentifier ${id ?? '—'}`);
+  } else if (res.status === 402) {
+    stats.blocked++;
+    if (challenge) showChallenge(challenge);
+    log(402, 'payment required — free tier exhausted');
+  } else {
+    log(res.status, await res.text().catch(() => 'unexpected status'));
+  }
+
+  render();
+  return res;
+}
+
+$('call').onclick = () => callApi();
+
+$('spam').onclick = async (e) => {
+  e.target.disabled = true;
+  for (let i = 0; i < 10; i++) await callApi();
+  e.target.disabled = false;
+};
+
+$('pay').onclick = async (e) => {
+  e.target.disabled = true;
+  // In stub mode the transaction bytes are placeholders. With sui-grpc
+  // verification these must be a real BCS-serialized, wallet-signed transaction.
+  const payload = {
+    x402Version: 2,
+    scheme: 'exact',
+    network: 'sui:testnet',
+    payload: {
+      transactionBytes: 'AAAAplaceholder',
+      signatures: ['AAAAplaceholdersig'],
+      payer: PAYER,
+    },
+  };
+  await callApi({ 'payment-signature': btoa(JSON.stringify(payload)) });
+  e.target.disabled = false;
+};
+
+$('reset').onclick = () => {
+  session = null;
+  $('session').hidden = true;
+  $('session-hint').textContent = 'No session. Pay to get one.';
+  render();
+  log('—', 'session discarded locally (server-side session still exists until it expires)');
+};
+
+render();
+</script>
+</body>
+</html>

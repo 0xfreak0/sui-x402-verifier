@@ -36,6 +36,20 @@ static_resources:
                   virtual_hosts:
                     - name: sui_testnet
                       domains: ["*"]
+                      # Browsers can only read response headers that are
+                      # explicitly exposed. Without expose_headers, JS sees the
+                      # 402 status but NOT the challenge, the session token, or
+                      # the receipt — which makes the whole flow unusable from a
+                      # web page.
+                      typed_per_filter_config:
+                        envoy.filters.http.cors:
+                          "@type": type.googleapis.com/envoy.extensions.filters.http.cors.v3.CorsPolicy
+                          allow_origin_string_match:
+                            - safe_regex: { regex: ".*" }
+                          allow_methods: "GET, POST, OPTIONS"
+                          allow_headers: "content-type, payment-signature, x-payment-session"
+                          expose_headers: "payment-required, payment-response, x-payment-session"
+                          max_age: "86400"
                       routes:
                         # gRPC method paths are /<package>.<Service>/<Method>,
                         # so these prefixes cleanly separate them from GraphQL.
@@ -100,9 +114,19 @@ static_resources:
                           #           skip_if_absent: true
 
                 http_filters:
-                  # ORDERING IS LOAD-BEARING: ext_authz must run before the
-                  # router (and before any ratelimit filter) so the headers it
-                  # injects exist by the time descriptors are built.
+                  # ORDERING IS LOAD-BEARING, twice over:
+                  #
+                  # 1. cors BEFORE ext_authz. The CORS filter answers preflight
+                  #    OPTIONS itself and short-circuits the chain. If ext_authz
+                  #    ran first, the preflight would be metered and 402'd, and
+                  #    the browser would never send the real request at all.
+                  # 2. ext_authz BEFORE router (and before any ratelimit filter)
+                  #    so the headers it injects exist by the time descriptors
+                  #    are built.
+                  - name: envoy.filters.http.cors
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.cors.v3.Cors
+
                   - name: envoy.filters.http.ext_authz
                     typed_config:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthz

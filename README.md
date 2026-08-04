@@ -61,6 +61,32 @@ content-type: application/json
 Base64-decode that header to get the terms: `payTo`, `maxAmountRequired`,
 `asset`, `network`, `maxTimeoutSeconds`.
 
+## Browser demo
+
+`demo/index.html` is a dependency-free page that drives the whole flow: call the
+API until the free tier is spent, watch the decoded challenge appear, pay, and
+watch calls resume on a session.
+
+```bash
+scripts/run-local.sh                       # terminal 1
+python3 -m http.server 8080 -d demo        # terminal 2 → open localhost:8080
+```
+
+x402 is browser-native — it is ordinary HTTP — but two things must be right or a
+web page cannot use it at all:
+
+- **`Access-Control-Expose-Headers`.** Browsers hide response headers from JS by
+  default, so without this the page sees the `402` status but *not* the terms,
+  the session token, or the receipt. `envoy.yaml` exposes all three.
+- **The CORS filter must run before `ext_authz`.** Otherwise the preflight
+  `OPTIONS` is itself metered and answered with `402`, and the browser never
+  sends the real request.
+
+What a browser *cannot* do alone is sign a Sui transaction. That needs a wallet
+(`@mysten/dapp-kit` with Slush/Sui Wallet, or zkLogin) — but it is not a proxy
+concern: the verifier only reads a header and does not care how the signature was
+produced. In `stub-accept-all` mode no wallet is needed at all.
+
 ## Configuration
 
 See `config.example.yaml`. Two values should never be committed and can be
@@ -164,10 +190,18 @@ Things that were not true of the original design and cost real debugging time:
   | confirm the tx would land | `TransactionExecutionService.SimulateTransaction` |
   | settle | `TransactionExecutionService.ExecuteTransaction` |
 
-- **x402 is an HTTP protocol; the fullnode is gRPC.** A 402 is a clean response to
-  an HTTP client. gRPC clients collapse a non-200 HTTP status into an opaque
-  transport error — the challenge JSON survives inside the error string, but it is
-  not ergonomic. GraphQL is the better surface for exercising the payment flow.
+- **gRPC needs its own error framing.** gRPC clients collapse any non-200 HTTP
+  status into an opaque transport error, so a raw `402` arrived as
+  `code = Unknown` with the terms buried in a string. Denials for gRPC requests
+  are therefore sent as a trailers-only response — HTTP 200 carrying
+  `grpc-status: 8` (RESOURCE_EXHAUSTED) — which clients surface properly as
+  `code = ResourceExhausted`, with the challenge still readable as metadata.
+
+- **Streaming RPCs are effectively unmetered.** `ext_authz` fires once per
+  *stream*, at headers time, never per message. A 20-second
+  `SubscribeCheckpoints` stream delivering 53 messages consumed 2 authz checks
+  total; a stream held open for hours costs 1. Paid streaming needs duration or
+  message caps, not per-request counting. Not yet implemented.
 
 - **gRPC reflection consumes free-tier quota.** `grpcurl` resolves method
   descriptors via `grpc.reflection.v1.*` before the real call, and that callout is
