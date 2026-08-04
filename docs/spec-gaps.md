@@ -32,26 +32,46 @@ than being vague. See `FacilitatorError::code` in `src/x402.rs`.
 
 **Upstream ask:** define Sui equivalents, or make the EVM-named ones generic.
 
-## 2. No way to enforce `maxTimeoutSeconds` on Sui
+## 2. `maxTimeoutSeconds` cannot be enforced on-chain on Sui at second granularity
 
-`PaymentRequirements.maxTimeoutSeconds` is required, and on EVM it is enforceable
-because EIP-3009 authorizations carry `validAfter`/`validBefore` — the *chain*
-rejects a stale authorization.
+> **Corrected twice while investigating.** First claim: "Sui transactions cannot
+> expire" — wrong, they can. Second claim: "so `VALID_DURING` makes this fully
+> enforceable" — also wrong. The accurate position is below, verified against
+> `sui-sdk-types` 0.3 and testnet `sui-node/1.77.0`. Recorded because the
+> difference decides whether enforcement can be delegated to the chain or has to
+> be done by the facilitator.
 
-Sui `TransactionData` has no expiry field. A signed transaction stays valid until
-its input objects are consumed, so a payment authorization signed once is
-replayable indefinitely as far as the client's signature is concerned. The Sui
-scheme document does not say how a facilitator should enforce the window.
+Sui `TransactionData` **does** carry a `TransactionExpiration`:
 
-**Consequence:** `maxTimeoutSeconds` is currently advertised and unenforceable
-on-chain. Any enforcement is facilitator-side bookkeeping — recording first-seen
-time per transaction digest and refusing the payload afterwards — which is
-strictly weaker than the EVM guarantee: it binds only this facilitator, and a
-second facilitator, or a restarted one with no shared state, would accept the
-same authorization again.
+| Variant | Granularity | Status |
+|---|---|---|
+| `None` | never expires | the default |
+| `Epoch(e)` | one epoch, roughly 24h | works today |
+| `ValidDuring { min_epoch, max_epoch, … }` | one epoch — the epochs "must equal current epoch" | works today |
+| `ValidDuring { min_timestamp, max_timestamp, … }` | sub-epoch, seconds | **documented "not yet implemented"** |
 
-**Upstream ask:** state the expected enforcement mechanism, and say plainly that
-it is off-chain on Sui so implementers do not assume EVM-equivalent safety.
+So the finest expiry the chain will enforce today is **one epoch**. A typical
+`maxTimeoutSeconds` of 60 cannot be expressed: the nearest on-chain bound is
+roughly a day. `ValidDuring` is also tied to gas payment from *address balances*,
+which the scheme's own Appendix lists as in-development, so it is not available
+to the coin-object flow the scheme currently specifies.
+
+EVM gets this for free and at second granularity from EIP-3009's
+`validAfter` / `validBefore`, and §9 has dedicated error codes for both. Sui has
+no equivalent yet.
+
+**What this project does:** enforce the window facilitator-side, recording
+first-seen time against the transaction digest in the replay cache. This is
+weaker than the EVM guarantee in ways worth being explicit about:
+
+- it binds only the facilitator that saw the payment first;
+- it does not survive a restart unless the cache is persistent (ours is, on Redis);
+- it is enforcement by policy, not by consensus — a compromised facilitator can
+  simply ignore it.
+
+**Upstream ask:** state in `scheme_exact_sui.md` that `maxTimeoutSeconds` is
+enforced off-chain on Sui and why, so implementers do not assume EVM-equivalent
+safety from an identically-named field; and revisit once sub-epoch timing ships.
 
 ## 3. Sequencing assumes the resource server can settle *after* doing the work
 

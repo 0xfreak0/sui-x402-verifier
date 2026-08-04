@@ -1,61 +1,62 @@
-# Draft issue: `maxTimeoutSeconds` is unenforceable on Sui
+# Draft issue: the Sui `exact` scheme never says how `maxTimeoutSeconds` is enforced
 
 **Repo:** coinbase/x402
 **Against:** `specs/x402-specification-v2.md` §5.1.2, `specs/schemes/exact/scheme_exact_sui.md`
 **Status:** draft — not yet filed
 
+> **Corrected 2026-08-04.** An earlier draft claimed Sui transactions cannot
+> expire (wrong — they can), then that `VALID_DURING` timestamps make the field
+> fully enforceable (also wrong — those are documented "not yet implemented").
+> The accurate position is below, verified against `sui-sdk-types` 0.3 and
+> testnet `sui-node/1.77.0`.
+
 ---
 
 ### Summary
 
-`PaymentRequirements.maxTimeoutSeconds` is a required field, but the Sui `exact`
-scheme provides no mechanism to enforce it. A signed Sui payment authorization
-has no expiry, so it stays valid indefinitely.
+`PaymentRequirements.maxTimeoutSeconds` is required, but on Sui the chain cannot
+enforce a window at second granularity today. The finest available expiry is one
+epoch (~24h). The scheme does not say this, so implementers reasonably assume the
+field carries the same weight it does on EVM, where EIP-3009 enforces it to the
+second.
 
 ### Detail
 
-On EVM the field is enforceable *by the chain*: an EIP-3009 authorization
-carries `validAfter` / `validBefore`, and `transferWithAuthorization` reverts
-outside that window. §9 has dedicated codes for both violations. The guarantee
-does not depend on any facilitator behaving well.
+Sui's `TransactionExpiration` supports:
 
-Sui `TransactionData` has no equivalent. It carries a sender, gas data, and
-input object references — no timestamp, no epoch bound, no expiry. A transaction
-signed once remains submittable until its input objects are consumed. So:
+| Variant | Granularity | Status |
+|---|---|---|
+| `None` | never expires | the default |
+| `Epoch(e)` | one epoch, ~24h | works today |
+| `ValidDuring { min_epoch, max_epoch, … }` | one epoch — epochs "must equal current epoch" | works today |
+| `ValidDuring { min_timestamp, max_timestamp, … }` | seconds | **"not yet implemented"** per `sui-sdk-types` |
 
-- A client that signs a payment and never sends it holds an authorization that
-  stays good indefinitely.
-- `maxTimeoutSeconds` is advertised to the client as though it constrains
-  something, and does not.
+Two consequences:
 
-`scheme_exact_sui.md` does not mention the field at all — neither how to enforce
-it nor that it cannot be enforced.
+1. A `maxTimeoutSeconds` of 60 has no on-chain expression. The nearest bound the
+   validators will enforce is roughly a day.
+2. `ValidDuring` is additionally tied to gas payment from *address balances*,
+   which this scheme's own Appendix lists as in-development — so it is not
+   available to the coin-object flow the scheme currently specifies.
 
-### What an implementer is left to do
+The scheme is also silent on whether a client should set an expiration at all,
+so a conformant client may send `None` and hold an authorization valid forever,
+and two facilitators will disagree about whether to accept it.
 
-Facilitator-side bookkeeping: record first-seen time keyed on transaction
-digest, and refuse the payload once the window elapses. That is strictly weaker
-than the EVM guarantee in ways worth stating in the spec:
+### What we do meanwhile
 
-- It binds only the facilitator that saw the payment first. A second facilitator
-  accepting the same requirements has no shared state and will accept it.
-- It does not survive a facilitator restart unless the cache is persistent.
-- It is enforcement by policy, not by the chain — a misbehaving or compromised
-  facilitator can simply ignore it.
-
-Note the object-version pinning that makes Sui transactions non-replayable
-*on-chain* only binds once settlement lands. Before that, nothing stops N
-concurrent submissions of the same authorization from being accepted by N
-resource servers.
+Enforce the window facilitator-side: record first-seen time against the
+transaction digest in a replay cache, and refuse the payload once
+`maxTimeoutSeconds` has elapsed. This is policy, not consensus — it binds only
+the facilitator that saw the payment first, and a compromised one can ignore it.
 
 ### Suggested resolution
 
-1. State in `scheme_exact_sui.md` that `maxTimeoutSeconds` is enforced off-chain
-   on Sui, and specify the expected mechanism (digest + first-seen cache) so
-   implementations agree; **and**
-2. Note the weaker guarantee explicitly, so implementers do not assume
-   EVM-equivalent safety from an identically-named field.
+Short term, state in `scheme_exact_sui.md` that `maxTimeoutSeconds` is enforced
+**off-chain** on Sui, and say why, so implementers do not assume the
+EVM-equivalent guarantee from an identically-named field.
 
-Longer term, the "Address Balances" work referenced in the scheme's Appendix is
-described as potentially enabling EIP-3009-style authorizations on Sui, which
-would make the field enforceable on-chain. Worth linking the two.
+Longer term, once `ValidDuring`'s sub-epoch timestamps are implemented, specify
+that clients must set them within the advertised window and that facilitators
+must reject payments that do not — at which point Sui gains the same property
+EIP-3009 gives EVM.
