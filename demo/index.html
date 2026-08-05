@@ -132,15 +132,6 @@
   a{color:var(--settled)}
   a:hover{color:var(--paper)}
 
-  /* ── what broke ── */
-  .broke{display:grid;gap:1rem}
-  .b{border-left:2px solid var(--declined);padding-left:.9rem}
-  .bk{font-family:var(--mono);font-size:12px;color:var(--declined);
-    letter-spacing:.04em;margin-bottom:.3rem}
-  .bv{color:var(--faint);font-size:13.5px;max-width:64ch}
-  .bv code{color:var(--paper)}
-  .bv em{color:var(--paper);font-style:normal}
-
   /* ── trace ── */
   .trace{font-family:var(--mono);font-size:11.5px;display:grid;gap:.3rem}
   .trace:empty::after{content:"send a request to record one";color:var(--faint)}
@@ -316,48 +307,6 @@ cargo run --bin x402-pay -- https://x402.suisonar.dev/graphql \
   curl -s -o /dev/null -w '%{http_code} ' -X POST https://x402.suisonar.dev/graphql \
     -H 'content-type: application/json' -d '{"query":"{ chainIdentifier }"}'
 done      # 200 200 200 200 200 402</pre>
-  </section>
-
-  <section>
-    <h2>What broke</h2>
-    <p class="hint">Four things went wrong while building this, and one of them turned out to
-      be my own mistake. Every number below came off a real transaction on testnet. The
-      <a href="https://github.com/0xfreak0/sui-x402-verifier#what-broke" target="_blank" rel="noopener">README</a>
-      has seven, including the ones that need more room than this.</p>
-    <div class="broke">
-      <div class="b">
-        <div class="bk">Verification passes on already-spent coins</div>
-        <div class="bv">Sui's <code>SimulateTransaction</code> returns success for a transaction
-          whose input coins were already spent. Verify by simulating alone — the obvious
-          implementation — and a dead authorization verifies, gets served, and fails only at
-          settlement. Free service, no race required. Fixed here by re-reading every pinned
-          input; simulation will not do it for you.</div>
-      </div>
-      <div class="b">
-        <div class="bk">Gas stopped being the constraint. A 0.01 USDC floor took its place</div>
-        <div class="bv">This used to say gas made per-request payment incoherent — 0.0023 SUI
-          per settlement against a 0.00001 USDC price. Sui's gasless stablecoin transfers made
-          that wrong. Payments here now settle at <code>computation 0, storage 0</code> and the
-          payer holds no SUI at all. What actually binds is a <strong>0.01 USDC minimum</strong>
-          on the gasless path, so a request cannot cost less than a cent. Sessions are still
-          load-bearing, for that reason instead: one payment at the floor covering 1000 requests
-          is $0.00001 each. And a session is prepaid credits, which beats an API key only when
-          opening an <em>account</em> is the friction.</div>
-      </div>
-      <div class="b">
-        <div class="bk">Settlement is most of the latency</div>
-        <div class="bv">~759ms of a ~1.3s paid request is broadcasting to the chain. The trace
-          above breaks it down per service; nothing there is guessed.</div>
-      </div>
-      <div class="b">
-        <div class="bk">The spec's ordering is impossible pre-upstream</div>
-        <div class="bv">verify → serve → settle cannot be done by <code>ext_authz</code>, which
-          never sees the response. It needs <code>ext_proc</code>'s bidirectional stream. On the
-          old coin-object path the payer could still spend the pinned coins after being served,
-          which made it a race against finality. Gasless payments pin nothing, so there is no
-          longer a coin to spend or an authorization to invalidate.</div>
-      </div>
-    </div>
   </section>
 
   <section>

@@ -266,7 +266,9 @@ request.
   cheap route cannot unlock an expensive one.
 - **A gRPC transport binding.** The spec defines HTTP, MCP and A2A transports and
   nothing for gRPC. Denials are framed as trailers-only responses carrying
-  `grpc-status: 8`; see the README for the four decisions that required.
+  `grpc-status: 8` (`RESOURCE_EXHAUSTED`, what gRPC maps 429 to), because a
+  plain 402 reaches a gRPC client as an opaque `code = Unknown`. x402's headers
+  are base64 JSON and so survive as gRPC metadata unchanged.
 
 ## Summary
 

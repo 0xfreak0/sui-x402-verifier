@@ -4,7 +4,7 @@ Sell API access for stablecoin, at the gateway, without accounts or API keys.
 
 > **This is an experiment.** I built it to find out what putting x402 in front of
 > real infrastructure actually costs. The most useful thing it produced is the
-> list of things that broke — see [What broke](#what-broke).
+> list of things that broke.
 >
 > Unmaintained, unaudited, testnet only. Do not run it in production. No support,
 > no roadmap. It is public so the findings and the code can be read together.
@@ -205,7 +205,7 @@ everything is derived at runtime.
 | Your address | `sui client active-address` |
 
 **USDC is the only one you actually need.** Payments at or above 0.01 USDC take
-the gasless path and cost no SUI at all — see [What broke](#what-broke). SUI is
+the gasless path and cost no SUI at all. SUI is
 required only for sub-cent prices, which fall back to coin objects, and for the
 one-off transaction that moves USDC into your address balance:
 
@@ -469,149 +469,6 @@ The last two are the ones worth alerting on. Everything else is throughput.
   tier is an unmetered one.
 - **IPv6 is metered per /64**, since a host delegated a /64 can otherwise iterate
   addresses for an unlimited free tier.
-
-## What broke
-
-Seven things, roughly in order of how surprising they should be to someone who
-already works on Sui. The first two are worth your time. The rest are things you
-probably suspected, now with numbers attached.
-
-### Verification passes on already-spent coins
-
-`SimulateTransaction` returns **success** for a transaction whose input coins
-have already been spent. Simulation checks that the transaction *would* execute
-against current state in the abstract; it does not enforce that the client's
-pinned `(id, version, digest)` inputs are still live.
-
-So the obvious facilitator — verify by simulating, as the scheme's step 3 reads
-— will verify a dead authorization. Measured on testnet, before the fix:
-
-1. Sign a payment pinning USDC coin `0x3a4d…`. `/verify` → `isValid: true`
-2. Spend that coin in an unrelated transaction. Success
-3. `/verify` again → **still `isValid: true`**
-4. `/settle` → `Client specified an invalid argument`
-
-That is free service with **no race required**: spend the coin first, present
-the dead authorization, be verified, be served, and let settlement fail. Any
-implementation that trusts simulation alone has this.
-
-The fix is to read every pinned owned and receiving input plus the gas objects
-and confirm each still exists at its pinned version, treating `NotFound` as
-spent rather than as an RPC failure. Shared inputs are skipped — consensus
-versions those at execution, so the client never pinned them.
-`sui::assert_inputs_are_live`. Re-measured after: step 3 returns `isValid:
-false`.
-
-### The spec's own ordering is impossible in a pre-upstream filter
-
-`scheme_exact_sui.md` sequences **verify → the resource server does the work →
-settle**, so a client is only charged once the resource exists. `ext_authz`
-cannot do this. It runs on the request path, never sees the response, and must
-answer allow/deny before Envoy proxies anything — settling there charges a
-client whose request then 500s.
-
-`ext_proc` can, because Envoy opens one bidirectional stream per request: verify
-on the way in, hold the verified-but-unsettled payment as stream-local state,
-settle on the way out and only on a 2xx. Which filter you pick decides this, and
-you will not discover it until you try to be conformant.
-
-There was a residual exposure here, and the gasless path removed most of it.
-On the coin-object path the payer could spend the pinned coins between verify
-and settle and kill the authorization — bounded by upstream latency (~70ms
-observed) against finality (~400ms), so a losing race, and only that because
-verification rejects dead authorizations. A gasless payment pins nothing, so
-there is no coin to spend and nothing to invalidate. The exposure survives only
-on the sub-cent fallback. `x402_settlement_after_serve_failures_total` counts it
-either way, since settlement can still fail for reasons that have nothing to do
-with the payer.
-
-### There is no gRPC transport binding
-
-The spec defines an HTTP transport and, more recently, MCP and A2A. There is
-nothing for gRPC, and a public search finds no x402 implementation that gates it
-at all. Two problems have to be solved to make it work:
-
-- gRPC clients collapse any non-200 into an opaque transport error, so a plain
-  402 arrives as `code = Unknown`. Denials are framed as a **trailers-only
-  response**: HTTP 200 carrying `grpc-status: 8` (`RESOURCE_EXHAUSTED`, what
-  gRPC maps 429 to) plus the challenge header.
-- gRPC metadata must be ASCII unless `-bin` suffixed. x402's headers are already
-  base64 JSON, so they survive unchanged — convenient rather than designed.
-
-### `maxTimeoutSeconds` has no on-chain expression
-
-Sui's finest transaction expiry is one epoch (~24h), so a 60-second window is
-enforced off-chain by the facilitator and nothing stops a third party
-broadcasting the authorization later. `TransactionExpiration::ValidDuring`
-timestamps would fix it and are documented as not yet implemented.
-
-### Gas stopped being the constraint. A 0.01 USDC floor took its place
-
-**Corrected.** This section previously claimed gas made per-request payment
-economically incoherent — ~0.0023 SUI per settlement against a 0.00001 USDC
-price. That was true of the coin-object path and is no longer the constraint.
-
-Sui's gasless stablecoin transfers execute at **`computation_cost: 0,
-storage_cost: 0`**. Measured on testnet through this gateway, digest
-`HNSWvtuWPidbRFCpDQU8AfVf1Nce5dQP3Zo6SsxLeRAV`: a complete x402 exchange in
-which the payer spent no SUI whatsoever and needs to hold none.
-
-The real constraint is a **minimum transfer of 0.01 USDC** — below it the
-gasless path simply does not execute, and the payment falls back to coin objects
-and SUI gas. So per-request pricing cannot go below a cent.
-
-Sessions remain load-bearing, for that reason rather than for gas: one payment
-at the floor buying 1000 requests is an effective $0.00001 each, with no gas and
-no native token required of the payer. That is a working micropayment model,
-which is the opposite of what this section used to say.
-
-Which leads to the uncomfortable part: **a session is prepaid credits.** It only
-beats an API key where establishing an *account* is the friction rather than the
-payment — an agent that cannot complete a signup flow, hold a card, or agree to
-terms. That is a real niche and an unproven one, and it is the honest answer to
-"why not just use Stripe."
-
-### Duration billing has no way to notice you left
-
-A session is keyed on a random id inside an HMAC token — not on IP, connection,
-or TLS session. That is deliberate: binding it to an address would punish a
-phone for moving between wifi and cellular. So a client that drops and
-reconnects presents the same token and finds its quota and expiry intact, and
-Redis carries that across a redeploy.
-
-The gap is on the streaming side, and it only exists for duration billing.
-
-`ext_proc` is headers-only, so the gateway authorizes a stream when it opens and
-**never observes it again**. Neither the messages nor the end of it. A client that
-disconnects thirty seconds into an hour-long window has burned the remaining
-fifty-nine minutes, and nothing in the system can tell. There is no refund, no
-pause, and no detection. Seeing the disconnect would mean
-`response_body_mode: STREAMED`, paying latency and memory on every chunk to act
-as a clock, which costs more than the problem is worth.
-
-Request-count billing does not have this problem: quota decrements per request,
-so a reconnect costs exactly one request and everything already delivered stays
-delivered. Both limits exist on every session and the first to run out wins, so
-"count only" is simply a large `duration_secs` and vice versa.
-
-The practical answer is to **sell short windows and let clients renew** rather
-than selling an hour up front. The upstream's own ~30s stream cap already forces
-reconnects, so a 30-second window costs a disconnected client at most 30 seconds
-and reuses machinery that has to exist anyway. Selling a long window looks
-generous and is strictly worse for the buyer.
-
-One asymmetry worth knowing before advertising a count-based product: the
-`grpc-timeout` the gateway injects comes from the session's *remaining seconds*,
-and the route's `grpc_timeout_header_max` clamps it. So a session sold as "1000
-requests over a day" still cannot hold a stream open past the route ceiling.
-Count-based sessions do not degrade gracefully into streams.
-
-### Settlement is most of the latency
-
-~759ms of a ~1.3s paid request is broadcasting to the chain; verification is
-~253ms of it and the upstream call ~72ms. The trace on the demo page reports
-this per service from `Server-Timing` and `x-envoy-upstream-service-time` rather
-than estimating it.
 
 ## Limitations
 
