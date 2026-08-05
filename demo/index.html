@@ -295,6 +295,29 @@
   </div>
 
   <section>
+    <h2>Trace</h2>
+    <p class="hint">Every bar is a real measurement, reported by whoever did the work:
+      this page times itself, the verifier reports its decide/settle split via
+      <code>Server-Timing</code>, and Envoy reports the upstream call via
+      <code>x-envoy-upstream-service-time</code>. Nothing here is estimated.</p>
+    <div id="trace" class="trace"></div>
+  </section>
+  <section>
+    <h2>Tape</h2>
+    <div class="tape" id="tape"></div>
+  </section>
+  <section>
+    <h2>The wire</h2>
+    <p class="hint">The last exchange, decoded from the actual headers. Nothing here is
+      reconstructed for display.</p>
+    <p class="cap">402 · payment-required</p>
+    <pre id="w-challenge">—</pre>
+    <p class="cap">payment-signature</p>
+    <pre id="w-payment">—</pre>
+    <p class="cap">payment-response · receipt</p>
+    <pre id="w-receipt">—</pre>
+  </section>
+  <section>
     <h2>Point a real client at it</h2>
     <p class="hint">Nothing above requires this page. The gate is the public endpoint, so
       any x402 client can hit it. This one signs with your wallet instead of the demo's.</p>
@@ -320,31 +343,8 @@ done      # 200 200 200 200 200 402</pre>
     <div class="wallets" id="wallets"></div>
   </section>
 
-  <section>
-    <h2>Tape</h2>
-    <div class="tape" id="tape"></div>
-  </section>
 
-  <section>
-    <h2>Trace</h2>
-    <p class="hint">Every bar is a real measurement, reported by whoever did the work:
-      this page times itself, the verifier reports its decide/settle split via
-      <code>Server-Timing</code>, and Envoy reports the upstream call via
-      <code>x-envoy-upstream-service-time</code>. Nothing here is estimated.</p>
-    <div id="trace" class="trace"></div>
-  </section>
 
-  <section>
-    <h2>The wire</h2>
-    <p class="hint">The last exchange, decoded from the actual headers. Nothing here is
-      reconstructed for display.</p>
-    <p class="cap">402 · payment-required</p>
-    <pre id="w-challenge">—</pre>
-    <p class="cap">payment-signature</p>
-    <pre id="w-payment">—</pre>
-    <p class="cap">payment-response · receipt</p>
-    <pre id="w-receipt">—</pre>
-  </section>
 
   <section>
     <h2>Gateway</h2>
