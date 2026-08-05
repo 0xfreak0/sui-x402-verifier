@@ -833,7 +833,7 @@ async function metrics(){
 // and you land on it every single time.
 const SEGS = [
   {label:'BAD LUCK',w:9},{label:'RUGGED',w:9},{label:'REORG',w:9},{label:'GAS SPIKE',w:9},
-  {label:'SLASHED',w:9},{label:'SUI $20',w:0.5,win:true},{label:'HACKED',w:9},{label:'TAXED',w:9},
+  {label:'SLASHED',w:9},{label:'SUI $20',w:9,win:true},{label:'HACKED',w:9},{label:'TAXED',w:9},
   {label:'SEC CALLS',w:9},{label:'FORKED',w:9},{label:'DELISTED',w:9},{label:'SEED LEAK',w:9},
   {label:'LIQUIDATED',w:9},
 ];
@@ -854,17 +854,16 @@ const TOTAL_W = SEGS.reduce((a,s) => a + s.w, 0);
              stroke-width="${seg.win ? '.9' : '.4'}"/>`;
     // Radial labels: a chord long enough for "LIQUIDATED" does not exist at
     // this radius, so the text runs outward instead of across.
-    // The winning slice is half a percent of the wheel, so a label sized for
-    // the losers is unreadable on it. Give it its own size and push it out to
-    // the rim where there is room.
-    out += `<g transform="translate(50,50) rotate(${seg._mid - 90})">
-      <text x="${seg.win ? 12 : 15}" y="0" font-family="ui-monospace,monospace"
-        font-size="${seg.win ? 6 : 3.4}"
-        font-weight="${seg.win ? '700' : '600'}"
+    // Radial text on the lower half of the wheel comes out upside down, so
+    // flip those labels and mirror their x. Every label then reads left to
+    // right wherever its slice happens to sit.
+    const flip = seg._mid > 180;
+    out += `<g transform="translate(50,50) rotate(${seg._mid - 90})${flip ? ' rotate(180)' : ''}">
+      <text x="${flip ? -15 : 15}" y="0" font-family="ui-monospace,monospace"
+        font-size="${seg.win ? 4 : 3.4}" font-weight="${seg.win ? '700' : '600'}"
         fill="${seg.win ? '#231704' : '#9fc0cc'}"
-        stroke="${seg.win ? '#fff3d6' : 'none'}" stroke-width="${seg.win ? '.35' : '0'}"
-        paint-order="stroke"
-        text-anchor="start" dominant-baseline="central">${seg.label}</text></g>`;
+        text-anchor="${flip ? 'end' : 'start'}"
+        dominant-baseline="central">${seg.label}</text></g>`;
     angle = a1;
   });
   out += `<circle cx="50" cy="50" r="6" fill="#0b1418" stroke="#c9922f" stroke-width="1"/>`;
