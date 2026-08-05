@@ -1,9 +1,9 @@
 # Draft issue: the Sui `exact` scheme never says how `maxTimeoutSeconds` is enforced
 
-**Repo:** coinbase/x402
+**Repo:** x402-foundation/x402 (canonical since the spec moved to the foundation)
 **Against:** `specs/x402-specification-v2.md` §5.1.2, `specs/schemes/exact/scheme_exact_sui.md`
 **Status:** DO NOT FILE. This repo is an exploratory prototype; nothing here
-is to be opened against coinbase/x402 or any other external repo. Kept as
+is to be opened against x402-foundation/x402 or any other external repo. Kept as
 notes on where the spec is underspecified, for our own reference only.
 
 > **Corrected 2026-08-04.** An earlier draft claimed Sui transactions cannot

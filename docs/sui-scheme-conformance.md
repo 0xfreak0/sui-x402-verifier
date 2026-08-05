@@ -1,7 +1,7 @@
 # Conformance against `scheme_exact_sui.md`
 
 Checked line by line against the vendored spec
-(`spec/upstream/scheme_exact_sui.md`, `coinbase/x402` @ `dd927a26`) and the code
+(`spec/upstream/scheme_exact_sui.md`, `x402-foundation/x402`, canonical since the spec moved to the foundation) and the code
 as of the current commit. Every claim below is either backed by a named test or
 marked as unverified.
 

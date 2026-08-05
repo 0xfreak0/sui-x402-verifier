@@ -11,17 +11,25 @@ at runtime.
 | `scheme_exact.md` | `specs/schemes/exact/scheme_exact.md` |
 | `scheme_exact_sui.md` | `specs/schemes/exact/scheme_exact_sui.md` |
 
-- **Source:** https://github.com/coinbase/x402
-- **Commit:** `dd927a26cfefc98c24b3ec38b3a8f204dad0c60d` (`main` at time of vendoring)
-- **Vendored:** 2026-08-04
+- **Source:** https://github.com/x402-foundation/x402
+- **Commit:** `34cb6bd04c88f4333f56b9c778d3d35df997379c` (`main` at time of vendoring)
+- **Vendored:** 2026-08-05
+
+The spec now lives under the x402 Foundation. It was previously vendored from
+`coinbase/x402` @ `dd927a26`; `scheme_exact_sui.md` is byte-identical between
+the two, so the conformance work in `../../sui-scheme-conformance.md` carries
+over unchanged. The other three files gained content — new per-network rules
+(TON, Starknet) in `scheme_exact.md`, and a clarification in the HTTP transport
+that `PAYMENT-REQUIRED` is the canonical location for the `PaymentRequired`
+object — none of which alters anything this implementation relies on.
 
 ## Refreshing
 
 ```bash
-gh api repos/coinbase/x402/contents/specs/x402-specification-v2.md --jq '.content' | base64 -d > x402-specification-v2.md
-gh api repos/coinbase/x402/contents/specs/transports-v2/http.md      --jq '.content' | base64 -d > transport-http-v2.md
-gh api repos/coinbase/x402/contents/specs/schemes/exact/scheme_exact.md     --jq '.content' | base64 -d > scheme_exact.md
-gh api repos/coinbase/x402/contents/specs/schemes/exact/scheme_exact_sui.md --jq '.content' | base64 -d > scheme_exact_sui.md
+gh api repos/x402-foundation/x402/contents/specs/x402-specification-v2.md --jq '.content' | base64 -d > x402-specification-v2.md
+gh api repos/x402-foundation/x402/contents/specs/transports-v2/http.md      --jq '.content' | base64 -d > transport-http-v2.md
+gh api repos/x402-foundation/x402/contents/specs/schemes/exact/scheme_exact.md     --jq '.content' | base64 -d > scheme_exact.md
+gh api repos/x402-foundation/x402/contents/specs/schemes/exact/scheme_exact_sui.md --jq '.content' | base64 -d > scheme_exact_sui.md
 ```
 
 Update the commit SHA above when you do. The JSON examples in these files are

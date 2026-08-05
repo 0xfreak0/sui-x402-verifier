@@ -2,7 +2,7 @@
 
 Sell API access for stablecoin, at the gateway, without accounts or API keys.
 
-An [x402](https://github.com/coinbase/x402) payment gate written in Rust. It sits
+An [x402](https://github.com/x402-foundation/x402) payment gate written in Rust. It sits
 beside an Envoy proxy and decides, per request, whether the caller is on the free
 tier or has paid. Anonymous callers get a small rate-limited allowance; when they
 exhaust it they receive **HTTP 402 Payment Required** with machine-readable terms
@@ -70,15 +70,33 @@ Sui-specific.
 
 ## Why a gateway
 
-Every x402 reference implementation is **middleware you import into an app you
-control** — Express, Hono, Next.js, FastAPI. That means you can only monetize
-code you can modify and redeploy.
+Most x402 implementations are **middleware you import into an app you control**
+— Express, Hono, Next.js, FastAPI, Axum. That only monetizes code you can modify
+and redeploy.
 
-A gateway monetizes whatever sits behind it: services you do not own, cannot
-modify, or that are written in a language with no x402 SDK. `ext_authz` is a
-standard interface, so one implementation covers Envoy, Istio, Kong, APISIX and
-Gloo. At the time of writing, `coinbase/x402` contains no gateway implementation
-and none on its roadmap.
+Standalone x402 gateways and reverse proxies do exist, and several are further
+along than this one on features like dashboards and provider catalogues. What is
+different here is narrower, and worth stating precisely rather than claiming a
+category:
+
+- **This is a filter for a proxy you already run, not a new proxy.** `ext_authz`
+  and `ext_proc` are standard interfaces, so the same implementation works under
+  Envoy, Istio, Kong, APISIX and Gloo. For anyone already running one, the
+  difference is adding a filter config rather than adopting another hop.
+- **Settlement happens on the response path.** `ext_proc` gives a bidirectional
+  stream per request, so the payment is verified on the way in and broadcast
+  only after the upstream returns 2xx — the ordering the spec asks for. A
+  reverse proxy can buffer to achieve this too, but nothing else appears to.
+- **gRPC and grpc-web are gated, not just REST.** A public search finds no other
+  x402 implementation that handles gRPC at all, and there is no transport
+  binding for it in the spec — see `docs/` for how denials are framed as
+  trailers-only responses.
+- **Sui.** Upstream has a Sui *scheme document* but no Sui implementation, and a
+  public search finds no other one.
+
+None of that makes this a product. It is an exploratory prototype, and the most
+transferable thing to come out of it is the verification gap documented in
+`docs/sui-scheme-conformance.md`.
 
 ## Status
 
@@ -437,7 +455,7 @@ The last two are the ones worth alerting on. Everything else is throughput.
 ## Conformance
 
 Wire format follows x402 **v2**, vendored at `docs/spec/upstream/`
-(`coinbase/x402` @ `dd927a26`). The spec's own JSON examples are extracted into
+(`x402-foundation/x402`). The spec's own JSON examples are extracted into
 `tests/fixtures/` and round-tripped through the types, so a shape that drifts
 fails CI rather than failing silently against a real client.
 

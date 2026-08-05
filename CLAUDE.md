@@ -1,6 +1,6 @@
 # sui-x402-verifier
 
-An Envoy filter that puts the [x402](https://github.com/coinbase/x402) payment
+An Envoy filter that puts the [x402](https://github.com/x402-foundation/x402) payment
 protocol in front of arbitrary upstreams, settling on Sui. Anonymous callers get
 a metered free tier; a settled payment buys a session with its own quota and
 lifetime. Per-route policies price different upstreams differently and can
@@ -32,7 +32,7 @@ it — not to leave it in two places.
 ## Nothing goes upstream
 
 This is an exploratory prototype. Do not open issues or pull requests against
-`coinbase/x402` or any other external repository, and do not otherwise publish
+`x402-foundation/x402` or any other external repository, and do not otherwise publish
 on its behalf. The notes in `docs/upstream-issues/` record where the spec is
 underspecified for our own reference — they are not drafts awaiting submission,
 whatever their filenames suggest.
