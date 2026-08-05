@@ -287,6 +287,9 @@ The example config ships the **zero address**, and the service **refuses to
 start** with it — settling there would burn funds, so an unconfigured deployment
 fails loudly rather than paying into a hole.
 
+> Full setup reference, including the settings where a plausible mistake gives
+> away the paid tier and how to check each one: **[docs/configuring.md](docs/configuring.md)**.
+
 ### Pricing routes differently
 
 Envoy names a policy per route; this config says what that policy costs and where
