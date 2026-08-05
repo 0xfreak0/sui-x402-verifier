@@ -62,8 +62,9 @@ struct Args {
 
     /// Hard ceiling on paid requests for the lifetime of this process.
     ///
-    /// Gas is the binding constraint — roughly 0.00234 SUI per settlement, so
-    /// ~2 SUI is ~850 payments. A Slack link can burn that in an afternoon.
+    /// USDC is the binding constraint now that settlement is gasless. At the
+    /// 0.01 minimum, a 20 USDC wallet covers ~2000 payments. A public link can
+    /// burn that in an afternoon.
     #[arg(long, default_value_t = 500)]
     max_plays: u64,
 

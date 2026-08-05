@@ -119,7 +119,8 @@ funding section in the top-level README.
 **The demo holds a hot wallet.** It is the only component with custody of
 anything, it is demo scaffolding rather than part of the gateway, and
 `X402_MAX_PLAYS` / `X402_PLAYS_PER_IP` are the only thing between a public link
-and an empty wallet. Check them before posting the URL.
+and an empty wallet. Settlement is gasless, so USDC is what runs out: at the
+0.01 floor a 20 USDC wallet covers about 2000 payments. Check them before posting the URL.
 
 **Envoy's CA bundle.** `envoy.yaml` points at `/etc/ssl/cert.pem`, which is the
 macOS path; the Envoy image is Ubuntu-based and has no such file.

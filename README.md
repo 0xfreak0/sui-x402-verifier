@@ -515,12 +515,15 @@ on the way in, hold the verified-but-unsettled payment as stream-local state,
 settle on the way out and only on a 2xx. Which filter you pick decides this, and
 you will not discover it until you try to be conformant.
 
-The residual exposure is real and stated rather than solved: between verify and
-settle the payer can spend the pinned coins and kill the authorization. Bounded
-by upstream latency (~70ms observed) against finality (~400ms), so a losing race
-— but only because verification now rejects dead authorizations. Counted by
-`x402_settlement_after_serve_failures_total`, which exists precisely so this is
-visible when it happens.
+There was a residual exposure here, and the gasless path removed most of it.
+On the coin-object path the payer could spend the pinned coins between verify
+and settle and kill the authorization — bounded by upstream latency (~70ms
+observed) against finality (~400ms), so a losing race, and only that because
+verification rejects dead authorizations. A gasless payment pins nothing, so
+there is no coin to spend and nothing to invalidate. The exposure survives only
+on the sub-cent fallback. `x402_settlement_after_serve_failures_total` counts it
+either way, since settlement can still fail for reasons that have nothing to do
+with the payer.
 
 ### There is no gRPC transport binding
 

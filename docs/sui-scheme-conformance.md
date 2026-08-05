@@ -163,6 +163,11 @@ and the authorization becomes permanently unexecutable. Demonstrated above: the
 settle failed with `Client specified an invalid argument` after the payer moved
 the pinned coin.
 
+**This applies to the coin-object path only.** A gasless payment (0.01 USDC and
+above) withdraws from an address balance and pins no objects at all, so there is
+nothing for the payer to spend and no authorization to invalidate. Everything
+below describes the sub-cent fallback.
+
 So the ordering does not shift risk from the client to nobody — it shifts risk
 from the client **to the server**:
 
