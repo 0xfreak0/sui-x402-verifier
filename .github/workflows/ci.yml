@@ -1,0 +1,98 @@
+# The docs claim that spec drift "fails CI". This is what makes that true.
+#
+# The fixtures under tests/ are the x402 spec's own JSON examples, so a change
+# to a wire shape fails here rather than being discovered by a client that
+# cannot talk to this service.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # Weekly, because the interesting failure is not a code change. It is the
+  # vendored spec drifting out from under fixtures nobody touched.
+  schedule:
+    - cron: "0 9 * * 1"
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Pinned to match Dockerfile. sui-transaction-builder uses a library
+      # feature that was unstable before 1.94, and an older toolchain fails
+      # with E0658 deep inside a dependency rather than anywhere useful.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.94"
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features
+
+      - name: Test
+        run: cargo test --all-targets
+
+      # Redis-backed tests no-op without this, so they never run in the normal
+      # job. Running them here is the only place the shared-state Lua paths get
+      # exercised at all.
+      - name: Test against Redis
+        env:
+          X402_TEST_REDIS_URL: redis://127.0.0.1:6379
+        run: |
+          docker run -d -p 6379:6379 --name ci-redis redis:7-alpine
+          for _ in $(seq 30); do
+            docker exec ci-redis redis-cli ping >/dev/null 2>&1 && break
+            sleep 1
+          done
+          cargo test --all-targets
+          docker rm -f ci-redis
+
+  config:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Envoy and compose configs are not compiled, so nothing else would catch
+      # a syntax error in them until a deploy fails.
+      - name: Configs parse
+        run: |
+          python3 - <<'PY'
+          import sys, yaml
+          for f in ("envoy.yaml", "config.example.yaml", "config.demo.yaml",
+                    "deploy/config.prod.yaml", "deploy/docker-compose.yml",
+                    "deploy/istio-envoyfilter.yaml"):
+              try:
+                  list(yaml.safe_load_all(open(f)))
+                  print(f"ok    {f}")
+              except Exception as e:
+                  print(f"FAIL  {f}: {e}"); sys.exit(1)
+          PY
+
+      # A shipped config that still carries the published placeholder secret or
+      # a sub-cent price is caught by the unit tests; this catches the reverse,
+      # a config that has quietly acquired a real-looking wallet.
+      - name: No wallet addresses in tracked files
+        run: |
+          if git ls-files -z | xargs -0 grep -ohE "0x[0-9a-f]{64}" \
+             | grep -vE "^0x(0{64}|1{64}|2{64}|3{64}|4{64}|9{64})$" \
+             | grep -v "a1ec7fc00a6f40db9693ad1415d0c193ad3906494428cf252621037bd7117e29" \
+             | grep -v "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef" \
+             | grep -v "1eb7c57e3f2bd0fc6cb9dcffd143ea957e4d98f805c358733f76dee0667fe0b1" \
+             | grep -v "2d6a7588d6acca505cbf0d9a4a227e0c52c6c34008c8e8986a12832597641736" \
+             | grep -v "f3746613c2d920b5fdabc0856f2aeb2d4f88ee6037b8cc5d04a71a4462f13480" \
+             | grep -q .; then
+            echo "An unrecognised 64-hex address is committed. If it is a real"
+            echo "wallet it must come from the environment instead."
+            exit 1
+          fi
