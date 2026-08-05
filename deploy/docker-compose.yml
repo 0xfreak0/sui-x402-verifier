@@ -87,6 +87,7 @@ services:
       - /usr/local/bin/x402-demo
       - --listen=0.0.0.0:8402
       - --static-dir=/srv/demo
+      - --prize-video=/srv/media/rickroll.mp4
       - --gateway=http://127.0.0.1:10000
       - --metrics=http://127.0.0.1:9090
       - --facilitator-api=http://127.0.0.1:50052
@@ -96,6 +97,14 @@ services:
       # Mounted rather than baked in, so the page can be edited on the VM
       # without a rebuild.
       - ../demo:/srv/demo:ro
+      # The prize video is NOT in the repository — it is someone else's
+      # copyrighted work. Supply it on the host and point X402_MEDIA_DIR at the
+      # directory holding it. If it is empty the page falls back to a text card,
+      # which is a fine way for a fresh deployment to behave.
+      #
+      # Must be an ABSOLUTE path: compose does not expand `~`, and a relative
+      # one resolves against deploy/ rather than the home directory.
+      - ${X402_MEDIA_DIR:-./media}:/srv/media:ro
     environment:
       X402_SUI_PRIVATE_KEY: "${X402_SUI_PRIVATE_KEY:?the demo wallet key, suiprivkey1...}"
       RUST_LOG: "${RUST_LOG:-x402_demo=info}"

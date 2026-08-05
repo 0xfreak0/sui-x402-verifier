@@ -76,6 +76,15 @@ struct Args {
     #[arg(long, default_value = "demo")]
     static_dir: String,
 
+    /// The prize video, served at `/rickroll.mp4`.
+    ///
+    /// Kept out of the repository — it is someone else's copyrighted work — so
+    /// it has to be supplied separately, and defaults to a path inside
+    /// `static_dir` that will usually be absent. The page degrades to a text
+    /// card when it is missing, so a fresh clone still runs.
+    #[arg(long)]
+    prize_video: Option<String>,
+
     /// Gateway origin every target is requested through.
     ///
     /// Serving the page and proxying from one origin means the browser sees a
@@ -899,7 +908,10 @@ async fn index(State(state): State<AppState>) -> impl IntoResponse {
 /// Serve the prize. Local rather than an embed: no third-party dependency, no
 /// CSP to negotiate, and it still works if the VM has no outbound internet.
 async fn prize(State(state): State<AppState>) -> impl IntoResponse {
-    let path = std::path::Path::new(&state.args.static_dir).join("rickroll.mp4");
+    let path = match &state.args.prize_video {
+        Some(explicit) => std::path::PathBuf::from(explicit),
+        None => std::path::Path::new(&state.args.static_dir).join("rickroll.mp4"),
+    };
     match tokio::fs::read(&path).await {
         Ok(bytes) => (
             [
