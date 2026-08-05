@@ -49,6 +49,23 @@ const SUI_ADDRESS_HEX_LEN: usize = 64;
 const PLACEHOLDER_HMAC_SECRET: &str =
     "abababababababababababababababababababababababababababababababab";
 
+/// Smallest transfer Sui's gasless stablecoin path will execute, in base units
+/// of a 6-decimal stablecoin: 0.01.
+///
+/// Below this the transfer is simply not executed, so a price set under it
+/// forces the old coin-object path — the payer needs SUI for gas, an object is
+/// created and pinned, and the authorization becomes spendable out from under
+/// itself. All of which is avoidable by charging at least a cent.
+///
+/// This is why sessions matter here. Per-request pricing cannot go below a cent
+/// at all; one payment buying a thousand requests brings the effective price to
+/// $0.00001 while staying above the floor.
+pub const GASLESS_MINIMUM_BASE_UNITS: u128 = 10_000;
+
+/// Decimals assumed when reporting a price against the gasless floor. Only used
+/// for the startup warning, never for anything on the wire.
+const STABLECOIN_DECIMALS: u32 = 6;
+
 /// Minimum accepted HMAC key length in bytes. 32 bytes matches the SHA-256
 /// block security level; shorter keys are rejected outright rather than
 /// silently weakening session-token forgery resistance.
@@ -428,6 +445,8 @@ impl Config {
         self.free_tier.validate("free_tier")?;
         self.paid_tier.validate("paid_tier")?;
 
+        self.warn_if_below_the_gasless_floor();
+
         // Validate overrides with the same rules as the defaults, so a typo in
         // a wallet or price fails at boot rather than at payment time.
         for (name, policy) in &self.policies {
@@ -450,6 +469,44 @@ impl Config {
         // paying request.
         self.hmac_key()?;
         Ok(())
+    }
+
+    /// Warn about prices too small for Sui's gasless stablecoin transfers.
+    ///
+    /// A warning rather than an error: a sub-cent price is a legitimate choice
+    /// if the operator is content for payers to hold SUI and pay gas. It should
+    /// just never be an accident, because the difference is invisible in the
+    /// config and expensive at runtime.
+    fn warn_if_below_the_gasless_floor(&self) {
+        let scale = 10u128.pow(STABLECOIN_DECIMALS) as f64;
+        for (name, amount) in self.priced_policies() {
+            let Ok(value) = amount.parse::<u128>() else {
+                continue;
+            };
+            if value > 0 && value < GASLESS_MINIMUM_BASE_UNITS {
+                tracing::warn!(
+                    policy = %name,
+                    amount = %amount,
+                    price = format!("{:.6}", value as f64 / scale),
+                    floor = format!("{:.2}", GASLESS_MINIMUM_BASE_UNITS as f64 / scale),
+                    "price is below the gasless stablecoin minimum; payers will need SUI \
+                     for gas and the payment will pin a coin object. Charge at least the \
+                     floor and sell a session to keep the effective per-request price low."
+                );
+            }
+        }
+    }
+
+    /// Every policy's effective price, including the default terms.
+    fn priced_policies(&self) -> Vec<(String, &str)> {
+        std::iter::once((DEFAULT_POLICY_LABEL.to_string(), self.payment.amount.as_str()))
+            .chain(self.policies.iter().map(|(name, over)| {
+                (
+                    name.clone(),
+                    over.amount.as_deref().unwrap_or(&self.payment.amount),
+                )
+            }))
+            .collect()
     }
 
     /// Resolve the payment terms for a request.
@@ -611,6 +668,39 @@ paid_tier:
     }
 
     #[test]
+    fn the_shipped_configs_price_above_the_gasless_floor() {
+        // Below 0.01 the gasless stablecoin path refuses to execute, which
+        // silently forces payers back onto coin objects and SUI gas. The
+        // shipped configs must not demonstrate the wrong thing.
+        for path in ["config.example.yaml", "config.demo.yaml", "deploy/config.prod.yaml"] {
+            let full = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(path);
+            let raw = std::fs::read_to_string(&full)
+                .unwrap_or_else(|e| panic!("{} must exist and be readable: {e}", full.display()));
+            for line in raw.lines() {
+                let Some(rest) = line.trim().strip_prefix("amount: ") else {
+                    continue;
+                };
+                let amount: u128 = rest.trim_matches('"').parse().expect("amount is an integer");
+                assert!(
+                    amount >= GASLESS_MINIMUM_BASE_UNITS,
+                    "{}: amount {amount} is below the gasless floor of {}",
+                    full.display(),
+                    GASLESS_MINIMUM_BASE_UNITS
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_price_below_the_gasless_floor_still_loads() {
+        // A warning, not an error: sub-cent pricing is a legitimate choice if
+        // the operator accepts that payers hold SUI. It must simply never be
+        // an accident.
+        let yaml = base_yaml().replace(r#"amount: "1000""#, r#"amount: "10""#);
+        assert!(parse(&yaml).is_ok());
+    }
+
+    #[test]
     fn rejects_the_published_placeholder_hmac_secret() {
         // Shipped in every example config and therefore public. Keeping it
         // means anyone can forge a session token for any payer and skip
@@ -630,11 +720,10 @@ paid_tier:
         // If one of them ever ships a real-looking secret instead, the check
         // above stops protecting anybody. This asserts the example files stay
         // the thing that gets refused.
-        for path in ["../config.example.yaml", "../config.demo.yaml"] {
+        for path in ["config.example.yaml", "config.demo.yaml"] {
             let full = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(path);
-            let Ok(raw) = std::fs::read_to_string(&full) else {
-                continue;
-            };
+            let raw = std::fs::read_to_string(&full)
+                .unwrap_or_else(|e| panic!("{} must exist and be readable: {e}", full.display()));
             assert!(
                 raw.contains(PLACEHOLDER_HMAC_SECRET),
                 "{} should carry the placeholder secret so it cannot boot unconfigured",

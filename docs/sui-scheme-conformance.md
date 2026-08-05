@@ -122,11 +122,32 @@ The spec lists **Address Balances** as in-development: it would remove the
 storage cost of creating a coin object, make sponsorship non-interactive, and
 potentially enable EIP-3009-style authorizations on Sui.
 
-This matters for one reason worth recording: an earlier design document for this
-project assumed Address Balances had shipped and concluded that settlement would
-be gas-free for everyone. It has not, and it is not. The current scheme requires
-a fully-formed signed transaction where the client pays gas (observed:
-~0.0023 SUI on a testnet transfer) unless a facilitator sponsors it.
+**The spec is out of date here, and it changes the scheme materially.**
+Address Balances has shipped: `0x2::coin::redeem_funds` and
+`0x2::coin::send_funds` exist on both testnet and mainnet, and
+`TransactionExpiration::ValidDuring` — whose documented purpose is enabling gas
+payment from address balances — is live except for its sub-epoch timestamp
+fields.
+
+So gasless stablecoin payment works today. Measured on testnet through this
+gateway, digest `HNSWvtuWPidbRFCpDQU8AfVf1Nce5dQP3Zo6SsxLeRAV`:
+`computation_cost: 0, storage_cost: 0`, the payer holding no SUI at all. That
+supersedes an earlier claim in this document — twice corrected now — that
+settlement necessarily costs the client ~0.0023 SUI.
+
+Three conditions apply, none of them in the spec text:
+
+1. The transfer must be **at least 0.01 USDC**; below that it does not execute.
+2. Funds must already be in the sender's **address balance**, not coin objects.
+   Moving them there costs gas once.
+3. The transaction must carry `ValidDuring` with a nonce. Address-balance gas
+   removes the replay protection that came from mutating a gas coin object, so
+   uniqueness has to be supplied explicitly or validators reject it.
+
+This also narrows the vulnerability recorded above. The spent-input problem is a
+property of coin-object pinning; a withdrawal pins nothing, so on the gasless
+path there is no authorization to invalidate. `assert_inputs_are_live` still
+guards the fallback, which is the only path that can pin anything.
 
 ## The pay-after-service window
 

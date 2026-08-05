@@ -45,11 +45,16 @@ payment:
   network: "sui:testnet"
 
   # Price in the asset's smallest unit, as a string. USDC has 6 decimals,
-  # so "1000" == 0.001 USDC.
+  # so "10000" == 0.01 USDC.
+  #
+  # 0.01 is the floor for Sui's gasless stablecoin transfers — below it the
+  # transfer is not executed at all, and the payment falls back to the coin
+  # object path where the payer needs SUI for gas. Price at or above the floor
+  # and sell a session: one payment covering 1000 requests is $0.00001 each.
   #
   # Called `amount` to match the x402 v2 wire field. v1 named this
   # `maxAmountRequired`; the scheme is `exact`, so it is a price, not a ceiling.
-  amount: "1000"
+  amount: "10000"
 
   # Circle's USDC on Sui testnet (verified on-chain: 6 decimals, REGULATED).
   # Faucet: https://faucet.circle.com — select "Sui Testnet".
@@ -110,10 +115,10 @@ store:
 # Each policy may also set `pay_to:` to credit a different wallet per route.
 policies:
   graphql:
-    amount: "100"
+    amount: "10000"
     description: "Sui testnet GraphQL queries"
   grpc:
-    amount: "5000"
+    amount: "20000"
     description: "Sui testnet fullnode gRPC calls"
 
 # Path-prefix overrides, matched by the verifier itself. Fallback for gateways

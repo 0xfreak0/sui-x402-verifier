@@ -12,18 +12,120 @@ use sui_crypto::SuiSigner;
 use sui_crypto::ed25519::Ed25519PrivateKey;
 use sui_rpc::proto::sui::rpc::v2 as pb;
 use sui_sdk_types::{Address, Digest};
-use sui_transaction_builder::{ObjectInput, TransactionBuilder};
+use sui_sdk_types::Identifier;
+use sui_transaction_builder::{Function, ObjectInput, TransactionBuilder};
 
 /// Gas budget for a coin-split-and-transfer. Generous: an underfunded budget
 /// fails at execution, and the unused remainder is refunded.
 pub const GAS_BUDGET: u64 = 10_000_000;
 
+/// Smallest transfer Sui's gasless path executes, in base units of a 6-decimal
+/// stablecoin: 0.01. Mirrors `config::GASLESS_MINIMUM_BASE_UNITS`, duplicated
+/// because the client is usable without the server's config.
+pub const GASLESS_MINIMUM: u64 = 10_000;
+
 /// Build a PTB that credits `payee` with exactly `amount` of `asset`.
 ///
-/// Splits a coin rather than transferring one whole, because the scheme is
-/// `exact` and the server asserts the recipient's balance change equals the
-/// advertised price.
+/// Two shapes, chosen by amount:
+///
+/// - **Gasless** at or above [`GASLESS_MINIMUM`]. Withdraws from the sender's
+///   address balance and calls `send_funds`, with gas price and budget both
+///   zero. Costs the payer nothing and requires no SUI whatsoever — verified on
+///   testnet at `computation_cost: 0, storage_cost: 0`.
+/// - **Coin objects** below it, because Sui simply will not execute a gasless
+///   transfer under a cent. The payer then needs SUI for gas.
+///
+/// The gasless path is better on every axis that matters here: no gas, no coin
+/// selection, and — because it pins no objects — nothing the payer can spend out
+/// from under their own authorization between verification and settlement. The
+/// fallback exists only so sub-cent pricing keeps working.
 pub async fn build_payment(
+    rpc: &str,
+    sender: Address,
+    payee: Address,
+    asset: &str,
+    amount: u64,
+) -> Result<sui_sdk_types::Transaction> {
+    if amount >= GASLESS_MINIMUM {
+        return build_gasless_payment(rpc, sender, payee, asset, amount).await;
+    }
+    build_coin_object_payment(rpc, sender, payee, asset, amount).await
+}
+
+/// Withdraw from the sender's address balance and send it, paying no gas.
+///
+/// Only three Move functions are permitted on this path — `withdrawal_split`,
+/// `redeem_funds`, `send_funds` — and the transaction may not write any object.
+/// That is why this sends into the recipient's address balance rather than
+/// splitting a coin and transferring it: creating a `Coin` would be an object
+/// write and the transaction would be rejected.
+async fn build_gasless_payment(
+    rpc: &str,
+    sender: Address,
+    payee: Address,
+    asset: &str,
+    amount: u64,
+) -> Result<sui_sdk_types::Transaction> {
+    let mut rpc_client = sui_rpc::Client::new(rpc).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let coin_type: sui_sdk_types::TypeTag = asset
+        .parse()
+        .with_context(|| format!("asset {asset:?} is not a Move type tag"))?;
+
+    let mut builder = TransactionBuilder::new();
+    builder.set_sender(sender);
+
+    // Zero, not "cheap". This is what makes the transaction free; anything
+    // else falls back to being charged against an address balance.
+    builder.set_gas_price(0);
+    builder.set_gas_budget(0);
+    // The builder refuses to produce a transaction with no gas objects, but a
+    // gasless one has none by definition — `GasPayment.objects` is allowed to
+    // be empty at the protocol level. So satisfy the builder with a placeholder
+    // and drop it below. Purely a limitation of sui-transaction-builder 0.3.
+    builder.add_gas_objects(vec![ObjectInput::owned(
+        Address::ZERO,
+        0,
+        Digest::ZERO,
+    )]);
+
+    // Reserves `amount` from the sender's address balance and redeems it into
+    // a Coin, without any object being selected, pinned, or versioned.
+    let coin = builder.funds_withdrawal_coin(coin_type.clone(), amount);
+    let recipient = builder.pure(&payee);
+    builder.move_call(
+        Function::new(
+            Address::TWO,
+            Identifier::from_static("coin"),
+            Identifier::from_static("send_funds"),
+        )
+        .with_type_args(vec![coin_type]),
+        vec![coin, recipient],
+    );
+
+    // MANDATORY, not optional. Paying gas from an address balance removes the
+    // replay protection that came from mutating a gas coin object, so the
+    // transaction has to carry its own uniqueness: epoch bounds, the chain id,
+    // and a nonce. Without this validators reject it.
+    builder.set_expiration(current_epoch_expiration(&mut rpc_client, amount).await?);
+
+    let mut transaction = builder
+        .try_build()
+        .map_err(|e| anyhow::anyhow!("building the gasless transaction: {e}"))?;
+
+    // Remove the placeholder. What makes this free is the combination of no gas
+    // objects, price zero and budget zero — leaving the object in place turns it
+    // into an ordinary transaction against an object that does not exist.
+    transaction.gas_payment.objects.clear();
+    Ok(transaction)
+}
+
+/// The legacy path: select a coin, split it, transfer the piece.
+///
+/// Retained for sub-cent prices, which the gasless path refuses outright. Every
+/// drawback this project documented lives here — the payer needs SUI, the coin
+/// object is pinned at a version, and spending it elsewhere kills the
+/// authorization after it has already been verified.
+async fn build_coin_object_payment(
     rpc: &str,
     sender: Address,
     payee: Address,
@@ -65,6 +167,63 @@ pub async fn build_payment(
     builder
         .try_build()
         .map_err(|e| anyhow::anyhow!("building the transaction: {e}"))
+}
+
+/// A `ValidDuring` expiry pinned to the current epoch, carrying a nonce.
+///
+/// Both epoch bounds must equal the current epoch — the sub-epoch timestamp
+/// fields exist in the type but are documented as not yet implemented, which is
+/// also why `maxTimeoutSeconds` still cannot be enforced on chain at finer than
+/// epoch granularity.
+async fn current_epoch_expiration(
+    client: &mut sui_rpc::Client,
+    salt: u64,
+) -> Result<sui_sdk_types::TransactionExpiration> {
+    let epoch = client
+        .ledger_client()
+        .get_epoch(
+            pb::GetEpochRequest::default().with_read_mask(prost_types::FieldMask {
+                paths: vec!["epoch".into()],
+            }),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("GetEpoch: {e}"))?
+        .into_inner();
+    let epoch_id = epoch
+        .epoch
+        .and_then(|e| e.epoch)
+        .context("node returned no epoch")?;
+
+    let chain: Digest = client
+        .ledger_client()
+        .get_service_info(pb::GetServiceInfoRequest::default())
+        .await
+        .map_err(|e| anyhow::anyhow!("GetServiceInfo: {e}"))?
+        .into_inner()
+        .chain_id
+        .context("node returned no chain id")?
+        .parse()
+        .map_err(|e| anyhow::anyhow!("chain id is not a digest: {e}"))?;
+
+    Ok(sui_sdk_types::TransactionExpiration::ValidDuring {
+        min_epoch: Some(epoch_id),
+        max_epoch: Some(epoch_id),
+        min_timestamp: None,
+        max_timestamp: None,
+        chain,
+        // Distinguishes two otherwise identical payments in the same epoch —
+        // same sender, same payee, same amount would collide without it.
+        nonce: nonce(salt),
+    })
+}
+
+/// A per-transaction nonce.
+///
+/// Random rather than a counter: this client is stateless and several may run
+/// against one wallet, so a counter would collide across processes.
+fn nonce(salt: u64) -> u32 {
+    use rand::RngCore;
+    rand::rng().next_u32() ^ (salt as u32)
 }
 
 /// A coin object we can spend.
@@ -364,7 +523,7 @@ pub async fn build_payment_header(
 
     let transaction = build_payment(rpc, sender, payee, &terms.asset, amount)
         .await
-        .context("building the payment transaction")?;
+        .with_context(|| format!("building the payment transaction for {amount} of {}", terms.asset))?;
     let signature = key
         .sign_transaction(&transaction)
         .context("signing the payment")?;

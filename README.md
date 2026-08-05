@@ -508,11 +508,25 @@ enforced off-chain by the facilitator and nothing stops a third party
 broadcasting the authorization later. `TransactionExpiration::ValidDuring`
 timestamps would fix it and are documented as not yet implemented.
 
-### Per-request payment does not pay for itself
+### Payment has a floor, and it is not gas
 
-Gas is ~0.0023 SUI per settlement against an advertised price of 0.00001 USDC —
-the settlement costs orders of magnitude more than the thing being sold. So
-sessions are load-bearing, not a convenience.
+**Corrected.** This section previously claimed gas made per-request payment
+economically incoherent — ~0.0023 SUI per settlement against a 0.00001 USDC
+price. That was true of the coin-object path and is no longer the constraint.
+
+Sui's gasless stablecoin transfers execute at **`computation_cost: 0,
+storage_cost: 0`**. Measured on testnet through this gateway, digest
+`HNSWvtuWPidbRFCpDQU8AfVf1Nce5dQP3Zo6SsxLeRAV`: a complete x402 exchange in
+which the payer spent no SUI whatsoever and needs to hold none.
+
+The real constraint is a **minimum transfer of 0.01 USDC** — below it the
+gasless path simply does not execute, and the payment falls back to coin objects
+and SUI gas. So per-request pricing cannot go below a cent.
+
+Sessions remain load-bearing, for that reason rather than for gas: one payment
+at the floor buying 1000 requests is an effective $0.00001 each, with no gas and
+no native token required of the payer. That is a working micropayment model,
+which is the opposite of what this section used to say.
 
 Which leads to the uncomfortable part: **a session is prepaid credits.** It only
 beats an API key where establishing an *account* is the friction rather than the
