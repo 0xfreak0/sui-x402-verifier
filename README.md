@@ -186,10 +186,34 @@ scripts/pay-with-sui-cli.sh --settle     # broadcasts, moves real testnet USDC
 scripts/e2e-test.sh --real               # the whole flow with a real payment
 ```
 
-These drive your local `sui` CLI wallet. Fund it with testnet USDC at
-[faucet.circle.com](https://faucet.circle.com) (chain: **Sui Testnet**) plus a
-little SUI for gas via `sui client faucet`. No addresses are baked into the repo;
+### Funding a testnet wallet
+
+These drive your local `sui` CLI wallet. No addresses are baked into the repo;
 everything is derived at runtime.
+
+| What | Where |
+|---|---|
+| **Testnet USDC** | [faucet.circle.com](https://faucet.circle.com) — select chain **Sui Testnet**, paste your address. Dispenses 10 USDC |
+| Testnet SUI | `sui client faucet`, or [faucet.sui.io](https://faucet.sui.io) |
+| Your address | `sui client active-address` |
+
+**USDC is the only one you actually need.** Payments at or above 0.01 USDC take
+the gasless path and cost no SUI at all — see [What broke](#what-broke). SUI is
+required only for sub-cent prices, which fall back to coin objects, and for the
+one-off transaction that moves USDC into your address balance:
+
+```bash
+# Gasless payments spend from the address balance, not from coin objects.
+# This moves 2 USDC across; it costs gas once, and nothing after that does.
+COIN=$(sui client objects --json | jq -r \
+  '.[] | select(.data.type? // "" | test("usdc::USDC")) | .data.objectId' | head -1)
+sui client ptb \
+  --split-coins @$COIN "[2000000]" --assign split \
+  --move-call 0x2::coin::send_funds "<$USDC_TYPE>" split.0 @$(sui client active-address) \
+  --gas-budget 20000000
+
+sui client balance    # `balance` is the total; `coinBalance` is only the coin objects
+```
 
 Verified end to end on testnet — a 0.00001 USDC payment through Envoy, settled
 only after the upstream succeeded:

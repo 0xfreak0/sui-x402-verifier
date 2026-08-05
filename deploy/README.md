@@ -110,6 +110,12 @@ addresses would drift from the file the tests exercise.
 restart, so a redeploy does not hand everyone a fresh allowance, and it
 exercises the Lua paths the local setup never touches.
 
+**Funding the demo wallet.** Testnet USDC from
+[faucet.circle.com](https://faucet.circle.com) (chain: **Sui Testnet**), testnet
+SUI from `sui client faucet`. Move the USDC into the wallet's *address balance*
+or payments fall back to the coin-object path and start costing gas — see the
+funding section in the top-level README.
+
 **The demo holds a hot wallet.** It is the only component with custody of
 anything, it is demo scaffolding rather than part of the gateway, and
 `X402_MAX_PLAYS` / `X402_PLAYS_PER_IP` are the only thing between a public link
