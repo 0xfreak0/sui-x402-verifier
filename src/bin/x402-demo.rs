@@ -455,6 +455,7 @@ async fn targets() -> Json<&'static [Target]> {
 async fn send(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    incoming: axum::http::HeaderMap,
     Json(request): Json<SendRequest>,
 ) -> Result<Json<SendResult>, ApiError> {
     let Some(target) = target(&request.target) else {
@@ -472,6 +473,10 @@ async fn send(
     let http = reqwest::Client::new();
 
     let mut headers = vec![("content-type".to_string(), target.content_type.to_string())];
+    // Carry the edge proxy's view of the original request inward. Without this
+    // the gateway sees only our loopback call and advertises a resource URL
+    // pointing at its own internal address, which no client can reach.
+    headers.extend(forwarded(&incoming));
     if let Some(session) = &request.session {
         headers.push(("x-payment-session".to_string(), session.clone()));
     }
@@ -662,6 +667,23 @@ async fn send(
         trace,
         settled,
     }))
+}
+
+/// Re-emit the `X-Forwarded-*` headers the edge proxy set on the request that
+/// reached us.
+///
+/// This service calls the gateway on loopback, so without propagating these the
+/// gateway would describe the resource as `http://127.0.0.1:10000/...`. Only
+/// forwarded here, never synthesised: with no proxy in front there is nothing
+/// to forward and the gateway's own view is already correct.
+fn forwarded(incoming: &axum::http::HeaderMap) -> Vec<(String, String)> {
+    ["x-forwarded-host", "x-forwarded-proto"]
+        .iter()
+        .filter_map(|name| {
+            let value = incoming.get(*name)?.to_str().ok()?;
+            Some((name.to_string(), value.to_string()))
+        })
+        .collect()
 }
 
 /// A zero-length grpc-web frame for targets that speak it.

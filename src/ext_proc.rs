@@ -165,6 +165,40 @@ fn header_map(
         .unwrap_or_default()
 }
 
+/// Build the absolute URL of the requested resource, as the client addresses it.
+///
+/// `:authority` is the host Envoy was *reached* on, which behind a reverse proxy
+/// is an internal address — deployed, that produced challenges advertising
+/// `https://127.0.0.1:10000/graphql`, a resource no client can reach. §5.1.2
+/// requires a complete URL, and a wrong one is worse than a path.
+///
+/// So prefer what the edge proxy recorded about the original request.
+/// `x-forwarded-host` and `x-forwarded-proto` are set by Caddy and, like
+/// `x-forwarded-for`, are only trustworthy because the edge replaces rather than
+/// appends them. With no proxy in front, neither header exists and `:authority`
+/// is the right answer.
+fn resource_url(map: &std::collections::HashMap<String, String>, path: &str) -> String {
+    let authority = map
+        .get("x-forwarded-host")
+        .or_else(|| map.get(":authority"))
+        .cloned()
+        .unwrap_or_default();
+
+    if authority.is_empty() {
+        return path.to_string();
+    }
+
+    // https is the safer assumption for a public gateway than downgrading.
+    let scheme = map
+        .get("x-forwarded-proto")
+        .or_else(|| map.get(":scheme"))
+        .filter(|s| !s.is_empty())
+        .cloned()
+        .unwrap_or_else(|| "https".to_string());
+
+    format!("{scheme}://{authority}{path}")
+}
+
 /// Pull the peer IP out of Envoy's requested attributes.
 ///
 /// Envoy groups these by the *filter name*, storing the full dotted CEL path as
@@ -343,16 +377,7 @@ async fn handle_request_headers(
 
     // ext_proc delivers pseudo-headers in the same map as ordinary ones.
     let path = map.get(":path").cloned().unwrap_or_default();
-    let authority = map.get(":authority").cloned().unwrap_or_default();
-    let scheme = map
-        .get(":scheme")
-        .cloned()
-        .unwrap_or_else(|| "https".to_string());
-    let resource_url = if authority.is_empty() {
-        path.clone()
-    } else {
-        format!("{scheme}://{authority}{path}")
-    };
+    let resource_url = resource_url(&map, &path);
 
     let started = std::time::Instant::now();
     let decision = X402Decider { state }
@@ -652,6 +677,54 @@ impl X402Decider<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn headers(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn resource_url_prefers_what_the_edge_proxy_saw() {
+        // Deployed behind Caddy, :authority is the internal address Envoy was
+        // reached on. Advertising that in a challenge tells a client to pay for
+        // a resource it cannot address.
+        let map = headers(&[
+            (":authority", "127.0.0.1:10000"),
+            (":scheme", "http"),
+            ("x-forwarded-host", "x402.suisonar.dev"),
+            ("x-forwarded-proto", "https"),
+        ]);
+        assert_eq!(
+            resource_url(&map, "/graphql"),
+            "https://x402.suisonar.dev/graphql"
+        );
+    }
+
+    #[test]
+    fn resource_url_falls_back_to_authority_with_no_proxy_in_front() {
+        let map = headers(&[(":authority", "localhost:10000"), (":scheme", "http")]);
+        assert_eq!(
+            resource_url(&map, "/graphql"),
+            "http://localhost:10000/graphql"
+        );
+    }
+
+    #[test]
+    fn resource_url_assumes_https_when_no_scheme_is_given() {
+        // Envoy leaves :scheme empty on some paths; downgrading a public
+        // gateway to http in an advertised URL is the worse guess.
+        let map = headers(&[(":authority", "example.com")]);
+        assert_eq!(resource_url(&map, "/x"), "https://example.com/x");
+    }
+
+    #[test]
+    fn resource_url_degrades_to_a_path_rather_than_a_malformed_url() {
+        // "https:///graphql" merely looks like a URL. A bare path is at least
+        // honestly incomplete.
+        assert_eq!(resource_url(&headers(&[]), "/graphql"), "/graphql");
+    }
 
     #[test]
     fn identity_headers_overwrite_rather_than_append() {

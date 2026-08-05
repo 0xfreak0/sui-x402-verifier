@@ -7,30 +7,49 @@
 	email {$ACME_EMAIL}
 }
 
-{$X402_DOMAIN} {
-	# Everything goes to the demo backend: it serves the page, exposes the
-	# console API, and proxies anything else on to the gated gateway. Same
-	# shape as the laptop, so there is one code path rather than two.
-	#
-	# The hostname is `envoy` because the demo shares Envoy's network
-	# namespace — see the note in docker-compose.yml.
-	reverse_proxy envoy:8402 {
-		# SECURITY BOUNDARY. The verifier meters the free tier per source
-		# address, so Envoy has to see the real client IP. `header_up` with a
-		# value REPLACES the header, which is the point: a client-supplied
-		# X-Forwarded-For is discarded here rather than carried inward, so
-		# nobody can rotate the header to mint themselves a fresh allowance.
-		#
-		# Envoy is configured with xff_num_trusted_hops: 1 to read exactly
-		# this one hop. If another proxy is ever put in front of Caddy, that
-		# number must change with it.
-		header_up X-Forwarded-For {remote_host}
-		header_up X-Real-IP {remote_host}
+(gateway_headers) {
+	header_up X-Forwarded-For {remote_host}
+	header_up X-Real-IP {remote_host}
+	header_up X-Forwarded-Host {host}
+	header_up X-Forwarded-Proto {scheme}
+}
 
-		# gRPC and grpc-web need HTTP/2 to the upstream. h2c because the hop
-		# to the demo backend is inside the compose network and unencrypted.
-		transport http {
-			versions h2c 2
+{$X402_DOMAIN} {
+	# SECURITY BOUNDARY, for both upstreams below. `header_up` with a value
+	# REPLACES the header, which is the point: a client-supplied
+	# X-Forwarded-For is discarded here rather than carried inward, so nobody
+	# can rotate it to mint themselves a fresh free-tier allowance. Envoy is
+	# configured with xff_num_trusted_hops: 1 to read exactly this one hop.
+	#
+	# X-Forwarded-Host is what lets the gateway advertise a resource URL the
+	# client can actually reach; without it the challenge names the internal
+	# address Envoy was reached on.
+
+	# Gated traffic goes STRAIGHT to the gateway. The demo backend is not in
+	# this path and would not exist in a real deployment — routing through it
+	# was what made the challenge advertise an internal address, and it made
+	# the topology misrepresent the product.
+	@gated path /graphql* /free/* /spin* /boom* /sui.rpc.v2.* /grpc.reflection.* /grpc.health.*
+	handle @gated {
+		reverse_proxy envoy:10000 {
+			import gateway_headers
+			# gRPC and grpc-web need HTTP/2 to the upstream. h2c because the
+			# hop is inside the compose network and unencrypted.
+			transport http {
+				versions h2c 2
+			}
+		}
+	}
+
+	# Everything else is the demo: the page, the console API, and paying on a
+	# visitor's behalf. `envoy` rather than `demo` as the hostname because the
+	# demo shares Envoy's network namespace — see docker-compose.yml.
+	handle {
+		reverse_proxy envoy:8402 {
+			import gateway_headers
+			transport http {
+				versions h2c 2
+			}
 		}
 	}
 
