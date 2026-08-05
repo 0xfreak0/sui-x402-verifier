@@ -165,6 +165,43 @@ fn header_map(
         .unwrap_or_default()
 }
 
+/// How long a gRPC stream may run, expressed as a `grpc-timeout` value.
+///
+/// Streaming is sold by duration: a payment buys a window, and the stream must
+/// end when the window does. Envoy already enforces this if the request carries
+/// `grpc-timeout`, so no new machinery is needed — the gateway simply has to be
+/// the one that sets it.
+///
+/// **Overwritten, never appended.** `grpc-timeout` is an ordinary request header
+/// a client can send, so honouring the client's value would let anyone grant
+/// themselves an arbitrarily long stream. Same reasoning as [`HEADER_TIER`].
+///
+/// Only the paid tier gets one. A free-tier stream is bounded by the route's own
+/// timeout, and a `None` here leaves that untouched rather than silently
+/// shortening it.
+///
+/// The route should also set `max_stream_duration.grpc_timeout_header_max` as a
+/// ceiling; this value is what the payment bought, that is what the operator is
+/// willing to sell.
+fn grpc_timeout_for(meter: &Meter, view: &HeaderView<'_>) -> Option<String> {
+    let Meter::Session {
+        expires_in_secs, ..
+    } = meter
+    else {
+        return None;
+    };
+    if !view
+        .get("content-type")
+        .is_some_and(|ct| ct.starts_with("application/grpc"))
+    {
+        return None;
+    }
+    // gRPC durations are `<value><unit>`; `S` is seconds. A session with no
+    // time left should not open a stream at all, so clamp to at least one
+    // second and let the session check refuse the next request.
+    Some(format!("{}S", (*expires_in_secs).max(1)))
+}
+
 /// Build the absolute URL of the requested resource, as the client addresses it.
 ///
 /// `:authority` is the host Envoy was *reached* on, which behind a reverse proxy
@@ -406,6 +443,11 @@ async fn handle_request_headers(
             let mut mutations = vec![header(HEADER_TIER, tier.as_str())];
             if let Some(payer) = payer {
                 mutations.push(header(HEADER_PAYER, payer));
+            }
+            // Bound a stream to what was actually paid for.
+            if let Some(timeout) = grpc_timeout_for(&meter, &view) {
+                tracing::debug!(%timeout, "bounding the stream to the paid window");
+                mutations.push(header("grpc-timeout", timeout));
             }
 
             ProcessingResponse {
@@ -683,6 +725,66 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect()
+    }
+
+    fn view_of(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
+        headers(pairs)
+    }
+
+    #[test]
+    fn a_paid_grpc_stream_is_bounded_by_what_the_session_has_left() {
+        // Streaming is sold by duration, so the stream must end when the window
+        // does. Envoy enforces grpc-timeout; the gateway only has to set it.
+        let map = view_of(&[("content-type", "application/grpc")]);
+        let meter = Meter::Session {
+            remaining: 10,
+            quota: 100,
+            expires_in_secs: 42,
+        };
+        assert_eq!(
+            grpc_timeout_for(&meter, &HeaderView::new(Some(&map))),
+            Some("42S".to_string())
+        );
+    }
+
+    #[test]
+    fn a_non_grpc_request_gets_no_timeout() {
+        let map = view_of(&[("content-type", "application/json")]);
+        let meter = Meter::Session {
+            remaining: 10,
+            quota: 100,
+            expires_in_secs: 42,
+        };
+        assert_eq!(grpc_timeout_for(&meter, &HeaderView::new(Some(&map))), None);
+    }
+
+    #[test]
+    fn a_free_tier_stream_keeps_the_routes_own_timeout() {
+        // Emitting a timeout here would silently shorten a stream nobody paid
+        // to extend. Leaving it absent lets the route decide.
+        let map = view_of(&[("content-type", "application/grpc")]);
+        let meter = Meter::Free {
+            remaining: 4,
+            limit: 5,
+            reset_secs: 30,
+        };
+        assert_eq!(grpc_timeout_for(&meter, &HeaderView::new(Some(&map))), None);
+    }
+
+    #[test]
+    fn an_exhausted_session_still_yields_a_positive_timeout() {
+        // A zero would be rejected by Envoy as malformed. The session check
+        // refuses the next request anyway, so one second is the safe floor.
+        let map = view_of(&[("content-type", "application/grpc")]);
+        let meter = Meter::Session {
+            remaining: 0,
+            quota: 100,
+            expires_in_secs: 0,
+        };
+        assert_eq!(
+            grpc_timeout_for(&meter, &HeaderView::new(Some(&map))),
+            Some("1S".to_string())
+        );
     }
 
     #[test]

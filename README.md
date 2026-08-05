@@ -2,6 +2,14 @@
 
 Sell API access for stablecoin, at the gateway, without accounts or API keys.
 
+> **This is an experiment, not a product.** It was built to find out what putting
+> x402 in front of real infrastructure actually costs, and the most useful thing
+> it produced is the list of things that broke — see [What broke](#what-broke).
+> It is not maintained, not audited, has run only on testnet, and no part of it
+> should be treated as production-ready. There is no support and no roadmap.
+>
+> It is public so the findings and the code are readable together.
+
 An [x402](https://github.com/x402-foundation/x402) payment gate written in Rust. It sits
 beside an Envoy proxy and decides, per request, whether the caller is on the free
 tier or has paid. Anonymous callers get a small rate-limited allowance; when they

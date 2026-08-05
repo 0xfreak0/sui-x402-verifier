@@ -31,6 +31,20 @@ static_resources:
                 stat_prefix: ingress_http
                 # AUTO accepts both h1 (curl → GraphQL) and h2 (grpcurl → gRPC).
                 codec_type: AUTO
+                # One line per request, to stdout.
+                #
+                # %REQ()% reports the request as it arrived from downstream, not
+                # as ext_proc rewrote it — so the tier here is what the CLIENT
+                # claimed, which is exactly what you want to see when checking
+                # that a forged `x-x402-tier` was ignored. The tier the verifier
+                # actually resolved is in its own logs, not this one.
+                access_log:
+                  - name: envoy.access_loggers.stdout
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StdoutAccessLog
+                      log_format:
+                        text_format_source:
+                          inline_string: "[%START_TIME%] %REQ(:METHOD)% %REQ(X-ENVOY-ORIGINAL-PATH?:PATH)% %RESPONSE_CODE% %DURATION%ms claimed-tier=%REQ(X-X402-TIER)% upstream=%UPSTREAM_HOST%\n"
 
                 # SECURITY CRITICAL — this is what makes the free tier real.
                 #
@@ -127,6 +141,19 @@ static_resources:
                             # "localhost:10000".
                             host_rewrite_literal: fullnode.testnet.sui.io
                             timeout: 30s
+                            # Streaming is sold by duration. The verifier sets
+                            # `grpc-timeout` to whatever the session has left
+                            # and overwrites any client-supplied value, so the
+                            # stream ends when the paid window does.
+                            #
+                            # This is the CEILING on what may be sold, not the
+                            # duration itself — keeping the per-session value in
+                            # a header is what lets one route sell a 60-second
+                            # window and an hour-long one. A static
+                            # max_stream_duration here would pin every session
+                            # on the route to the same length.
+                            max_stream_duration:
+                              grpc_timeout_header_max: 3600s
                           metadata:
                             filter_metadata:
                               envoy.filters.http.ext_proc:
