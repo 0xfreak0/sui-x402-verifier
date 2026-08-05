@@ -49,6 +49,21 @@ static_resources:
                 # number of proxies you actually control — never leave the
                 # decision to the client.
                 use_remote_address: true
+                # Trust exactly one proxy hop: Caddy, which REPLACES
+                # X-Forwarded-For with the real peer, so a client-supplied
+                # value never survives to be read here. The demo backend
+                # forwards that header verbatim and adds nothing, so one hop
+                # is the whole chain.
+                #
+                # Locally there is no Caddy and browsers send no XFF, so Envoy
+                # falls back to the connection peer exactly as before. A
+                # curious user could hand-craft an XFF against their own
+                # laptop; that is not a threat model, and any deployment must
+                # keep a header-sanitising proxy in front for this to hold.
+                #
+                # Add another proxy in front of Caddy and this number must
+                # change with it, or the free tier becomes forgeable.
+                xff_num_trusted_hops: 1
                 route_config:
                   name: local_route
                   virtual_hosts:

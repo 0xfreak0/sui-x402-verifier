@@ -1,0 +1,7 @@
+target
+.git
+.local-logs*
+demo
+deploy
+scripts
+*.md

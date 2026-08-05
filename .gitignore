@@ -21,6 +21,8 @@
 /scratchpad/
 
 /X402-CONFORMANCE-PROMPT.md
-/Dockerfile
-/.dockerignore
-/deploy/
+
+# The deploy stack IS tracked — it carries no secrets. The filled-in
+# environment file is the one thing that must never be committed: it holds the
+# session HMAC secret and the demo wallet's private key.
+/deploy/.env

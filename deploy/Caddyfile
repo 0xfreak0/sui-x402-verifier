@@ -1,0 +1,41 @@
+# Caddy fronts the whole stack and handles TLS automatically.
+#
+# On first start it requests a Let's Encrypt certificate over HTTP-01, which is
+# why port 80 must be open to the internet as well as 443. Renewal is automatic.
+
+{
+	email {$ACME_EMAIL}
+}
+
+{$X402_DOMAIN} {
+	# Everything goes to the demo backend: it serves the page, exposes the
+	# console API, and proxies anything else on to the gated gateway. Same
+	# shape as the laptop, so there is one code path rather than two.
+	#
+	# The hostname is `envoy` because the demo shares Envoy's network
+	# namespace — see the note in docker-compose.yml.
+	reverse_proxy envoy:8402 {
+		# SECURITY BOUNDARY. The verifier meters the free tier per source
+		# address, so Envoy has to see the real client IP. `header_up` with a
+		# value REPLACES the header, which is the point: a client-supplied
+		# X-Forwarded-For is discarded here rather than carried inward, so
+		# nobody can rotate the header to mint themselves a fresh allowance.
+		#
+		# Envoy is configured with xff_num_trusted_hops: 1 to read exactly
+		# this one hop. If another proxy is ever put in front of Caddy, that
+		# number must change with it.
+		header_up X-Forwarded-For {remote_host}
+		header_up X-Real-IP {remote_host}
+
+		# gRPC and grpc-web need HTTP/2 to the upstream. h2c because the hop
+		# to the demo backend is inside the compose network and unencrypted.
+		transport http {
+			versions h2c 2
+		}
+	}
+
+	log {
+		output stdout
+		format console
+	}
+}

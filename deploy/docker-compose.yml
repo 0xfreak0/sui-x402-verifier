@@ -1,0 +1,116 @@
+# The demo stack for a single small VM.
+#
+#   internet ──▶ caddy :443 ──▶ demo :8402 ──▶ envoy :10000 ──▶ Sui testnet
+#                (auto TLS)     (page + API)       │            or the demo app
+#                                                  └─ext_proc─▶ verifier :50051
+#                                                                    │
+#                                                                    └─▶ redis
+#
+# NETWORKING. verifier, demo and redis deliberately share Envoy's network
+# namespace (`network_mode: service:envoy`), so 127.0.0.1:50051, :8402 and
+# :6379 resolve inside the stack exactly as they do on a laptop. That means
+# ../envoy.yaml runs UNMODIFIED here. The alternative — a production copy of
+# envoy.yaml differing only in a few addresses — is a config file that silently
+# drifts from the one the tests actually exercise.
+#
+# Only caddy publishes ports. Envoy, the verifier, the demo, its metrics and the
+# facilitator API are unreachable from outside the host no matter what the
+# firewall says, which matters because /settle moves money and neither /metrics
+# nor the facilitator API is authenticated.
+
+services:
+  # Terminates TLS and fronts everything. The only service with published ports.
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"     # required for the ACME HTTP-01 challenge
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data      # certificates live here — do NOT delete casually,
+      - caddy_config:/config  # Let's Encrypt rate-limits re-issuance
+    environment:
+      X402_DOMAIN: "${X402_DOMAIN:?set X402_DOMAIN in deploy/.env}"
+      ACME_EMAIL: "${ACME_EMAIL:?set ACME_EMAIL in deploy/.env}"
+    depends_on:
+      - demo
+
+  # The gateway, and the network namespace the other three join.
+  envoy:
+    build:
+      context: .
+      dockerfile: Dockerfile.envoy
+    restart: unless-stopped
+    command: ["-c", "/etc/envoy/envoy.yaml", "--log-level", "info"]
+    volumes:
+      - ../envoy.yaml:/etc/envoy/envoy.yaml:ro
+    expose:
+      - "8402"    # demo, reached by caddy across the namespace boundary
+      - "10000"   # envoy itself; caddy never talks to it directly
+
+  verifier:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    command: ["/usr/local/bin/x402-verifier", "--config", "/etc/x402/config.yaml"]
+    network_mode: "service:envoy"
+    volumes:
+      - ./config.prod.yaml:/etc/x402/config.yaml:ro
+    environment:
+      # From deploy/.env, never baked into an image or a config file. The
+      # service refuses to start without them.
+      X402_SESSION_HMAC_SECRET: "${X402_SESSION_HMAC_SECRET:?generate one with openssl rand -hex 32}"
+      X402_PAY_TO: "${X402_PAY_TO:?set the default Sui receiving address}"
+      # A second payee, so the demo can show two routes crediting different
+      # wallets. Unset means gRPC credits the default wallet, which quietly
+      # costs the demo one of its points — set it.
+      X402_PAY_TO_GRPC: "${X402_PAY_TO_GRPC:-}"
+      RUST_LOG: "${RUST_LOG:-x402_verifier=info}"
+    depends_on:
+      - envoy
+      - redis
+
+  # The console backend. Serves the page, and pays on a visitor's behalf.
+  #
+  # THIS HOLDS A HOT WALLET. It is the one component with custody of anything,
+  # it is demo scaffolding rather than part of the gateway, and its spend
+  # controls are the only reason a public link cannot drain it.
+  demo:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    network_mode: "service:envoy"
+    command:
+      - /usr/local/bin/x402-demo
+      - --listen=0.0.0.0:8402
+      - --static-dir=/srv/demo
+      - --gateway=http://127.0.0.1:10000
+      - --metrics=http://127.0.0.1:9090
+      - --facilitator-api=http://127.0.0.1:50052
+      - --max-plays=${X402_MAX_PLAYS:-400}
+      - --plays-per-ip-hourly=${X402_PLAYS_PER_IP:-20}
+    volumes:
+      # Mounted rather than baked in, so the page can be edited on the VM
+      # without a rebuild.
+      - ../demo:/srv/demo:ro
+    environment:
+      X402_SUI_PRIVATE_KEY: "${X402_SUI_PRIVATE_KEY:?the demo wallet key, suiprivkey1...}"
+      RUST_LOG: "${RUST_LOG:-x402_demo=info}"
+    depends_on:
+      - verifier
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    network_mode: "service:envoy"
+    # Session and rate-limit state is reconstructible: a wiped Redis costs
+    # everyone their current session and nothing more. Persistence off keeps
+    # the memory footprint small on a tiny VM.
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "128mb", "--maxmemory-policy", "allkeys-lru"]
+
+volumes:
+  caddy_data:
+  caddy_config:

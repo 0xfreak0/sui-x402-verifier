@@ -1,0 +1,15 @@
+# Envoy, with one fix.
+#
+# ../envoy.yaml points `trusted_ca` at /etc/ssl/cert.pem, which is where macOS
+# keeps its CA bundle. The official Envoy image is Ubuntu-based and uses
+# /etc/ssl/certs/ca-certificates.crt instead, with no cert.pem at all — so
+# Envoy fails to start with a file-not-found on a path nobody looks at twice.
+#
+# Symlinking is better than editing the config: one envoy.yaml then works
+# unmodified on the laptop and on the VM, and the file exercised by local
+# testing is the file that runs in production.
+FROM envoyproxy/envoy:v1.39-latest
+
+USER root
+RUN ln -sf /etc/ssl/certs/ca-certificates.crt /etc/ssl/cert.pem
+USER envoy
