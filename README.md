@@ -566,6 +566,41 @@ payment — an agent that cannot complete a signup flow, hold a card, or agree t
 terms. That is a real niche and an unproven one, and it is the honest answer to
 "why not just use Stripe."
 
+### Duration billing has no way to notice you left
+
+A session is keyed on a random id inside an HMAC token — not on IP, connection,
+or TLS session. That is deliberate: binding it to an address would punish a
+phone for moving between wifi and cellular. So a client that drops and
+reconnects presents the same token and finds its quota and expiry intact, and
+Redis carries that across a redeploy.
+
+The gap is on the streaming side, and it only exists for duration billing.
+
+`ext_proc` is headers-only, so the gateway authorizes a stream when it opens and
+**never observes it again** — not its messages, not its end. A client that
+disconnects thirty seconds into an hour-long window has burned the remaining
+fifty-nine minutes, and nothing in the system can tell. There is no refund, no
+pause, and no detection. Seeing the disconnect would mean
+`response_body_mode: STREAMED`, paying latency and memory on every chunk to act
+as a clock, which costs more than the problem is worth.
+
+Request-count billing does not have this problem: quota decrements per request,
+so a reconnect costs exactly one request and everything already delivered stays
+delivered. Both limits exist on every session and the first to run out wins, so
+"count only" is simply a large `duration_secs` and vice versa.
+
+The practical answer is to **sell short windows and let clients renew** rather
+than selling an hour up front. The upstream's own ~30s stream cap already forces
+reconnects, so a 30-second window costs a disconnected client at most 30 seconds
+and reuses machinery that has to exist anyway. Selling a long window looks
+generous and is strictly worse for the buyer.
+
+One asymmetry worth knowing before advertising a count-based product: the
+`grpc-timeout` the gateway injects comes from the session's *remaining seconds*,
+and the route's `grpc_timeout_header_max` clamps it. So a session sold as "1000
+requests over a day" still cannot hold a stream open past the route ceiling.
+Count-based sessions do not degrade gracefully into streams.
+
 ### Settlement is most of the latency
 
 ~759ms of a ~1.3s paid request is broadcasting to the chain; verification is
