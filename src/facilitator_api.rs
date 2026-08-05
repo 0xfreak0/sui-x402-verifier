@@ -28,6 +28,7 @@ use axum::{
     routing::{get, post},
 };
 
+use crate::config::Config;
 use crate::session::{PaymentClaim, SessionStore};
 use crate::x402::{
     self, Facilitator, FacilitatorRequest, SettlementResponse, SupportedResponse, VerifyResponse,
@@ -41,19 +42,76 @@ pub struct ApiState {
     /// Shared with the gateway path so a payment spent through one surface
     /// cannot be spent again through the other.
     pub sessions: Arc<SessionStore>,
+    /// Read-only, for `/policies`.
+    pub config: Arc<Config>,
 }
 
 /// Build the router. Kept separate from serving so tests can exercise it
 /// without binding a port.
-pub fn router(facilitator: Arc<Facilitator>, sessions: Arc<SessionStore>) -> Router {
+pub fn router(
+    facilitator: Arc<Facilitator>,
+    sessions: Arc<SessionStore>,
+    config: Arc<Config>,
+) -> Router {
     Router::new()
         .route("/verify", post(verify))
         .route("/settle", post(settle))
         .route("/supported", get(supported))
+        .route("/policies", get(policies))
         .with_state(ApiState {
             facilitator,
             sessions,
+            config,
         })
+}
+
+/// One row of the effective policy table.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PolicyView {
+    pub name: String,
+    pub amount: String,
+    pub asset: String,
+    pub pay_to: String,
+    pub network: String,
+    pub description: String,
+    pub free_requests: u64,
+    pub free_window_secs: u64,
+    pub session_quota: u64,
+    pub session_duration_secs: u64,
+}
+
+/// The resolved policy table: what each named policy costs, where it pays, and
+/// what it gives away.
+///
+/// Not part of the x402 spec — operator and client introspection. It exposes
+/// nothing a client cannot already learn by triggering one 402 per route, but
+/// **without spending a free-tier request to find out**, which matters for any
+/// client that wants to render prices before it starts consuming its allowance.
+async fn policies(State(state): State<ApiState>) -> Json<Vec<PolicyView>> {
+    let mut rows: Vec<PolicyView> = state
+        .config
+        .policies
+        .keys()
+        .map(|name| {
+            let resolved = state.config.policy_for("", Some(name));
+            PolicyView {
+                name: name.clone(),
+                amount: resolved.payment.amount.clone(),
+                asset: resolved.payment.asset.clone(),
+                pay_to: resolved.payment.pay_to.clone(),
+                network: resolved.payment.network.clone(),
+                description: resolved.payment.description.clone(),
+                free_requests: resolved.free_tier.max_requests,
+                free_window_secs: resolved.free_tier.window_secs,
+                session_quota: resolved.paid_tier.quota,
+                session_duration_secs: resolved.paid_tier.duration_secs,
+            }
+        })
+        .collect();
+    // Stable order: a HashMap would otherwise reshuffle the table every call.
+    rows.sort_by(|a, b| a.name.cmp(&b.name));
+    Json(rows)
 }
 
 /// A request whose envelope is wrong before any payment logic runs.
@@ -210,8 +268,42 @@ mod tests {
         Arc::new(SessionStore::Memory(MemorySessionStore::new(
             vec![7u8; 32],
             3600,
-            100,
         )))
+    }
+
+    /// A config with two policies that differ in every dimension, so
+    /// `/policies` cannot pass by echoing one row twice.
+    fn test_config() -> Arc<Config> {
+        use crate::config::{FreeTierConfig, PaidTierConfig, PaymentOverride};
+        let mut policies = std::collections::HashMap::new();
+        policies.insert(
+            "cheap".to_string(),
+            PaymentOverride {
+                amount: Some("10".into()),
+                free_tier: Some(FreeTierConfig {
+                    max_requests: 5,
+                    window_secs: 60,
+                }),
+                ..Default::default()
+            },
+        );
+        policies.insert(
+            "pricey".to_string(),
+            PaymentOverride {
+                amount: Some("5000".into()),
+                pay_to: Some(format!("0x{}", "2".repeat(64))),
+                paid_tier: Some(PaidTierConfig {
+                    quota: 50,
+                    duration_secs: 900,
+                }),
+                ..Default::default()
+            },
+        );
+        let mut config = crate::auth::test_support::app_state_with_policies(9, 77, policies)
+            .config
+            .clone();
+        config.payment.pay_to = format!("0x{}", "1".repeat(64));
+        Arc::new(config)
     }
 
     fn facilitator() -> Arc<Facilitator> {
@@ -259,7 +351,7 @@ mod tests {
     /// POST against a router whose state persists across calls, so replay
     /// behaviour is observable.
     async fn post_twice(path: &str, body: String) -> Vec<serde_json::Value> {
-        let app = router(facilitator(), sessions());
+        let app = router(facilitator(), sessions(), test_config());
         let mut out = Vec::new();
         for _ in 0..2 {
             let response = app
@@ -283,7 +375,7 @@ mod tests {
     }
 
     async fn post(path: &str, body: String) -> (StatusCode, serde_json::Value) {
-        let response = router(facilitator(), sessions())
+        let response = router(facilitator(), sessions(), test_config())
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -395,8 +487,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn policies_reports_the_resolved_table_not_the_raw_overrides() {
+        let response = router(facilitator(), sessions(), test_config())
+            .oneshot(
+                Request::builder()
+                    .uri("/policies")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let rows: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        // Sorted, so a HashMap cannot reshuffle the table between calls.
+        assert_eq!(rows[0]["name"], "cheap");
+        assert_eq!(rows[1]["name"], "pricey");
+
+        // Every field is the *resolved* value: `cheap` sets no pay_to and no
+        // paid_tier, so it must show the inherited ones rather than nulls.
+        assert_eq!(rows[0]["amount"], "10");
+        assert_eq!(rows[0]["payTo"], format!("0x{}", "1".repeat(64)));
+        assert_eq!(rows[0]["freeRequests"], 5);
+        assert_eq!(rows[0]["sessionQuota"], 77);
+
+        // And `pricey` overrides exactly what it declared, inheriting the rest.
+        assert_eq!(rows[1]["amount"], "5000");
+        assert_eq!(rows[1]["payTo"], format!("0x{}", "2".repeat(64)));
+        assert_eq!(rows[1]["freeRequests"], 9);
+        assert_eq!(rows[1]["sessionQuota"], 50);
+        assert_eq!(rows[1]["sessionDurationSecs"], 900);
+    }
+
+    #[tokio::test]
+    async fn policies_costs_no_free_tier_request_to_read() {
+        // The whole reason this endpoint exists: a client can render prices
+        // without spending the allowance it is about to display.
+        let sessions = sessions();
+        let app = router(facilitator(), Arc::clone(&sessions), test_config());
+        for _ in 0..50 {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/policies")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        // Nothing was minted, spent or claimed by reading the table.
+        assert_eq!(sessions.len(), 0);
+    }
+
+    #[tokio::test]
     async fn supported_lists_scheme_network_and_extensions() {
-        let response = router(facilitator(), sessions())
+        let response = router(facilitator(), sessions(), test_config())
             .oneshot(
                 Request::builder()
                     .uri("/supported")
@@ -436,7 +587,7 @@ mod tests {
             )
             .expect("connecting is lazy; the channel is not dialed until first use"),
         );
-        let response = router(facilitator, sessions())
+        let response = router(facilitator, sessions(), test_config())
             .oneshot(
                 Request::builder()
                     .method("POST")

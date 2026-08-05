@@ -98,6 +98,33 @@ impl Tier {
     }
 }
 
+/// What the requester has left, surfaced as `x-x402-*` response headers.
+///
+/// The gateway already knows this at decision time; without publishing it a
+/// client can only discover the wall by hitting it, and cannot show a user how
+/// much of a purchased session remains.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Meter {
+    /// Anonymous allowance in the current sliding window.
+    Free {
+        remaining: u64,
+        limit: u64,
+        /// Seconds until the window rolls over.
+        reset_secs: u64,
+    },
+    /// A paid session's remaining quota and life.
+    Session {
+        remaining: u64,
+        quota: u64,
+        /// Seconds until the session expires, whatever the quota says.
+        expires_in_secs: u64,
+    },
+    /// Nothing meaningful to report: the request never reached a tier, or a
+    /// payment settled without minting a session.
+    #[default]
+    Unknown,
+}
+
 /// The authorization outcome, independent of Envoy's protobuf types.
 ///
 /// Kept separate from [`CheckResponse`] construction so the policy logic can be
@@ -114,6 +141,8 @@ pub enum Decision {
         /// Present only under [`SettlePolicy::Deferred`]: verified, not yet
         /// charged. The caller must settle it once the upstream succeeds.
         pending: Option<Box<PendingPayment>>,
+        /// What is left after serving this request.
+        meter: Meter,
     },
     Deny {
         challenge: PaymentRequired,
@@ -124,6 +153,9 @@ pub enum Decision {
         /// were previously indistinguishable to a client, both arriving as a
         /// bare 402 with only a challenge.
         receipt: Option<SettlementResponse>,
+        /// What is left, so a 402 says *when* the free tier returns rather than
+        /// only that it is gone.
+        meter: Meter,
     },
 }
 
@@ -176,10 +208,13 @@ impl X402Auth {
             );
         }
 
-        // Terms are resolved per request so different routes can advertise
-        // different prices and receiving wallets.
-        let payment = self.state.config.payment_for(path, policy);
-        let requirements = PaymentRequirements::from_config(&payment);
+        // Terms *and tiers* are resolved once per request, so different routes
+        // can advertise different prices, receiving wallets, free allowances
+        // and session sizes — and so every branch below agrees about which
+        // policy is in force.
+        let resolved = self.state.config.policy_for(path, policy);
+        let payment = &resolved.payment;
+        let requirements = PaymentRequirements::from_config(payment);
 
         // In v2 the resource is a top-level object on PaymentRequired, not a
         // field repeated inside every accepts[] entry.
@@ -192,8 +227,8 @@ impl X402Auth {
         // Advertise that a settled payment buys a reusable session, using the
         // §5.1.2 extensions mechanism rather than an undocumented header.
         let mut challenge_extensions = Some(x402::session_extension_advertisement(
-            self.state.config.paid_tier.quota,
-            self.state.config.paid_tier.duration_secs,
+            resolved.paid_tier.quota,
+            resolved.paid_tier.duration_secs,
             HEADER_PAYMENT_SESSION,
         ));
 
@@ -217,7 +252,12 @@ impl X402Auth {
         // ---- 1. Existing paid session -------------------------------------
         if let Some(token) = &session_token {
             match self.state.sessions.consume(token, policy).await {
-                SessionOutcome::Accepted { payer, remaining } => {
+                SessionOutcome::Accepted {
+                    payer,
+                    remaining,
+                    quota,
+                    expires_at,
+                } => {
                     metrics::counter!(m::SESSIONS, "event" => "accepted").increment(1);
                     metrics::counter!(
                         m::REQUESTS,
@@ -233,6 +273,12 @@ impl X402Auth {
                         session_token: None,
                         settlement: None,
                         pending: None,
+                        meter: Meter::Session {
+                            remaining,
+                            quota,
+                            expires_in_secs: expires_at
+                                .saturating_sub(crate::util::now_epoch_secs()),
+                        },
                     };
                 }
                 SessionOutcome::Rejected(reason) => {
@@ -266,6 +312,7 @@ impl X402Auth {
                         challenge,
                         // A payment WAS attempted; it just could not be parsed.
                         receipt: Some(self.state.facilitator.failure_receipt("invalid_payload")),
+                        meter: Meter::Unknown,
                     };
                 }
             };
@@ -316,6 +363,7 @@ impl X402Auth {
                     return Decision::Deny {
                         challenge,
                         receipt: Some(self.state.facilitator.failure_receipt(error.code())),
+                        meter: Meter::Unknown,
                     };
                 }
             }
@@ -353,6 +401,10 @@ impl X402Auth {
                                 payload,
                                 requirements,
                             })),
+                            // The session is minted on the response path once
+                            // settlement lands, so there is nothing to meter
+                            // yet. ext_proc fills this in after settling.
+                            meter: Meter::Unknown,
                         }
                     }
                     Err(e) => {
@@ -373,6 +425,7 @@ impl X402Auth {
                         Decision::Deny {
                             challenge,
                             receipt: Some(self.state.facilitator.failure_receipt(e.code())),
+                            meter: Meter::Unknown,
                         }
                     }
                 };
@@ -403,7 +456,17 @@ impl X402Auth {
                             None
                         }
                         Some(payer) => {
-                            match self.state.sessions.create_session(payer, policy).await {
+                            match self
+                                .state
+                                .sessions
+                                .create_session(
+                                    payer,
+                                    policy,
+                                    resolved.paid_tier.quota,
+                                    resolved.paid_tier.duration_secs,
+                                )
+                                .await
+                            {
                                 Ok(token) => Some(token),
                                 Err(e) => {
                                     tracing::error!(
@@ -424,8 +487,8 @@ impl X402Auth {
                     if let Some(token) = &token {
                         settlement.extensions = Some(x402::session_extension_grant(
                             token,
-                            self.state.config.paid_tier.quota,
-                            self.state.config.paid_tier.duration_secs,
+                            resolved.paid_tier.quota,
+                            resolved.paid_tier.duration_secs,
                         ));
                     }
 
@@ -445,12 +508,24 @@ impl X402Auth {
                         sessioned = token.is_some(),
                         "payment settled"
                     );
+                    // A brand-new session has spent nothing yet: this request is
+                    // covered by the payment itself, not by the quota.
+                    let meter = if token.is_some() {
+                        Meter::Session {
+                            remaining: resolved.paid_tier.quota,
+                            quota: resolved.paid_tier.quota,
+                            expires_in_secs: resolved.paid_tier.duration_secs,
+                        }
+                    } else {
+                        Meter::Unknown
+                    };
                     Decision::Allow {
                         tier: Tier::Paid,
                         payer: settlement.payer.clone(),
                         session_token: token,
                         settlement: Some(settlement),
                         pending: None,
+                        meter,
                     }
                 }
                 Err(e) => {
@@ -473,6 +548,7 @@ impl X402Auth {
                     Decision::Deny {
                         challenge,
                         receipt: Some(self.state.facilitator.failure_receipt(e.code())),
+                        meter: Meter::Unknown,
                     }
                 }
             };
@@ -494,10 +570,29 @@ impl X402Auth {
             return Decision::Deny {
                 challenge,
                 receipt: None,
+                meter: Meter::Unknown,
             };
         };
 
-        if self.state.limiter.check(ip).await {
+        // Buckets are scoped to the resolved policy label, so a free allowance
+        // spent on one route is not also spent on an unrelated one.
+        let allowance = self
+            .state
+            .limiter
+            .check(
+                &resolved.label,
+                ip,
+                resolved.free_tier.max_requests,
+                resolved.free_tier.window_secs,
+            )
+            .await;
+        let meter = Meter::Free {
+            remaining: allowance.remaining,
+            limit: allowance.limit,
+            reset_secs: allowance.reset_secs,
+        };
+
+        if allowance.allowed {
             metrics::counter!(m::RATE_LIMIT, "outcome" => "allowed").increment(1);
             metrics::counter!(
                 m::REQUESTS,
@@ -512,6 +607,7 @@ impl X402Auth {
                 session_token: None,
                 settlement: None,
                 pending: None,
+                meter,
             }
         } else {
             metrics::counter!(m::RATE_LIMIT, "outcome" => "denied").increment(1);
@@ -532,7 +628,51 @@ impl X402Auth {
             Decision::Deny {
                 challenge,
                 receipt: None,
+                meter,
             }
+        }
+    }
+}
+
+/// Response headers publishing what the requester has left.
+///
+/// Deliberately `x-x402-` rather than the conventional `x-ratelimit-*`: these
+/// describe *two* meters that swap places when a payment lands, and reusing the
+/// standard names for a purchased quota would misreport a session as an
+/// anonymous rate limit.
+pub const HEADER_FREE_REMAINING: &str = "x-x402-free-remaining";
+pub const HEADER_FREE_LIMIT: &str = "x-x402-free-limit";
+pub const HEADER_FREE_RESET: &str = "x-x402-free-reset";
+pub const HEADER_SESSION_REMAINING: &str = "x-x402-session-remaining";
+pub const HEADER_SESSION_QUOTA: &str = "x-x402-session-quota";
+pub const HEADER_SESSION_EXPIRES: &str = "x-x402-session-expires";
+
+impl Meter {
+    /// Render as `(name, value)` pairs for the response.
+    ///
+    /// [`Meter::Unknown`] yields nothing rather than zeros: a client must be
+    /// able to tell "no allowance left" from "no allowance was measured".
+    pub fn headers(&self) -> Vec<(&'static str, String)> {
+        match self {
+            Meter::Free {
+                remaining,
+                limit,
+                reset_secs,
+            } => vec![
+                (HEADER_FREE_REMAINING, remaining.to_string()),
+                (HEADER_FREE_LIMIT, limit.to_string()),
+                (HEADER_FREE_RESET, reset_secs.to_string()),
+            ],
+            Meter::Session {
+                remaining,
+                quota,
+                expires_in_secs,
+            } => vec![
+                (HEADER_SESSION_REMAINING, remaining.to_string()),
+                (HEADER_SESSION_QUOTA, quota.to_string()),
+                (HEADER_SESSION_EXPIRES, expires_in_secs.to_string()),
+            ],
+            Meter::Unknown => Vec::new(),
         }
     }
 }
@@ -571,6 +711,7 @@ pub fn decision_to_response(
             payer,
             session_token,
             settlement,
+            meter,
             ..
         } => {
             let mut ok = OkHttpResponseBuilder::new();
@@ -615,13 +756,23 @@ pub fn decision_to_response(
                 );
             }
 
+            // Publish what is left, so a client can render a meter instead of
+            // discovering the wall by hitting it.
+            for (name, value) in meter.headers() {
+                ok.add_response_header(name, value, Some(AUTHORITATIVE_APPEND), false);
+            }
+
             let mut response = CheckResponse::with_status(Status::ok(""));
             response.set_http_response(ok);
             response.set_dynamic_metadata(Some(rate_limit_metadata(tier, payer, client_ip)));
             response
         }
 
-        Decision::Deny { challenge, receipt } => {
+        Decision::Deny {
+            challenge,
+            receipt,
+            meter,
+        } => {
             let mut denied = DeniedHttpResponseBuilder::new();
 
             // A refused payment reports its outcome exactly like a successful
@@ -648,6 +799,12 @@ pub fn decision_to_response(
             };
             if let Some(encoded) = &encoded {
                 denied.add_header(HEADER_PAYMENT_REQUIRED, encoded.clone(), None, false);
+            }
+
+            // A 402 carries the meter too: the useful part of "you are out" is
+            // when it comes back.
+            for (name, value) in meter.headers() {
+                denied.add_header(name, value, None, false);
             }
 
             if grpc {
@@ -907,13 +1064,23 @@ impl Authorization for X402Auth {
 pub mod test_support {
     use super::*;
     use crate::config::{
-        FreeTierConfig, PaidTierConfig, PaymentConfig, StoreConfig, VerificationMode,
+        FreeTierConfig, PaidTierConfig, PaymentConfig, PaymentOverride, StoreConfig,
+        VerificationMode,
     };
     use crate::ratelimit::{MemoryRateLimiter, RateLimiter};
     use crate::session::{MemorySessionStore, SessionStore};
 
-    /// An in-memory `AppState` in stub mode, with the given tier limits.
+    /// An in-memory `AppState` in stub mode, with the given global tier limits.
     pub fn app_state(free_limit: u64, quota: u64) -> Arc<AppState> {
+        app_state_with_policies(free_limit, quota, Default::default())
+    }
+
+    /// As [`app_state`], with named policies layered over the global tiers.
+    pub fn app_state_with_policies(
+        free_limit: u64,
+        quota: u64,
+        policies: std::collections::HashMap<String, PaymentOverride>,
+    ) -> Arc<AppState> {
         let config = Config {
             listen_addr: "127.0.0.1:50051".parse().unwrap(),
             metrics_listen_addr: None,
@@ -931,7 +1098,7 @@ pub mod test_support {
                 description: "test".into(),
                 gas_station: None,
             },
-            policies: std::collections::HashMap::new(),
+            policies,
             routes: Vec::new(),
             free_tier: FreeTierConfig {
                 max_requests: free_limit,
@@ -955,12 +1122,8 @@ pub mod test_support {
         let sessions = Arc::new(SessionStore::Memory(MemorySessionStore::new(
             config.hmac_key().unwrap(),
             config.paid_tier.duration_secs,
-            config.paid_tier.quota,
         )));
-        let limiter = RateLimiter::Memory(MemoryRateLimiter::new(
-            config.free_tier.max_requests,
-            config.free_tier.window_secs,
-        ));
+        let limiter = RateLimiter::Memory(MemoryRateLimiter::new());
         Arc::new(AppState {
             config,
             sessions,
@@ -1053,6 +1216,221 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// Drive one anonymous request and return the meter it reported.
+    async fn free_meter(a: &X402Auth, policy: Option<&str>) -> Meter {
+        let map = headers(&[]);
+        match a
+            .decide(
+                &HeaderView::new(Some(&map)),
+                ip(),
+                PATH,
+                policy,
+                RESOURCE_URL,
+                SettlePolicy::Immediate,
+            )
+            .await
+        {
+            Decision::Allow { meter, .. } | Decision::Deny { meter, .. } => meter,
+        }
+    }
+
+    #[tokio::test]
+    async fn the_free_meter_counts_down_and_survives_the_wall() {
+        // This is what the client renders. If it disagrees with the limiter,
+        // the page shows requests that are not there — or hides ones that are.
+        let a = auth(3, 10);
+
+        for expected in [2, 1, 0] {
+            assert!(
+                matches!(
+                    free_meter(&a, None).await,
+                    Meter::Free { remaining, limit: 3, .. } if remaining == expected
+                ),
+                "expected {expected} remaining"
+            );
+        }
+
+        // The 402 still carries a meter: "none left" is only useful alongside
+        // when it comes back.
+        assert!(matches!(
+            free_meter(&a, None).await,
+            Meter::Free {
+                remaining: 0,
+                limit: 3,
+                reset_secs
+            } if reset_secs > 0
+        ));
+    }
+
+    /// Two policies at the same gateway selling different amounts of access:
+    /// `cheap` gives away 2 requests a minute, `pricey` gives away nothing.
+    fn tiered_auth() -> X402Auth {
+        use crate::config::{FreeTierConfig, PaidTierConfig, PaymentOverride};
+        let mut policies = std::collections::HashMap::new();
+        policies.insert(
+            "cheap".to_string(),
+            PaymentOverride {
+                amount: Some("10".into()),
+                free_tier: Some(FreeTierConfig {
+                    max_requests: 2,
+                    window_secs: 60,
+                }),
+                paid_tier: Some(PaidTierConfig {
+                    quota: 500,
+                    duration_secs: 600,
+                }),
+                ..Default::default()
+            },
+        );
+        policies.insert(
+            "pricey".to_string(),
+            PaymentOverride {
+                amount: Some("5000".into()),
+                free_tier: Some(FreeTierConfig {
+                    max_requests: 0,
+                    window_secs: 60,
+                }),
+                ..Default::default()
+            },
+        );
+        // Global tiers are deliberately different from both, so a test that
+        // passes by accidentally reading the global value fails here.
+        X402Auth::new(test_support::app_state_with_policies(9, 77, policies))
+    }
+
+    #[tokio::test]
+    async fn each_policy_meters_its_own_free_allowance() {
+        let a = tiered_auth();
+
+        // `cheap` gives away exactly 2.
+        assert!(matches!(
+            free_meter(&a, Some("cheap")).await,
+            Meter::Free {
+                remaining: 1,
+                limit: 2,
+                ..
+            }
+        ));
+        assert!(matches!(
+            free_meter(&a, Some("cheap")).await,
+            Meter::Free {
+                remaining: 0,
+                limit: 2,
+                ..
+            }
+        ));
+
+        // `pricey` gives away nothing, and — critically — spending `cheap`'s
+        // allowance did not touch it. Without per-policy buckets these two
+        // would share one counter.
+        assert!(matches!(
+            free_meter(&a, Some("pricey")).await,
+            Meter::Free {
+                remaining: 0,
+                limit: 0,
+                ..
+            }
+        ));
+
+        // And an unnamed route still falls back to the global tier, untouched
+        // by either of the above.
+        assert!(matches!(
+            free_meter(&a, None).await,
+            Meter::Free {
+                remaining: 8,
+                limit: 9,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_challenge_advertises_the_session_its_own_policy_sells() {
+        let a = tiered_auth();
+        let map = headers(&[]);
+
+        // `pricey` has no free allowance, so the first request is challenged.
+        let Decision::Deny { challenge, .. } = a
+            .decide(
+                &HeaderView::new(Some(&map)),
+                ip(),
+                PATH,
+                Some("pricey"),
+                RESOURCE_URL,
+                SettlePolicy::Immediate,
+            )
+            .await
+        else {
+            panic!("a policy with no free tier must challenge immediately");
+        };
+
+        assert_eq!(challenge.accepts[0].amount, "5000");
+        // `pricey` sets no paid_tier, so it inherits the global one.
+        let advertised = &challenge.extensions.as_ref().unwrap()
+            [crate::x402::SESSION_EXTENSION]["info"];
+        assert_eq!(advertised["quota"], 77);
+
+        // `cheap` overrides it, and must advertise its own numbers.
+        for _ in 0..2 {
+            free_meter(&a, Some("cheap")).await;
+        }
+        let Decision::Deny { challenge, .. } = a
+            .decide(
+                &HeaderView::new(Some(&map)),
+                ip(),
+                PATH,
+                Some("cheap"),
+                RESOURCE_URL,
+                SettlePolicy::Immediate,
+            )
+            .await
+        else {
+            panic!("cheap's free tier should be spent by now");
+        };
+        assert_eq!(challenge.accepts[0].amount, "10");
+        let advertised = &challenge.extensions.as_ref().unwrap()
+            [crate::x402::SESSION_EXTENSION]["info"];
+        assert_eq!(advertised["quota"], 500);
+        assert_eq!(advertised["durationSeconds"], 600);
+    }
+
+    #[tokio::test]
+    async fn a_meter_renders_only_the_headers_for_its_own_tier() {
+        // A client must be able to tell "no allowance left" from "no allowance
+        // was measured", so Unknown emits nothing rather than zeros.
+        let free = Meter::Free {
+            remaining: 4,
+            limit: 5,
+            reset_secs: 12,
+        }
+        .headers();
+        assert_eq!(
+            free,
+            vec![
+                (HEADER_FREE_REMAINING, "4".to_string()),
+                (HEADER_FREE_LIMIT, "5".to_string()),
+                (HEADER_FREE_RESET, "12".to_string()),
+            ]
+        );
+
+        let session = Meter::Session {
+            remaining: 994,
+            quota: 1000,
+            expires_in_secs: 3492,
+        }
+        .headers();
+        assert_eq!(
+            session,
+            vec![
+                (HEADER_SESSION_REMAINING, "994".to_string()),
+                (HEADER_SESSION_QUOTA, "1000".to_string()),
+                (HEADER_SESSION_EXPIRES, "3492".to_string()),
+            ]
+        );
+
+        assert!(Meter::Unknown.headers().is_empty());
     }
 
     #[tokio::test]
@@ -1368,7 +1746,8 @@ mod tests {
                     SettlePolicy::Immediate
                 )
                 .await,
-                Decision::Deny { .. }
+                Decision::Deny {
+                .. }
             ),
             "a session must not cross policies"
         );
@@ -1551,6 +1930,7 @@ mod tests {
         };
         let response = decision_to_response(
             Decision::Deny {
+                meter: Meter::Unknown,
                 challenge,
                 receipt: Some(receipt),
             },
@@ -1714,6 +2094,7 @@ mod tests {
     fn tier_and_payer_headers_overwrite_client_supplied_values() {
         // The core anti-self-promotion property.
         let ok = ok_response(Decision::Allow {
+            meter: Meter::Unknown,
             tier: Tier::Paid,
             payer: Some(PAYER.into()),
             session_token: None,
@@ -1746,6 +2127,7 @@ mod tests {
     #[test]
     fn client_payment_headers_are_stripped_before_the_backend() {
         let ok = ok_response(Decision::Allow {
+            meter: Meter::Unknown,
             tier: Tier::Free,
             payer: None,
             session_token: None,
@@ -1767,6 +2149,7 @@ mod tests {
     #[test]
     fn new_session_is_returned_to_the_client_as_a_response_header() {
         let ok = ok_response(Decision::Allow {
+            meter: Meter::Unknown,
             tier: Tier::Paid,
             payer: Some(PAYER.into()),
             session_token: Some("token-value".into()),
@@ -1796,6 +2179,7 @@ mod tests {
         let challenge = PaymentRequired::new("nope", test_resource(), vec![]);
         let response = decision_to_response(
             Decision::Deny {
+                meter: Meter::Unknown,
                 challenge,
                 receipt: None,
             },
@@ -1831,6 +2215,7 @@ mod tests {
         let challenge = PaymentRequired::new("free tier exhausted", test_resource(), vec![]);
         let response = decision_to_response(
             Decision::Deny {
+                meter: Meter::Unknown,
                 challenge,
                 receipt: None,
             },
@@ -1878,6 +2263,7 @@ mod tests {
         let challenge = PaymentRequired::new("nope", test_resource(), vec![]);
         let response = decision_to_response(
             Decision::Deny {
+                meter: Meter::Unknown,
                 challenge,
                 receipt: None,
             },
@@ -1938,6 +2324,7 @@ mod tests {
     fn allow_sets_rate_limit_metadata_for_envoy_descriptors() {
         let response = decision_to_response(
             Decision::Allow {
+                meter: Meter::Unknown,
                 tier: Tier::Paid,
                 payer: Some(PAYER.into()),
                 session_token: None,

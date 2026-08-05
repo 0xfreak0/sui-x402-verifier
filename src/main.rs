@@ -97,35 +97,24 @@ async fn main() -> Result<()> {
                  sessions are replica-affine. Use 'redis' to scale out."
             );
             (
+                // Tiers are per policy and passed per request; the store only
+                // needs a horizon for sweeping the replay cache.
                 SessionStore::Memory(MemorySessionStore::new(
                     hmac_key,
                     config.paid_tier.duration_secs,
-                    config.paid_tier.quota,
                 )),
-                RateLimiter::Memory(MemoryRateLimiter::new(
-                    config.free_tier.max_requests,
-                    config.free_tier.window_secs,
-                )),
+                RateLimiter::Memory(MemoryRateLimiter::new()),
             )
         }
         StoreBackend::Redis => {
             let url = &config.store.redis_url;
             tracing::info!(redis_url = %url, "connecting to redis state store");
-            let sessions = RedisSessionStore::connect(
-                url,
-                hmac_key,
-                config.paid_tier.duration_secs,
-                config.paid_tier.quota,
-            )
-            .await
-            .with_context(|| format!("connecting to redis at {url}"))?;
-            let limiter = RedisRateLimiter::connect(
-                url,
-                config.free_tier.max_requests,
-                config.free_tier.window_secs,
-            )
-            .await
-            .with_context(|| format!("connecting to redis at {url}"))?;
+            let sessions = RedisSessionStore::connect(url, hmac_key)
+                .await
+                .with_context(|| format!("connecting to redis at {url}"))?;
+            let limiter = RedisRateLimiter::connect(url)
+                .await
+                .with_context(|| format!("connecting to redis at {url}"))?;
             (SessionStore::Redis(sessions), RateLimiter::Redis(limiter))
         }
     };
@@ -160,6 +149,9 @@ async fn main() -> Result<()> {
     // gateway and again through /settle.
     let sessions = Arc::new(sessions);
 
+    // The §7 API reads the policy table; the gateway owns the config itself.
+    let api_config = Arc::new(config.clone());
+
     let state = Arc::new(AppState {
         config,
         sessions: Arc::clone(&sessions),
@@ -168,10 +160,14 @@ async fn main() -> Result<()> {
     });
 
     if let Some(addr) = facilitator_api_addr {
-        let router = facilitator_api::router(Arc::clone(&facilitator), Arc::clone(&sessions));
+        let router = facilitator_api::router(
+            Arc::clone(&facilitator),
+            Arc::clone(&sessions),
+            api_config,
+        );
         tracing::info!(
             %addr,
-            "serving the x402 facilitator HTTP API (POST /verify, POST /settle, GET /supported)"
+            "serving the x402 facilitator HTTP API (POST /verify, POST /settle, GET /supported, GET /policies)"
         );
         tokio::spawn(async move {
             match tokio::net::TcpListener::bind(addr).await {

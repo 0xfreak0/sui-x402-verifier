@@ -18,6 +18,22 @@ pub const ENV_HMAC_SECRET: &str = "X402_SESSION_HMAC_SECRET";
 /// Exists so no real receiving wallet ever needs to live in a committed config.
 pub const ENV_PAY_TO: &str = "X402_PAY_TO";
 
+/// Prefix for per-policy receiving-wallet overrides: `X402_PAY_TO_<POLICY>`,
+/// with the policy name upper-cased and `-` mapped to `_`.
+///
+/// The whole point of per-policy `pay_to` is that different routes credit
+/// different wallets, so one [`ENV_PAY_TO`] is not enough to keep real
+/// addresses out of a committed config once there is more than one payee.
+pub const ENV_PAY_TO_PREFIX: &str = "X402_PAY_TO_";
+
+/// Environment-variable name carrying the receiving wallet for `policy`.
+pub fn pay_to_env_var(policy: &str) -> String {
+    format!(
+        "{ENV_PAY_TO_PREFIX}{}",
+        policy.to_ascii_uppercase().replace('-', "_")
+    )
+}
+
 /// Length of a Sui address in hex characters (32 bytes).
 const SUI_ADDRESS_HEX_LEN: usize = 64;
 
@@ -84,8 +100,14 @@ pub struct PaymentConfig {
 /// `CheckRequest.attributes.context_extensions`.
 pub const POLICY_CONTEXT_KEY: &str = "x402_policy";
 
-/// Payment terms that differ from the defaults. Every field is optional and
-/// falls back to the corresponding `payment` value when unset.
+/// Payment terms *and tier limits* that differ from the defaults. Every field is
+/// optional and falls back to the corresponding top-level value when unset.
+///
+/// Tiers are overridable per policy because price alone does not describe what a
+/// route sells. A cheap read endpoint might give away 20 requests a minute and
+/// sell 1000 more; an expensive one might give away nothing and sell 50. Those
+/// are different products at the same gateway, and one global `free_tier` cannot
+/// express that.
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct PaymentOverride {
@@ -98,19 +120,31 @@ pub struct PaymentOverride {
     /// Description surfaced in the challenge.
     #[serde(default)]
     pub description: Option<String>,
+    /// Anonymous allowance for this policy. Unset inherits the global tier.
+    #[serde(default)]
+    pub free_tier: Option<FreeTierConfig>,
+    /// What one payment buys on this policy. Unset inherits the global tier.
+    #[serde(default)]
+    pub paid_tier: Option<PaidTierConfig>,
 }
 
 impl PaymentOverride {
     /// Layer this override onto resolved terms.
-    fn apply_to(&self, payment: &mut PaymentConfig) {
+    fn apply_to(&self, resolved: &mut ResolvedPolicy) {
         if let Some(pay_to) = &self.pay_to {
-            payment.pay_to = pay_to.clone();
+            resolved.payment.pay_to = pay_to.clone();
         }
         if let Some(amount) = &self.amount {
-            payment.amount = amount.clone();
+            resolved.payment.amount = amount.clone();
         }
         if let Some(description) = &self.description {
-            payment.description = description.clone();
+            resolved.payment.description = description.clone();
+        }
+        if let Some(free_tier) = &self.free_tier {
+            resolved.free_tier = free_tier.clone();
+        }
+        if let Some(paid_tier) = &self.paid_tier {
+            resolved.paid_tier = paid_tier.clone();
         }
     }
 
@@ -124,9 +158,34 @@ impl PaymentOverride {
         {
             bail!("{context}: amount must be a decimal integer string, got {amount:?}");
         }
+        if let Some(free_tier) = &self.free_tier {
+            free_tier.validate(&format!("{context} free_tier"))?;
+        }
+        if let Some(paid_tier) = &self.paid_tier {
+            paid_tier.validate(&format!("{context} paid_tier"))?;
+        }
         Ok(())
     }
 }
+
+/// Every tier and term decision for one request, with all fallbacks applied.
+///
+/// Resolved once per request and threaded through from there, so the free-tier
+/// check, the challenge, the session mint and the response headers cannot
+/// disagree about which policy is in force.
+#[derive(Debug, Clone)]
+pub struct ResolvedPolicy {
+    /// Stable name for this policy: the `policies` key, the matched
+    /// `path_prefix`, or [`DEFAULT_POLICY_LABEL`]. Used to scope rate-limit
+    /// buckets, so two policies never share a free-tier allowance.
+    pub label: String,
+    pub payment: PaymentConfig,
+    pub free_tier: FreeTierConfig,
+    pub paid_tier: PaidTierConfig,
+}
+
+/// Bucket and metric label for requests matching no named policy or prefix.
+pub const DEFAULT_POLICY_LABEL: &str = "default";
 
 /// Per-route override of the default payment terms.
 ///
@@ -150,10 +209,20 @@ pub struct RouteOverride {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FreeTierConfig {
-    /// Requests permitted per window, per source IP.
+    /// Requests permitted per window, per source IP. Zero means every request
+    /// is challenged; there is no free allowance at all.
     pub max_requests: u64,
     /// Sliding-window length in seconds.
     pub window_secs: u64,
+}
+
+impl FreeTierConfig {
+    fn validate(&self, context: &str) -> Result<()> {
+        if self.window_secs == 0 {
+            bail!("{context}: window_secs must be greater than zero");
+        }
+        Ok(())
+    }
 }
 
 /// Limits unlocked by a settled payment.
@@ -165,6 +234,18 @@ pub struct PaidTierConfig {
     /// Wall-clock lifetime of the session, in seconds. The session dies at
     /// whichever comes first: quota exhaustion or this deadline.
     pub duration_secs: u64,
+}
+
+impl PaidTierConfig {
+    fn validate(&self, context: &str) -> Result<()> {
+        if self.duration_secs == 0 {
+            bail!("{context}: duration_secs must be greater than zero");
+        }
+        if self.quota == 0 {
+            bail!("{context}: quota must be greater than zero");
+        }
+        Ok(())
+    }
 }
 
 /// Where session and rate-limit state lives.
@@ -302,6 +383,11 @@ impl Config {
         if let Ok(pay_to) = std::env::var(ENV_PAY_TO) {
             config.payment.pay_to = pay_to;
         }
+        for (name, policy) in config.policies.iter_mut() {
+            if let Ok(pay_to) = std::env::var(pay_to_env_var(name)) {
+                policy.pay_to = Some(pay_to);
+            }
+        }
 
         config.validate()?;
         Ok(config)
@@ -327,17 +413,8 @@ impl Config {
 
         validate_pay_to(&self.payment.pay_to)?;
 
-        if self.free_tier.window_secs == 0 {
-            bail!("free_tier.window_secs must be greater than zero");
-        }
-
-        if self.paid_tier.duration_secs == 0 {
-            bail!("paid_tier.duration_secs must be greater than zero");
-        }
-
-        if self.paid_tier.quota == 0 {
-            bail!("paid_tier.quota must be greater than zero");
-        }
+        self.free_tier.validate("free_tier")?;
+        self.paid_tier.validate("paid_tier")?;
 
         // Validate overrides with the same rules as the defaults, so a typo in
         // a wallet or price fails at boot rather than at payment time.
@@ -376,14 +453,20 @@ impl Config {
     ///
     /// An unknown policy name falls through to the lower tiers rather than
     /// failing the request; it is logged by the caller.
-    pub fn payment_for(&self, path: &str, policy: Option<&str>) -> PaymentConfig {
-        let mut payment = self.payment.clone();
+    pub fn policy_for(&self, path: &str, policy: Option<&str>) -> ResolvedPolicy {
+        let mut resolved = ResolvedPolicy {
+            label: DEFAULT_POLICY_LABEL.to_string(),
+            payment: self.payment.clone(),
+            free_tier: self.free_tier.clone(),
+            paid_tier: self.paid_tier.clone(),
+        };
 
-        if let Some(policy) = policy
-            && let Some(over) = self.policies.get(policy)
+        if let Some(name) = policy
+            && let Some(over) = self.policies.get(name)
         {
-            over.apply_to(&mut payment);
-            return payment;
+            over.apply_to(&mut resolved);
+            resolved.label = name.to_string();
+            return resolved;
         }
 
         if let Some(route) = self
@@ -392,11 +475,13 @@ impl Config {
             .filter(|r| path.starts_with(&r.path_prefix))
             .max_by_key(|r| r.path_prefix.len())
         {
-            route.overrides.apply_to(&mut payment);
+            route.overrides.apply_to(&mut resolved);
+            resolved.label = route.path_prefix.clone();
         }
 
-        payment
+        resolved
     }
+
 
     /// True when `policy` was supplied but matches no configured policy.
     pub fn is_unknown_policy(&self, policy: &str) -> bool {
@@ -570,7 +655,7 @@ routes:
     #[test]
     fn without_routes_every_path_uses_the_default_terms() {
         let config = parse(&base_yaml()).unwrap();
-        let terms = config.payment_for("/anything", None);
+        let terms = config.policy_for("/anything", None).payment;
         assert_eq!(terms.pay_to, TEST_PAY_TO);
         assert_eq!(terms.amount, "1000");
     }
@@ -581,12 +666,12 @@ routes:
 
         // "/sui.rpc.v2." is longer than "/", so it must win even though the
         // "/" rule is listed first.
-        let grpc = config.payment_for("/sui.rpc.v2.LedgerService/GetServiceInfo", None);
+        let grpc = config.policy_for("/sui.rpc.v2.LedgerService/GetServiceInfo", None).payment;
         assert_eq!(grpc.pay_to, format!("0x{}", "3".repeat(64)));
         assert_eq!(grpc.amount, "5000");
         assert_eq!(grpc.description, "gRPC calls");
 
-        let graphql = config.payment_for("/graphql", None);
+        let graphql = config.policy_for("/graphql", None).payment;
         assert_eq!(graphql.amount, "100");
         assert_eq!(graphql.description, "cheap default");
     }
@@ -595,9 +680,9 @@ routes:
     fn unset_route_fields_fall_back_to_the_defaults() {
         let config = parse(&routed_yaml()).unwrap();
         // The "/" rule sets no pay_to, so the default wallet applies.
-        assert_eq!(config.payment_for("/graphql", None).pay_to, TEST_PAY_TO);
+        assert_eq!(config.policy_for("/graphql", None).payment.pay_to, TEST_PAY_TO);
         // And unrelated fields are untouched.
-        assert_eq!(config.payment_for("/graphql", None).network, "sui:testnet");
+        assert_eq!(config.policy_for("/graphql", None).payment.network, "sui:testnet");
     }
 
     /// Base config plus named policies — the Envoy-driven mechanism, which
@@ -626,7 +711,7 @@ routes:
         let config = parse(&policy_yaml()).unwrap();
         // Path is deliberately unrelated: the policy name alone decides, which
         // is the point — Envoy already matched the route.
-        let terms = config.payment_for("/whatever", Some("grpc"));
+        let terms = config.policy_for("/whatever", Some("grpc")).payment;
         assert_eq!(terms.pay_to, format!("0x{}", "4".repeat(64)));
         assert_eq!(terms.amount, "5000");
     }
@@ -635,7 +720,7 @@ routes:
     fn a_named_policy_outranks_a_path_prefix_rule() {
         let config = parse(&policy_yaml()).unwrap();
         // "/graphql" matches the routes[] rule (77), but the policy wins (100).
-        let terms = config.payment_for("/graphql", Some("graphql"));
+        let terms = config.policy_for("/graphql", Some("graphql")).payment;
         assert_eq!(terms.amount, "100");
     }
 
@@ -644,7 +729,7 @@ routes:
         let config = parse(&policy_yaml()).unwrap();
         assert!(config.is_unknown_policy("typo"));
         // Falls through to the path-prefix rule rather than erroring.
-        let terms = config.payment_for("/graphql", Some("typo"));
+        let terms = config.policy_for("/graphql", Some("typo")).payment;
         assert_eq!(terms.amount, "77");
     }
 

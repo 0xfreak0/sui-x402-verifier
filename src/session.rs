@@ -33,6 +33,9 @@ pub struct Session {
     pub policy: Option<String>,
     /// Absolute expiry, seconds since the Unix epoch.
     pub expires_at: u64,
+    /// Requests this session was minted with. Kept alongside the live counter
+    /// so the meter has a denominator.
+    pub quota: u64,
     /// Requests still available. Atomic so concurrent requests on the same
     /// session can spend quota without a write lock on the map.
     pub quota_remaining: AtomicU64,
@@ -67,7 +70,13 @@ pub enum SessionOutcome {
     /// Accepted; one request was deducted.
     Accepted {
         payer: String,
+        /// Requests left after this one.
         remaining: u64,
+        /// Requests this session was minted with, so a client can render
+        /// "994 of 1000" without having kept the original grant.
+        quota: u64,
+        /// Absolute expiry, seconds since the Unix epoch.
+        expires_at: u64,
     },
     Rejected(SessionRejection),
 }
@@ -208,13 +217,14 @@ pub enum PaymentClaim {
 ///   -1 → session exists but quota is spent
 const SPEND_SCRIPT: &str = r#"
 local payer = redis.call('HGET', KEYS[1], 'payer')
-if not payer then return {-2, '', ''} end
+if not payer then return {-2, '', 0} end
 local policy = redis.call('HGET', KEYS[1], 'policy') or ''
-if policy ~= ARGV[1] then return {-3, payer, policy} end
+if policy ~= ARGV[1] then return {-3, payer, 0} end
 local quota = tonumber(redis.call('HGET', KEYS[1], 'quota'))
-if quota == nil or quota <= 0 then return {-1, payer, policy} end
+if quota == nil or quota <= 0 then return {-1, payer, 0} end
 redis.call('HINCRBY', KEYS[1], 'quota', -1)
-return {quota - 1, payer, policy}
+local granted = tonumber(redis.call('HGET', KEYS[1], 'granted')) or quota
+return {quota - 1, payer, granted}
 "#;
 
 /// In-memory store of live paid sessions.
@@ -227,18 +237,23 @@ pub struct MemorySessionStore {
     /// Payment id -> first-seen Unix timestamp. See [`PaymentClaim`].
     seen_payments: DashMap<String, u64>,
     codec: TokenCodec,
-    ttl_secs: u64,
-    quota: u64,
+    /// How long a replay record is swept for.
+    ///
+    /// Sessions expire per session (each carries its own deadline, since each
+    /// policy grants a different lifetime); this bounds only the replay map.
+    /// It must comfortably exceed the per-payment claim TTL that
+    /// `auth::replay_ttl` computes, or a claim would be swept while still live
+    /// and the payment would become replayable.
+    replay_retention_secs: u64,
 }
 
 impl MemorySessionStore {
-    pub fn new(hmac_key: Vec<u8>, ttl_secs: u64, quota: u64) -> Self {
+    pub fn new(hmac_key: Vec<u8>, replay_retention_secs: u64) -> Self {
         Self {
             sessions: DashMap::new(),
             seen_payments: DashMap::new(),
             codec: TokenCodec::new(hmac_key),
-            ttl_secs,
-            quota,
+            replay_retention_secs,
         }
     }
 
@@ -254,15 +269,32 @@ impl MemorySessionStore {
         self.sessions.is_empty()
     }
 
-    /// Mint a session for `payer` under `policy`.
-    pub fn create_session(&self, payer: &str, policy: Option<&str>) -> String {
-        self.create_session_at(payer, policy, now_epoch_secs())
+    /// Mint a session for `payer` under `policy`, granting `quota` requests for
+    /// `ttl_secs`.
+    ///
+    /// The grant is per call rather than per store because each policy sells a
+    /// different amount of access — see [`crate::config::PaymentOverride`].
+    pub fn create_session(
+        &self,
+        payer: &str,
+        policy: Option<&str>,
+        quota: u64,
+        ttl_secs: u64,
+    ) -> String {
+        self.create_session_at(payer, policy, quota, ttl_secs, now_epoch_secs())
     }
 
     /// Clock-injected variant so tests can drive expiry deterministically.
-    fn create_session_at(&self, payer: &str, policy: Option<&str>, now: u64) -> String {
+    fn create_session_at(
+        &self,
+        payer: &str,
+        policy: Option<&str>,
+        quota: u64,
+        ttl_secs: u64,
+        now: u64,
+    ) -> String {
         let session_id = new_session_id();
-        let expires_at = now.saturating_add(self.ttl_secs);
+        let expires_at = now.saturating_add(ttl_secs);
 
         self.sessions.insert(
             session_id.clone(),
@@ -270,7 +302,8 @@ impl MemorySessionStore {
                 payer: payer.to_string(),
                 policy: policy.map(str::to_string),
                 expires_at,
-                quota_remaining: AtomicU64::new(self.quota),
+                quota,
+                quota_remaining: AtomicU64::new(quota),
             },
         );
 
@@ -311,6 +344,8 @@ impl MemorySessionStore {
             Some(remaining) => SessionOutcome::Accepted {
                 payer: session.payer.clone(),
                 remaining,
+                quota: session.quota,
+                expires_at: session.expires_at,
             },
             None => SessionOutcome::Rejected(SessionRejection::QuotaExhausted),
         }
@@ -356,7 +391,7 @@ impl MemorySessionStore {
         // Replay records are bounded by the same sweep; without this the map
         // grows once per distinct payment forever.
         self.seen_payments
-            .retain(|_, first_seen| now.saturating_sub(*first_seen) < self.ttl_secs);
+            .retain(|_, first_seen| now.saturating_sub(*first_seen) < self.replay_retention_secs);
 
         reaped
     }
@@ -394,8 +429,6 @@ fn spend_one(counter: &AtomicU64) -> Option<u64> {
 pub struct RedisSessionStore {
     conn: redis::aio::ConnectionManager,
     codec: TokenCodec,
-    ttl_secs: u64,
-    quota: u64,
 }
 
 impl RedisSessionStore {
@@ -403,19 +436,12 @@ impl RedisSessionStore {
     ///
     /// `ConnectionManager` reconnects transparently, so a Redis blip degrades
     /// to failed operations rather than a permanently broken service.
-    pub async fn connect(
-        url: &str,
-        hmac_key: Vec<u8>,
-        ttl_secs: u64,
-        quota: u64,
-    ) -> Result<Self, StoreError> {
+    pub async fn connect(url: &str, hmac_key: Vec<u8>) -> Result<Self, StoreError> {
         let client = redis::Client::open(url)?;
         let conn = redis::aio::ConnectionManager::new(client).await?;
         Ok(Self {
             conn,
             codec: TokenCodec::new(hmac_key),
-            ttl_secs,
-            quota,
         })
     }
 
@@ -447,23 +473,30 @@ impl RedisSessionStore {
         &self,
         payer: &str,
         policy: Option<&str>,
+        quota: u64,
+        ttl_secs: u64,
     ) -> Result<String, StoreError> {
         let session_id = new_session_id();
-        let expires_at = now_epoch_secs().saturating_add(self.ttl_secs);
+        let expires_at = now_epoch_secs().saturating_add(ttl_secs);
         let key = Self::key(&session_id);
 
         let mut conn = self.conn.clone();
         // Pipelined and atomic so a crash cannot leave a session with a payer
         // but no quota, or with no expiry at all.
+        //
+        // `quota` is decremented by SPEND_SCRIPT; `granted` is the immutable
+        // denominator the meter divides by.
         redis::pipe()
             .atomic()
             .hset(&key, "payer", payer)
             .ignore()
-            .hset(&key, "quota", self.quota)
+            .hset(&key, "quota", quota)
+            .ignore()
+            .hset(&key, "granted", quota)
             .ignore()
             .hset(&key, "policy", policy.unwrap_or_default())
             .ignore()
-            .expire(&key, self.ttl_secs as i64)
+            .expire(&key, ttl_secs as i64)
             .ignore()
             .query_async::<()>(&mut conn)
             .await?;
@@ -492,7 +525,7 @@ impl RedisSessionStore {
         };
 
         let mut conn = self.conn.clone();
-        let result: Result<(i64, String, String), _> = redis::Script::new(SPEND_SCRIPT)
+        let result: Result<(i64, String, u64), _> = redis::Script::new(SPEND_SCRIPT)
             .key(Self::key(&claims.session_id))
             .arg(policy.unwrap_or_default())
             .invoke_async(&mut conn)
@@ -502,9 +535,14 @@ impl RedisSessionStore {
             Ok((-2, _, _)) => SessionOutcome::Rejected(SessionRejection::Unknown),
             Ok((-3, _, _)) => SessionOutcome::Rejected(SessionRejection::WrongPolicy),
             Ok((-1, _, _)) => SessionOutcome::Rejected(SessionRejection::QuotaExhausted),
-            Ok((remaining, payer, _)) => SessionOutcome::Accepted {
+            Ok((remaining, payer, quota)) => SessionOutcome::Accepted {
                 payer,
                 remaining: remaining.max(0) as u64,
+                quota,
+                // Redis holds no expiry field of its own — the key's TTL is the
+                // real deadline. The token's copy is HMAC-authenticated and was
+                // minted from that same TTL, so it is the trustworthy readback.
+                expires_at: claims.expires_at,
             },
             Err(e) => {
                 // Fail closed: an unreachable Redis must not grant paid access.
@@ -526,15 +564,17 @@ pub enum SessionStore {
 }
 
 impl SessionStore {
-    /// Mint a session for `payer`.
+    /// Mint a session for `payer`, granting `quota` requests for `ttl_secs`.
     pub async fn create_session(
         &self,
         payer: &str,
         policy: Option<&str>,
+        quota: u64,
+        ttl_secs: u64,
     ) -> Result<String, StoreError> {
         match self {
-            SessionStore::Memory(s) => Ok(s.create_session(payer, policy)),
-            SessionStore::Redis(s) => s.create_session(payer, policy).await,
+            SessionStore::Memory(s) => Ok(s.create_session(payer, policy, quota, ttl_secs)),
+            SessionStore::Redis(s) => s.create_session(payer, policy, quota, ttl_secs).await,
         }
     }
 
@@ -604,17 +644,53 @@ mod tests {
     const PAYER: &str = "0xdeadbeef";
     const NOW: u64 = 1_700_000_000;
 
-    fn store(ttl: u64, quota: u64) -> MemorySessionStore {
-        MemorySessionStore::new(vec![7u8; 32], ttl, quota)
+    /// A store bundled with the grant its sessions are minted with.
+    ///
+    /// Quota and TTL moved from the store to the mint call (each policy sells a
+    /// different amount of access), but every test here wants one fixed grant,
+    /// so this keeps that in one place. `Deref` exposes the real store, so only
+    /// minting needs the wrapper.
+    struct TestStore {
+        inner: MemorySessionStore,
+        ttl: u64,
+        quota: u64,
+    }
+
+    impl std::ops::Deref for TestStore {
+        type Target = MemorySessionStore;
+        fn deref(&self) -> &Self::Target {
+            &self.inner
+        }
+    }
+
+    impl TestStore {
+        fn mint(&self, payer: &str, policy: Option<&str>, now: u64) -> String {
+            self.inner
+                .create_session_at(payer, policy, self.quota, self.ttl, now)
+        }
+    }
+
+    fn store(ttl: u64, quota: u64) -> TestStore {
+        store_with_key(vec![7u8; 32], ttl, quota)
+    }
+
+    /// Same, with an explicit HMAC key — used to prove a token minted under one
+    /// key is not honoured under another.
+    fn store_with_key(hmac_key: Vec<u8>, ttl: u64, quota: u64) -> TestStore {
+        TestStore {
+            inner: MemorySessionStore::new(hmac_key, ttl),
+            ttl,
+            quota,
+        }
     }
 
     #[test]
     fn issued_token_is_accepted_and_spends_quota() {
         let s = store(3600, 3);
-        let token = s.create_session_at(PAYER, None, NOW);
+        let token = s.mint(PAYER, None, NOW);
 
         match s.consume_at(&token, None, NOW + 1) {
-            SessionOutcome::Accepted { payer, remaining } => {
+            SessionOutcome::Accepted { payer, remaining, .. } => {
                 assert_eq!(payer, PAYER);
                 assert_eq!(remaining, 2);
             }
@@ -625,7 +701,7 @@ mod tests {
     #[test]
     fn quota_is_exhausted_after_the_configured_number_of_requests() {
         let s = store(3600, 2);
-        let token = s.create_session_at(PAYER, None, NOW);
+        let token = s.mint(PAYER, None, NOW);
 
         assert!(matches!(
             s.consume_at(&token, None, NOW),
@@ -644,7 +720,7 @@ mod tests {
     #[test]
     fn tampering_with_any_field_invalidates_the_token() {
         let s = store(3600, 5);
-        let token = s.create_session_at(PAYER, None, NOW);
+        let token = s.mint(PAYER, None, NOW);
         let parts: Vec<&str> = token.split(':').collect();
 
         // Extend the deadline.
@@ -672,10 +748,10 @@ mod tests {
     #[test]
     fn token_signed_with_a_different_key_is_rejected() {
         let issuer = store(3600, 5);
-        let token = issuer.create_session_at(PAYER, None, NOW);
+        let token = issuer.mint(PAYER, None, NOW);
 
         // Same session id exists here, but the key differs.
-        let other = MemorySessionStore::new(vec![9u8; 32], 3600, 5);
+        let other = store_with_key(vec![9u8; 32], 3600, 5);
         assert_eq!(
             other.consume_at(&token, None, NOW),
             SessionOutcome::Rejected(SessionRejection::Malformed)
@@ -703,7 +779,7 @@ mod tests {
     #[test]
     fn expired_token_is_rejected() {
         let s = store(60, 5);
-        let token = s.create_session_at(PAYER, None, NOW);
+        let token = s.mint(PAYER, None, NOW);
         assert_eq!(
             s.consume_at(&token, None, NOW + 61),
             SessionOutcome::Rejected(SessionRejection::Expired)
@@ -714,7 +790,7 @@ mod tests {
     fn authentic_token_for_a_forgotten_session_is_unknown_not_accepted() {
         // Models a process restart: the MAC still verifies, but state is gone.
         let s = store(3600, 5);
-        let token = s.create_session_at(PAYER, None, NOW);
+        let token = s.mint(PAYER, None, NOW);
         let session_id = token.split(':').nth(2).unwrap().to_string();
         s.sessions.remove(&session_id);
 
@@ -727,8 +803,8 @@ mod tests {
     #[test]
     fn cleanup_reaps_only_expired_sessions() {
         let s = store(60, 5);
-        s.create_session_at("0xold", None, NOW);
-        s.create_session_at("0xnew", None, NOW + 100);
+        s.mint("0xold", None, NOW);
+        s.mint("0xnew", None, NOW + 100);
         assert_eq!(s.len(), 2);
 
         let reaped = s.cleanup_expired_at(NOW + 61);
@@ -743,7 +819,7 @@ mod tests {
         const THREADS: usize = 8;
 
         let s = Arc::new(store(3600, QUOTA));
-        let token = Arc::new(s.create_session_at(PAYER, None, NOW));
+        let token = Arc::new(s.mint(PAYER, None, NOW));
 
         let handles: Vec<_> = (0..THREADS)
             .map(|_| {
@@ -779,13 +855,37 @@ mod tests {
         std::env::var("X402_TEST_REDIS_URL").ok()
     }
 
-    async fn redis_store(ttl: u64, quota: u64) -> Option<RedisSessionStore> {
+    /// Redis counterpart of [`TestStore`].
+    struct RedisTestStore {
+        inner: RedisSessionStore,
+        ttl: u64,
+        quota: u64,
+    }
+
+    impl std::ops::Deref for RedisTestStore {
+        type Target = RedisSessionStore;
+        fn deref(&self) -> &Self::Target {
+            &self.inner
+        }
+    }
+
+    impl RedisTestStore {
+        async fn mint(&self, payer: &str, policy: Option<&str>) -> Result<String, StoreError> {
+            self.inner
+                .create_session(payer, policy, self.quota, self.ttl)
+                .await
+        }
+    }
+
+    async fn redis_store(ttl: u64, quota: u64) -> Option<RedisTestStore> {
         let url = test_redis_url()?;
-        Some(
-            RedisSessionStore::connect(&url, vec![7u8; 32], ttl, quota)
+        Some(RedisTestStore {
+            inner: RedisSessionStore::connect(&url, vec![7u8; 32])
                 .await
                 .expect("connecting to the test redis"),
-        )
+            ttl,
+            quota,
+        })
     }
 
     #[tokio::test]
@@ -793,10 +893,10 @@ mod tests {
         let Some(s) = redis_store(3600, 3).await else {
             return;
         };
-        let token = s.create_session(PAYER, None).await.unwrap();
+        let token = s.mint(PAYER, None).await.unwrap();
 
         match s.consume(&token, None).await {
-            SessionOutcome::Accepted { payer, remaining } => {
+            SessionOutcome::Accepted { payer, remaining, .. } => {
                 assert_eq!(payer, PAYER);
                 assert_eq!(remaining, 2);
             }
@@ -809,7 +909,7 @@ mod tests {
         let Some(s) = redis_store(3600, 2).await else {
             return;
         };
-        let token = s.create_session(PAYER, None).await.unwrap();
+        let token = s.mint(PAYER, None).await.unwrap();
 
         assert!(matches!(
             s.consume(&token, None).await,
@@ -830,7 +930,7 @@ mod tests {
         let Some(s) = redis_store(3600, 5).await else {
             return;
         };
-        let token = s.create_session(PAYER, None).await.unwrap();
+        let token = s.mint(PAYER, None).await.unwrap();
         let parts: Vec<&str> = token.split(':').collect();
 
         // Tampered payer.
@@ -842,7 +942,7 @@ mod tests {
 
         // Authentic shape, but signed with a different key.
         let Some(url) = test_redis_url() else { return };
-        let other = RedisSessionStore::connect(&url, vec![9u8; 32], 3600, 5)
+        let other = RedisSessionStore::connect(&url, vec![9u8; 32])
             .await
             .unwrap();
         assert_eq!(
@@ -872,7 +972,7 @@ mod tests {
         let Some(s) = redis_store(1, 5).await else {
             return;
         };
-        let token = s.create_session(PAYER, None).await.unwrap();
+        let token = s.mint(PAYER, None).await.unwrap();
         assert!(matches!(
             s.consume(&token, None).await,
             SessionOutcome::Accepted { .. }
@@ -897,7 +997,7 @@ mod tests {
         let Some(s) = redis_store(3600, QUOTA).await else {
             return;
         };
-        let token = Arc::new(s.create_session(PAYER, None).await.unwrap());
+        let token = Arc::new(s.mint(PAYER, None).await.unwrap());
         let s = Arc::new(s);
 
         let tasks: Vec<_> = (0..8)
@@ -934,7 +1034,7 @@ mod tests {
         // Without this, a session bought on a cheap route unlocks an expensive
         // one: pay the GraphQL price, use the gRPC resource.
         let s = store(3600, 5);
-        let token = s.create_session_at(PAYER, Some("graphql"), NOW);
+        let token = s.mint(PAYER, Some("graphql"), NOW);
 
         assert!(matches!(
             s.consume_at(&token, Some("graphql"), NOW),
@@ -957,7 +1057,7 @@ mod tests {
         let Some(s) = redis_store(3600, 5).await else {
             return;
         };
-        let token = s.create_session(PAYER, Some("graphql")).await.unwrap();
+        let token = s.mint(PAYER, Some("graphql")).await.unwrap();
         assert!(matches!(
             s.consume(&token, Some("graphql")).await,
             SessionOutcome::Accepted { .. }

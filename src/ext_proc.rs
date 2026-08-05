@@ -48,7 +48,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::auth::{
-    AppState, Decision, HEADER_PAYER, HEADER_TIER, HeaderView, PendingPayment, SettlePolicy,
+    AppState, Decision, HEADER_PAYER, HEADER_TIER, HeaderView, Meter, PendingPayment, SettlePolicy,
 };
 use crate::metrics as m;
 use crate::x402::{self, HEADER_PAYMENT_REQUIRED, HEADER_PAYMENT_RESPONSE, HEADER_PAYMENT_SESSION};
@@ -75,6 +75,30 @@ struct StreamState {
     /// Policy the request phase resolved, so the session minted on the response
     /// path is scoped to what was actually paid for.
     policy: Option<String>,
+    /// Request path, kept so the response phase can re-resolve the same policy
+    /// and mint a session with that policy's quota rather than the global one.
+    path: String,
+    /// What the request phase measured. Emitted on the response so the client
+    /// sees its own meter; a settlement on the response path replaces it.
+    meter: Meter,
+    /// How long the request-phase decision took, in milliseconds.
+    ///
+    /// Reported back as `Server-Timing`. The gateway is the only party that
+    /// knows how much of a request's latency it was responsible for, so
+    /// without this a client can only measure the total and guess.
+    decide_ms: f64,
+}
+
+/// Standard header for server-side phase timings, readable in browser devtools.
+const HEADER_SERVER_TIMING: &str = "server-timing";
+
+/// Format phase timings as a `Server-Timing` value.
+fn server_timing(phases: &[(&str, f64)]) -> String {
+    phases
+        .iter()
+        .map(|(name, ms)| format!("{name};dur={ms:.1}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Build a `HeaderValueOption` for a mutation.
@@ -330,20 +354,29 @@ async fn handle_request_headers(
         format!("{scheme}://{authority}{path}")
     };
 
+    let started = std::time::Instant::now();
     let decision = X402Decider { state }
         .decide(&view, client_ip, &path, policy.as_deref(), &resource_url)
         .await;
+    // Covers everything the gateway does before the upstream is touched:
+    // session lookup or free-tier check, and for a payment, on-chain
+    // verification against the fullnode.
+    let decide_ms = started.elapsed().as_secs_f64() * 1000.0;
 
     match decision {
         Decision::Allow {
             tier,
             payer,
             pending,
+            meter,
             ..
         } => {
             // Hold the verified payment for the response phase.
             stream_state.pending = pending;
             stream_state.policy = policy;
+            stream_state.path = path.clone();
+            stream_state.meter = meter;
+            stream_state.decide_ms = decide_ms;
 
             let mut mutations = vec![header(HEADER_TIER, tier.as_str())];
             if let Some(payer) = payer {
@@ -365,7 +398,11 @@ async fn handle_request_headers(
                 ..Default::default()
             }
         }
-        Decision::Deny { challenge, receipt } => {
+        Decision::Deny {
+            challenge,
+            receipt,
+            meter,
+        } => {
             let mut headers = Vec::new();
             if let Ok(encoded) = x402::encode_header(&challenge) {
                 headers.push(header(HEADER_PAYMENT_REQUIRED, encoded));
@@ -375,6 +412,17 @@ async fn handle_request_headers(
             {
                 headers.push(header(HEADER_PAYMENT_RESPONSE, encoded));
             }
+            // The 402 carries the meter too: the useful part of "you are out"
+            // is when it comes back.
+            for (name, value) in meter.headers() {
+                headers.push(header(name, value));
+            }
+            // A challenge short-circuits the upstream, so this is the only
+            // chance to report what the decision cost.
+            headers.push(header(
+                HEADER_SERVER_TIMING,
+                server_timing(&[("x402-decide", decide_ms)]),
+            ));
             headers.push(header("content-type", "application/json"));
 
             ProcessingResponse {
@@ -404,11 +452,25 @@ async fn handle_response_headers(
     stream_state: &mut StreamState,
     headers: envoy_types::pb::envoy::service::ext_proc::v3::HttpHeaders,
 ) -> ProcessingResponse {
+    // Whatever the request phase measured travels back to the client. Only a
+    // settlement below can supersede it.
+    let meter_headers: Vec<_> = stream_state
+        .meter
+        .headers()
+        .into_iter()
+        .map(|(name, value)| header(name, value))
+        .collect();
+
     let Some(pending) = stream_state.pending.take() else {
         // Nothing was paid on this request (free tier or an existing session).
+        let mut headers = meter_headers;
+        headers.push(header(
+            HEADER_SERVER_TIMING,
+            server_timing(&[("x402-decide", stream_state.decide_ms)]),
+        ));
         return ProcessingResponse {
             response: Some(processing_response::Response::ResponseHeaders(
-                continue_with(Vec::new()),
+                continue_with(headers),
             )),
             ..Default::default()
         };
@@ -430,22 +492,44 @@ async fn handle_response_headers(
         if let Some(id) = &pending.payment_id {
             state.sessions.release_payment(id).await;
         }
+        let mut headers = meter_headers;
+        headers.push(header(
+            HEADER_SERVER_TIMING,
+            server_timing(&[("x402-decide", stream_state.decide_ms)]),
+        ));
         return ProcessingResponse {
             response: Some(processing_response::Response::ResponseHeaders(
-                continue_with(Vec::new()),
+                continue_with(headers),
             )),
             ..Default::default()
         };
     }
 
-    let mut mutations = Vec::new();
+    let mut mutations = meter_headers;
+
+    // Re-resolve the policy so the session is minted with the tier this route
+    // sells, not the global default.
+    let resolved = state
+        .config
+        .policy_for(&stream_state.path, stream_state.policy.as_deref());
 
     let started = std::time::Instant::now();
     let settled = state
         .facilitator
         .settle(&pending.payload, &pending.requirements)
         .await;
+    let settle_ms = started.elapsed().as_secs_f64() * 1000.0;
     metrics::histogram!(m::SETTLEMENT_SECONDS).record(started.elapsed().as_secs_f64());
+
+    // Both phases, so a client can see how the gateway's share of its latency
+    // splits between verifying on the way in and broadcasting on the way out.
+    mutations.push(header(
+        HEADER_SERVER_TIMING,
+        server_timing(&[
+            ("x402-decide", stream_state.decide_ms),
+            ("x402-settle", settle_ms),
+        ]),
+    ));
 
     match settled {
         Ok(mut settlement) => {
@@ -453,7 +537,12 @@ async fn handle_response_headers(
                 None => None,
                 Some(payer) => state
                     .sessions
-                    .create_session(payer, stream_state.policy.as_deref())
+                    .create_session(
+                        payer,
+                        stream_state.policy.as_deref(),
+                        resolved.paid_tier.quota,
+                        resolved.paid_tier.duration_secs,
+                    )
                     .await
                     .ok(),
             };
@@ -465,10 +554,27 @@ async fn handle_response_headers(
             if let Some(token) = &token {
                 settlement.extensions = Some(x402::session_extension_grant(
                     token,
-                    state.config.paid_tier.quota,
-                    state.config.paid_tier.duration_secs,
+                    resolved.paid_tier.quota,
+                    resolved.paid_tier.duration_secs,
                 ));
                 mutations.push(header(HEADER_PAYMENT_SESSION, token.clone()));
+
+                // A payment just bought a session, so the free-tier meter the
+                // request phase measured is no longer what this client is
+                // spending against. Replace it wholesale.
+                mutations.retain(|h| {
+                    !h.header
+                        .as_ref()
+                        .is_some_and(|h| h.key.starts_with("x-x402-free-"))
+                });
+                let fresh = Meter::Session {
+                    remaining: resolved.paid_tier.quota,
+                    quota: resolved.paid_tier.quota,
+                    expires_in_secs: resolved.paid_tier.duration_secs,
+                };
+                for (name, value) in fresh.headers() {
+                    mutations.push(header(name, value));
+                }
             }
 
             tracing::info!(
