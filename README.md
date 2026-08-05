@@ -629,6 +629,16 @@ than estimating it.
 - Out of scope: the Bazaar / discovery endpoints (§8), the `a2a` and `mcp`
   transports, and the interactive gas-station sponsorship protocol.
 
+## Further reading
+
+| | |
+|---|---|
+| [`docs/configuring.md`](docs/configuring.md) | setting up Envoy and the verifier, and checking each setting is doing what you think |
+| [`docs/sui-scheme-conformance.md`](docs/sui-scheme-conformance.md) | line-by-line audit against the Sui `exact` scheme, both payment paths |
+| [`docs/settlement-failure.md`](docs/settlement-failure.md) | what happens when settlement fails after the resource was served, and what should be built |
+| [`docs/spec-gaps.md`](docs/spec-gaps.md) | where the spec does not say enough to implement from |
+| [`docs/architecture.dot`](docs/architecture.dot) | the diagram source |
+
 ## Conformance
 
 Wire format follows x402 **v2**, vendored at `docs/spec/upstream/`
