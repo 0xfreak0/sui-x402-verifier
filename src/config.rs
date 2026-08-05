@@ -37,6 +37,18 @@ pub fn pay_to_env_var(policy: &str) -> String {
 /// Length of a Sui address in hex characters (32 bytes).
 const SUI_ADDRESS_HEX_LEN: usize = 64;
 
+/// The HMAC secret shipped in every example config.
+///
+/// Published in a public repository, so a deployment that keeps it is using a
+/// session signing key the whole internet knows: anyone can mint themselves a
+/// token for any payer with unexpired claims and skip payment entirely.
+///
+/// The zero address is refused for the same reason, and this is the more
+/// dangerous of the two — a wrong `pay_to` sends money nowhere, a known HMAC key
+/// gives the paid tier away.
+const PLACEHOLDER_HMAC_SECRET: &str =
+    "abababababababababababababababababababababababababababababababab";
+
 /// Minimum accepted HMAC key length in bytes. 32 bytes matches the SHA-256
 /// block security level; shorter keys are rejected outright rather than
 /// silently weakening session-token forgery resistance.
@@ -496,6 +508,15 @@ impl Config {
             );
         }
 
+        if self.session_hmac_secret.trim() == PLACEHOLDER_HMAC_SECRET {
+            bail!(
+                "session HMAC secret is the placeholder from the example config, which is \
+                 published and therefore public. Anyone could forge session tokens against \
+                 this deployment. Generate a real one:\n\n    \
+                 export {ENV_HMAC_SECRET}=$(openssl rand -hex 32)"
+            );
+        }
+
         let key = hex::decode(&self.session_hmac_secret).context(
             "session HMAC secret must be hex-encoded (generate with: openssl rand -hex 32)",
         )?;
@@ -515,6 +536,11 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A valid non-placeholder secret. Deliberately not the `"abab…"` example
+    /// value, which is published and is now refused.
+    const TEST_HMAC_SECRET: &str =
+        "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
 
     /// Synthetic, obviously-fake receiving address. Never use a real wallet in
     /// tests or committed config — see [`ENV_PAY_TO`].
@@ -544,7 +570,7 @@ paid_tier:
   quota: 100
   duration_secs: 3600
 "#,
-            "ab".repeat(32),
+            TEST_HMAC_SECRET,
             TEST_PAY_TO
         )
     }
@@ -572,21 +598,54 @@ paid_tier:
 
     #[test]
     fn rejects_short_hmac_key() {
-        let yaml = base_yaml().replace(&"ab".repeat(32), "abcd");
+        let yaml = base_yaml().replace(TEST_HMAC_SECRET, "abcd");
         let err = parse(&yaml).unwrap_err().to_string();
         assert!(err.contains("at least"), "unexpected error: {err}");
     }
 
     #[test]
     fn rejects_non_hex_hmac_key() {
-        let yaml = base_yaml().replace(&"ab".repeat(32), &"zz".repeat(32));
+        let yaml = base_yaml().replace(TEST_HMAC_SECRET, &"zz".repeat(32));
         let err = parse(&yaml).unwrap_err().to_string();
         assert!(err.contains("hex-encoded"), "unexpected error: {err}");
     }
 
     #[test]
+    fn rejects_the_published_placeholder_hmac_secret() {
+        // Shipped in every example config and therefore public. Keeping it
+        // means anyone can forge a session token for any payer and skip
+        // payment entirely — strictly worse than the zero-address case, which
+        // only misdirects money.
+        let yaml = base_yaml().replace(TEST_HMAC_SECRET, PLACEHOLDER_HMAC_SECRET);
+        let err = parse(&yaml).unwrap_err().to_string();
+        assert!(err.contains("placeholder"), "got: {err}");
+        assert!(
+            err.contains("openssl rand -hex 32"),
+            "the error should say how to fix it: {err}"
+        );
+    }
+
+    #[test]
+    fn the_shipped_example_configs_all_carry_the_placeholder() {
+        // If one of them ever ships a real-looking secret instead, the check
+        // above stops protecting anybody. This asserts the example files stay
+        // the thing that gets refused.
+        for path in ["../config.example.yaml", "../config.demo.yaml"] {
+            let full = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(path);
+            let Ok(raw) = std::fs::read_to_string(&full) else {
+                continue;
+            };
+            assert!(
+                raw.contains(PLACEHOLDER_HMAC_SECRET),
+                "{} should carry the placeholder secret so it cannot boot unconfigured",
+                full.display()
+            );
+        }
+    }
+
+    #[test]
     fn rejects_empty_hmac_key() {
-        let yaml = base_yaml().replace(&format!("\"{}\"", "ab".repeat(32)), "\"\"");
+        let yaml = base_yaml().replace(&format!("\"{TEST_HMAC_SECRET}\""), "\"\"");
         let err = parse(&yaml).unwrap_err().to_string();
         assert!(err.contains("empty"), "unexpected error: {err}");
     }

@@ -1,0 +1,103 @@
+# The same verifier, under Istio, as configuration only.
+#
+# The claim this repo makes is that payment becomes a *policy* in a proxy you
+# already run, rather than another hop you have to get approved. This file is
+# that claim in a form you can read: no new proxy, no application change, no
+# code — an EnvoyFilter and a service entry.
+#
+# Istio's data plane IS Envoy, so `ext_proc` behaves exactly as it does in
+# ../envoy.yaml. The verifier is unmodified and unaware it is running under a
+# mesh.
+#
+# NOT APPLIED BY THE DEMO. The demo runs plain Envoy via docker-compose; this
+# exists so the portability claim is checkable rather than asserted.
+#
+#   kubectl apply -f istio-envoyfilter.yaml
+---
+# Where the verifier lives, from the mesh's point of view. HTTP/2 is mandatory:
+# ext_proc is a gRPC service.
+apiVersion: v1
+kind: Service
+metadata:
+  name: x402-verifier
+  namespace: x402
+spec:
+  ports:
+    - name: grpc-extproc
+      port: 50051
+      protocol: TCP
+      appProtocol: grpc
+  selector:
+    app: x402-verifier
+---
+apiVersion: networking.istio.io/v1alpha3
+kind: EnvoyFilter
+metadata:
+  name: x402-payment-gate
+  namespace: istio-system
+spec:
+  # Scope it. Without a selector this attaches to every proxy in the mesh,
+  # including ones fronting services nobody intends to sell.
+  workloadSelector:
+    labels:
+      x402-gated: "true"
+
+  configPatches:
+    # 1. Insert ext_proc into the filter chain, before the router.
+    - applyTo: HTTP_FILTER
+      match:
+        context: SIDECAR_INBOUND
+        listener:
+          filterChain:
+            filter:
+              name: envoy.filters.network.http_connection_manager
+              subFilter:
+                name: envoy.filters.http.router
+      patch:
+        operation: INSERT_BEFORE
+        value:
+          name: envoy.filters.http.ext_proc
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor
+            # Fail closed. A verifier that is down must not become an
+            # unmetered free tier.
+            failure_mode_allow: false
+            # Headers only, both directions. Payment lives entirely in headers;
+            # streaming bodies through the verifier would add latency and
+            # memory for nothing.
+            processing_mode:
+              request_header_mode: SEND
+              response_header_mode: SEND
+              request_body_mode: NONE
+              response_body_mode: NONE
+              request_trailer_mode: SKIP
+              response_trailer_mode: SKIP
+            message_timeout: 10s
+            # The verifier meters per source address and reads the route's
+            # policy from metadata — the same two attributes it uses outside a
+            # mesh.
+            request_attributes:
+              - source.address
+              - xds.route_metadata
+            grpc_service:
+              envoy_grpc:
+                cluster_name: outbound|50051||x402-verifier.x402.svc.cluster.local
+
+    # 2. Name the pricing policy per route. Istio carries this the same way the
+    #    standalone config does, so the verifier needs no change: the mesh stays
+    #    the single source of truth for routing, and this file only says which
+    #    policy a route uses.
+    - applyTo: HTTP_ROUTE
+      match:
+        context: SIDECAR_INBOUND
+        routeConfiguration:
+          vhost:
+            route:
+              name: default
+      patch:
+        operation: MERGE
+        value:
+          metadata:
+            filter_metadata:
+              envoy.filters.http.ext_proc:
+                x402_policy: graphql

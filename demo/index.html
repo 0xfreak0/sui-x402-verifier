@@ -132,6 +132,15 @@
   a{color:var(--settled)}
   a:hover{color:var(--paper)}
 
+  /* ── what broke ── */
+  .broke{display:grid;gap:1rem}
+  .b{border-left:2px solid var(--declined);padding-left:.9rem}
+  .bk{font-family:var(--mono);font-size:12px;color:var(--declined);
+    letter-spacing:.04em;margin-bottom:.3rem}
+  .bv{color:var(--faint);font-size:13.5px;max-width:64ch}
+  .bv code{color:var(--paper)}
+  .bv em{color:var(--paper);font-style:normal}
+
   /* ── trace ── */
   .trace{font-family:var(--mono);font-size:11.5px;display:grid;gap:.3rem}
   .trace:empty::after{content:"send a request to record one";color:var(--faint)}
@@ -247,11 +256,13 @@
   </div>
 
   <div class="lede">
-    <h1>Anything with a URL<br>can be metered and sold.</h1>
-    <p>This is an <strong>Envoy filter</strong> that puts the x402 payment protocol in front of
-      arbitrary upstreams. Pick a target below and hold down send. Watch the free
-      allowance run out, read the <strong>402</strong>, buy a session, watch that drain instead.
-      Four targets, four prices, two receiving wallets, one gateway.</p>
+    <h1>Payments as a filter<br>in a proxy you already run.</h1>
+    <p>Not another proxy to put in your path — an <strong>Envoy filter</strong>. The same
+      <code>ext_proc</code> interface works under Istio, Consul, Gloo and APISIX, so
+      metering and payment become a policy rather than a new hop. The upstreams below
+      have <strong>no payment code of their own</strong> and never learn they are being sold.</p>
+    <p style="margin-top:.7rem">Pick one and hold down send: watch the free allowance run
+      out, read the <strong>402</strong>, buy a session, watch that drain instead.</p>
   </div>
 
   <div class="console">
@@ -283,6 +294,58 @@
       <div class="note" id="note"></div>
     </div>
   </div>
+
+  <section>
+    <h2>Point a real client at it</h2>
+    <p class="hint">Nothing above requires this page. The gate is the public endpoint, so
+      any x402 client can hit it — this one signs from your own wallet, not the demo's.</p>
+    <pre id="cli">git clone https://github.com/0xfreak0/sui-x402-verifier &amp;&amp; cd sui-x402-verifier
+
+# needs testnet SUI for gas + testnet USDC
+cargo run --bin x402-pay -- https://x402.suisonar.dev/graphql \
+  -X POST -H 'content-type: application/json' \
+  -d '{"query":"{ chainIdentifier }"}'</pre>
+    <p class="hint">Or just watch it refuse you, no wallet needed:</p>
+    <pre>for i in $(seq 6); do
+  curl -s -o /dev/null -w '%{http_code} ' -X POST https://x402.suisonar.dev/graphql \
+    -H 'content-type: application/json' -d '{"query":"{ chainIdentifier }"}'
+done      # 200 200 200 200 200 402</pre>
+  </section>
+
+  <section>
+    <h2>What broke</h2>
+    <p class="hint">The useful output of an experiment is where it fails. All of these are
+      measured, not estimated.</p>
+    <div class="broke">
+      <div class="b">
+        <div class="bk">Verification passes on already-spent coins</div>
+        <div class="bv">Sui's <code>SimulateTransaction</code> returns success for a transaction
+          whose input coins were already spent. Verify by simulating alone — the obvious
+          implementation — and a dead authorization verifies, gets served, and fails only at
+          settlement. Free service, no race required. Fixed here by re-reading every pinned
+          input; simulation will not do it for you.</div>
+      </div>
+      <div class="b">
+        <div class="bk">Per-request payment is economically incoherent</div>
+        <div class="bv">Gas is ~0.0023 SUI per settlement against a price of 0.00001 USDC.
+          Settlement costs orders of magnitude more than the thing being sold, so sessions are
+          load-bearing rather than a convenience — and a session is prepaid credits, which only
+          beats an API key when establishing an <em>account</em> is the friction.</div>
+      </div>
+      <div class="b">
+        <div class="bk">Settlement is most of the latency</div>
+        <div class="bv">~759ms of a ~1.3s paid request is broadcasting to the chain. The trace
+          above breaks it down per service; nothing there is guessed.</div>
+      </div>
+      <div class="b">
+        <div class="bk">The spec's ordering is impossible pre-upstream</div>
+        <div class="bv">verify → serve → settle cannot be done by <code>ext_authz</code>, which
+          never sees the response. It needs <code>ext_proc</code>'s bidirectional stream. And
+          after serving, the payer can still spend the pinned coins — bounded by upstream
+          latency against finality, so a losing race rather than a guarantee.</div>
+      </div>
+    </div>
+  </section>
 
   <section>
     <h2>Where the money is</h2>

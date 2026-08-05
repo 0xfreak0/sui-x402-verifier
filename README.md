@@ -436,6 +436,97 @@ The last two are the ones worth alerting on. Everything else is throughput.
 - **IPv6 is metered per /64**, since a host delegated a /64 can otherwise iterate
   addresses for an unlimited free tier.
 
+## What broke
+
+The useful output of an experiment is where it fails. Ranked by how much of a
+surprise each one should be to someone who already works on Sui — the first two
+are the ones worth your time, the rest are confirmations with numbers attached.
+
+### Verification passes on already-spent coins
+
+`SimulateTransaction` returns **success** for a transaction whose input coins
+have already been spent. Simulation checks that the transaction *would* execute
+against current state in the abstract; it does not enforce that the client's
+pinned `(id, version, digest)` inputs are still live.
+
+So the obvious facilitator — verify by simulating, as the scheme's step 3 reads
+— will verify a dead authorization. Measured on testnet, before the fix:
+
+1. Sign a payment pinning USDC coin `0x3a4d…`. `/verify` → `isValid: true`
+2. Spend that coin in an unrelated transaction. Success
+3. `/verify` again → **still `isValid: true`**
+4. `/settle` → `Client specified an invalid argument`
+
+That is free service with **no race required**: spend the coin first, present
+the dead authorization, be verified, be served, and let settlement fail. Any
+implementation that trusts simulation alone has this.
+
+The fix is to read every pinned owned and receiving input plus the gas objects
+and confirm each still exists at its pinned version, treating `NotFound` as
+spent rather than as an RPC failure. Shared inputs are skipped — consensus
+versions those at execution, so the client never pinned them.
+`sui::assert_inputs_are_live`. Re-measured after: step 3 returns `isValid:
+false`.
+
+### The spec's own ordering is impossible in a pre-upstream filter
+
+`scheme_exact_sui.md` sequences **verify → the resource server does the work →
+settle**, so a client is only charged once the resource exists. `ext_authz`
+cannot do this. It runs on the request path, never sees the response, and must
+answer allow/deny before Envoy proxies anything — settling there charges a
+client whose request then 500s.
+
+`ext_proc` can, because Envoy opens one bidirectional stream per request: verify
+on the way in, hold the verified-but-unsettled payment as stream-local state,
+settle on the way out and only on a 2xx. That is a filter choice, not a code
+choice, and it is invisible until you try to be conformant.
+
+The residual exposure is real and stated rather than solved: between verify and
+settle the payer can spend the pinned coins and kill the authorization. Bounded
+by upstream latency (~70ms observed) against finality (~400ms), so a losing race
+— but only because verification now rejects dead authorizations. Counted by
+`x402_settlement_after_serve_failures_total`, which exists precisely so this is
+visible when it happens.
+
+### There is no gRPC transport binding
+
+The spec defines an HTTP transport and, more recently, MCP and A2A. There is
+nothing for gRPC, and a public search finds no x402 implementation that gates it
+at all. Two problems have to be solved to make it work:
+
+- gRPC clients collapse any non-200 into an opaque transport error, so a plain
+  402 arrives as `code = Unknown`. Denials are framed as a **trailers-only
+  response**: HTTP 200 carrying `grpc-status: 8` (`RESOURCE_EXHAUSTED`, what
+  gRPC maps 429 to) plus the challenge header.
+- gRPC metadata must be ASCII unless `-bin` suffixed. x402's headers are already
+  base64 JSON, so they survive unchanged — convenient rather than designed.
+
+### `maxTimeoutSeconds` has no on-chain expression
+
+Sui's finest transaction expiry is one epoch (~24h), so a 60-second window is
+enforced off-chain by the facilitator and nothing stops a third party
+broadcasting the authorization later. `TransactionExpiration::ValidDuring`
+timestamps would fix it and are documented as not yet implemented.
+
+### Per-request payment does not pay for itself
+
+Gas is ~0.0023 SUI per settlement against an advertised price of 0.00001 USDC —
+the settlement costs orders of magnitude more than the thing being sold. So
+sessions are load-bearing, not a convenience.
+
+Which leads to the uncomfortable part: **a session is prepaid credits.** It only
+beats an API key where establishing an *account* is the friction rather than the
+payment — an agent that cannot complete a signup flow, hold a card, or agree to
+terms. That is a real niche and an unproven one, and it is the honest answer to
+"why not just use Stripe."
+
+### Settlement is most of the latency
+
+~759ms of a ~1.3s paid request is broadcasting to the chain; verification is
+~253ms of it and the upstream call ~72ms. The trace on the demo page reports
+this per service from `Server-Timing` and `x-envoy-upstream-service-time` rather
+than estimating it.
+
 ## Limitations
 
 - **Streaming RPCs are effectively unmetered.** A filter fires once per *stream*,

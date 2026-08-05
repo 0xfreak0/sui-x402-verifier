@@ -1109,7 +1109,9 @@ pub mod test_support {
                 duration_secs: 3600,
             },
             store: StoreConfig::default(),
-            session_hmac_secret: "ab".repeat(32),
+            // Not "ab".repeat(32): that is the published example secret and
+            // Config::hmac_key now refuses it.
+            session_hmac_secret: "cd".repeat(32),
         };
         let facilitator = Arc::new(
             Facilitator::new(
