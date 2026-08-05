@@ -1,9 +1,9 @@
 //! Facilitator HTTP interface (spec §7).
 //!
 //! `POST /verify`, `POST /settle`, `GET /supported` — the standard endpoints a
-//! *resource server* calls to delegate blockchain work. This runs on its own
-//! listener, separate from the ext_authz gRPC service, and shares the same
-//! [`Facilitator`].
+//! *resource server* calls to delegate blockchain work. Plus `GET /policies`,
+//! which is not in the spec; see below. This runs on its own listener, separate
+//! from the ext_authz gRPC service, and shares the same [`Facilitator`].
 //!
 //! # Why this exists
 //!
@@ -12,11 +12,31 @@
 //! "verifier" promises. Exposing §7 makes the same logic reusable by anything
 //! that speaks x402.
 //!
+//! `GET /policies` is a local addition. It reports the resolved policy table —
+//! what each route costs, where it pays, and what it gives away — because the
+//! only other way to learn a price is to spend a free-tier request getting
+//! challenged. It exposes nothing a client could not obtain from one 402 per
+//! route.
+//!
 //! # Exposure
 //!
-//! These endpoints are unauthenticated and must not face the internet. `/settle`
-//! is the one that moves money once real settlement lands, so it belongs on a
-//! private interface (the default binds loopback) or behind its own auth.
+//! **These endpoints are unauthenticated and must not face the internet.**
+//!
+//! `POST /settle` broadcasts a signed transaction to the chain. In `sui-grpc`
+//! mode that is not hypothetical and not deferred — it moves money on the call.
+//! Anyone who can reach this port can make this service broadcast any payment
+//! authorization they hold, which is not theft (they signed it, and the payee is
+//! fixed by the transaction) but is a way to force settlement the resource
+//! server never asked for, and to spend its fullnode quota.
+//!
+//! `GET /policies` also names every receiving wallet in one response, which is
+//! public information but convenient reconnaissance.
+//!
+//! So: bind loopback or a private interface, or put auth in front. The listener
+//! is disabled entirely unless `facilitator_api_listen_addr` is set, and the
+//! shipped configs bind `127.0.0.1`. Under the deploy stack this port lives
+//! inside a private container network namespace and is not published to the
+//! host at all — see `deploy/docker-compose.yml`.
 
 use std::sync::Arc;
 
