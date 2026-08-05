@@ -3,295 +3,1127 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>x402 on Sui — pay for rate limit</title>
+<title>402 — a meter in front of anything</title>
 <style>
-  :root {
-    --bg: #fbfbfd; --panel: #fff; --ink: #16181d; --muted: #6b7280;
-    --line: #e5e7eb; --accent: #4a7dff; --ok: #0f8a5f; --warn: #b45309; --err: #c2334d;
-    --code-bg: #f4f4f7;
+  /* ── Ledger ────────────────────────────────────────────────────────────
+     The page is a receipt. Every event is a line item on a monospace grid.
+     Deep teal-slate instrument panel; amber is money, sea-green is settled,
+     coral is declined.
+
+     The hero is the METER, not the payment. A payment is one line on a
+     receipt; the meter is the thing you can feel running out.
+     ─────────────────────────────────────────────────────────────────── */
+  :root{
+    --ink:#0d181d;
+    --ink-2:#12222a;
+    --ink-3:#183039;
+    --rule:#1f3c47;
+    --paper:#e6f1f2;
+    --faint:#7593a0;
+    --money:#f2b441;        /* amber — money, prices, the wall */
+    --settled:#4fd1b0;      /* sea green — paid, settled, allowed */
+    --declined:#ff7a7a;
+    --mono:ui-monospace,"SF Mono",SFMono-Regular,Menlo,Consolas,monospace;
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,sans-serif;
   }
-  @media (prefers-color-scheme: dark) {
-    :root {
-      --bg: #0e1014; --panel: #161a21; --ink: #e8eaed; --muted: #9aa3b2;
-      --line: #262c37; --accent: #7aa2ff; --ok: #46c78d; --warn: #e0a33e; --err: #ff6b85;
-      --code-bg: #0b0d11;
-    }
+  *{box-sizing:border-box}
+  html{-webkit-text-size-adjust:100%}
+  body{
+    margin:0;padding:0;background:var(--ink);color:var(--paper);
+    font-family:var(--sans);font-size:15px;line-height:1.5;
+    background-image:linear-gradient(180deg,#0d181d 0%,#0b1418 100%);
+    background-attachment:fixed;
   }
-  * { box-sizing: border-box; }
-  body {
-    margin: 0; padding: 2rem 1.25rem 4rem;
-    font: 15px/1.55 ui-sans-serif, -apple-system, "Segoe UI", Roboto, sans-serif;
-    background: var(--bg); color: var(--ink);
+  .sheet{max-width:820px;margin:0 auto;padding:0 1.25rem 5rem}
+
+  .bar{
+    display:flex;justify-content:space-between;align-items:center;gap:1rem;
+    font-family:var(--mono);font-size:11px;letter-spacing:.14em;text-transform:uppercase;
+    color:var(--faint);padding:1.1rem 0;border-bottom:1px solid var(--rule);
   }
-  .wrap { max-width: 860px; margin: 0 auto; }
-  h1 { font-size: 1.5rem; margin: 0 0 .3rem; letter-spacing: -0.02em; }
-  .sub { color: var(--muted); margin: 0 0 1.75rem; }
-  .panel {
-    background: var(--panel); border: 1px solid var(--line);
-    border-radius: 12px; padding: 1.1rem 1.25rem; margin-bottom: 1rem;
+  .live{display:inline-flex;align-items:center;gap:.45rem}
+  .dot{width:6px;height:6px;border-radius:50%;background:var(--settled);
+    box-shadow:0 0 0 0 rgba(79,209,176,.6);animation:pulse 2.4s ease-out infinite}
+  @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(79,209,176,.5)}70%{box-shadow:0 0 0 7px rgba(79,209,176,0)}100%{box-shadow:0 0 0 0 rgba(79,209,176,0)}}
+
+  .lede{padding:2.6rem 0 1.6rem}
+  .lede h1{font-family:var(--mono);font-weight:700;letter-spacing:-.02em;
+    font-size:clamp(1.5rem,5vw,2.3rem);margin:0 0 .8rem;line-height:1.12}
+  .lede p{color:var(--faint);margin:0;max-width:54ch}
+  .lede strong{color:var(--paper);font-weight:600}
+
+  /* ── the console ── */
+  .console{background:var(--ink-2);border:1px solid var(--rule);border-radius:3px;
+    margin:1.6rem 0 0;overflow:hidden}
+  .targets{border-bottom:1px solid var(--rule)}
+  .t{display:grid;grid-template-columns:auto 1fr auto;gap:.2rem .75rem;width:100%;text-align:left;
+    padding:.8rem 1rem;background:transparent;border:0;border-bottom:1px solid var(--rule);
+    color:var(--faint);font-family:var(--sans);font-size:14px;text-transform:none;
+    letter-spacing:normal;cursor:pointer;border-radius:0;
+    transition:background .12s ease,color .12s ease}
+  .t:last-child{border-bottom:0}
+  .t:hover{background:var(--ink-3);color:var(--paper);filter:none}
+  /* The selected row is the one the buttons below act on, so it has to be
+     unmissable — a tint alone is not enough on a phone in daylight. */
+  .t[aria-pressed="true"]{background:var(--ink-3);color:var(--paper);
+    box-shadow:inset 4px 0 0 var(--money)}
+  .t .mark{font-family:var(--mono);color:var(--rule);align-self:center}
+  .t[aria-pressed="true"] .mark{color:var(--money)}
+  .t .name{font-weight:600;color:inherit}
+  .t[aria-pressed="true"] .name{color:var(--paper)}
+  .t .price{font-family:var(--mono);font-size:12px;color:var(--money);white-space:nowrap;
+    align-self:center}
+  .t .price.free{color:var(--settled)}
+  .t .sub{grid-column:2/-1;font-family:var(--mono);font-size:11px;color:var(--faint);
+    letter-spacing:.02em}
+
+  .panel{padding:1.15rem 1rem 1.3rem}
+  .meterhead{display:flex;justify-content:space-between;align-items:baseline;gap:1rem;
+    font-family:var(--mono);font-size:11.5px;letter-spacing:.1em;text-transform:uppercase;
+    color:var(--faint);margin-bottom:.55rem}
+  .meterhead .what{color:var(--paper)}
+  .meterhead .what.paid{color:var(--settled)}
+  .meterhead .what.wall{color:var(--money)}
+
+  /* Segmented, so you watch discrete requests disappear rather than a bar
+     shrinking. A rate limit is countable; the gauge should be too. */
+  .gauge{display:flex;gap:3px;height:16px;margin-bottom:.6rem}
+  .seg{flex:1 1 0;min-width:2px;background:var(--ink-3);border-radius:1px;
+    transition:background .25s ease}
+  .seg.on{background:var(--settled)}
+  .seg.on.low{background:var(--money)}
+  .gauge.spent .seg{background:#2a1416}
+
+  .count{font-family:var(--mono);font-size:12.5px;color:var(--faint);
+    display:flex;justify-content:space-between;gap:1rem;flex-wrap:wrap}
+  .count b{color:var(--paper);font-weight:600;font-variant-numeric:tabular-nums}
+
+  .actions{display:flex;gap:.6rem;align-items:center;margin-top:1.1rem;flex-wrap:wrap}
+  button{
+    font-family:var(--mono);font-size:13px;letter-spacing:.1em;text-transform:uppercase;
+    font-weight:600;padding:.85rem 1.4rem;border-radius:2px;cursor:pointer;
+    background:var(--money);color:#231704;border:1px solid var(--money);
+    transition:transform .12s ease,filter .12s ease;
   }
-  .row { display: flex; gap: .6rem; flex-wrap: wrap; align-items: center; }
-  label { font-size: .8rem; color: var(--muted); display: block; margin-bottom: .3rem; }
-  input {
-    font: 13px ui-monospace, SFMono-Regular, Menlo, monospace;
-    padding: .5rem .6rem; border: 1px solid var(--line); border-radius: 7px;
-    background: var(--bg); color: var(--ink); width: 100%;
+  button:hover:not(:disabled){filter:brightness(1.08)}
+  button:active:not(:disabled){transform:translateY(1px)}
+  button:disabled{opacity:.4;cursor:not-allowed}
+  button.quiet{background:transparent;color:var(--faint);border-color:var(--rule);
+    padding:.42rem .7rem;font-size:11px;letter-spacing:.08em}
+  button.quiet:hover:not(:disabled){color:var(--paper);border-color:var(--faint);filter:none}
+  button.ghost{background:transparent;color:var(--paper);border-color:var(--rule)}
+  button.ghost:hover:not(:disabled){border-color:var(--faint);filter:none}
+  :focus-visible{outline:2px solid var(--settled);outline-offset:3px}
+  .note{font-family:var(--mono);font-size:11.5px;color:var(--faint);margin-top:.75rem;
+    min-height:1.4em;letter-spacing:.02em}
+  .note.bad{color:var(--declined)}
+  .note.good{color:var(--settled)}
+
+  /* ── wallets ── */
+  .wallets{display:grid;gap:.55rem;font-family:var(--mono);font-size:12px}
+  .w{display:grid;grid-template-columns:auto 1fr auto;gap:.75rem;align-items:baseline;
+    padding:.5rem 0;border-bottom:1px dotted var(--rule)}
+  .w:last-child{border-bottom:0}
+  .w .lbl{color:var(--faint);letter-spacing:.1em;text-transform:uppercase;font-size:10.5px}
+  .w .addr{color:var(--paper);overflow:hidden;text-overflow:ellipsis}
+  .w .bal{text-align:right;color:var(--money);white-space:nowrap;font-variant-numeric:tabular-nums}
+  .w .bal .delta{color:var(--declined);font-size:11px}
+  .w .bal .delta.up{color:var(--settled)}
+  a{color:var(--settled)}
+  a:hover{color:var(--paper)}
+
+  /* ── trace ── */
+  .trace{font-family:var(--mono);font-size:11.5px;display:grid;gap:.3rem}
+  .trace:empty::after{content:"send a request to record one";color:var(--faint)}
+  .sp{display:grid;grid-template-columns:1fr 4.5rem;gap:.6rem;align-items:center}
+  .sp .lane{position:relative;height:1.65rem;background:var(--ink-2);
+    border:1px solid var(--rule);border-radius:2px;overflow:hidden}
+  .sp .bar{position:absolute;top:0;bottom:0;border-radius:1px;min-width:2px;
+    background:var(--settled);opacity:.28}
+  .sp.pay .bar{background:var(--money)}
+  .sp.err .bar{background:var(--declined)}
+  .sp.skip .bar{background:repeating-linear-gradient(45deg,var(--declined) 0 4px,transparent 4px 8px);
+    opacity:.55;left:0!important;right:0;width:auto!important}
+  .sp .txt{position:absolute;inset:0;display:flex;align-items:center;gap:.5rem;
+    padding:0 .5rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .sp .who{color:var(--faint)}
+  .sp.child .txt{padding-left:1.5rem}
+  .sp.child .who::before{content:"└ ";color:var(--rule)}
+  .sp .ms{text-align:right;color:var(--faint);font-variant-numeric:tabular-nums}
+  .sp.skip .name{color:var(--declined)}
+  .sp .note-inline{color:var(--declined);font-size:10.5px}
+  code{font-family:var(--mono);font-size:.92em;color:var(--paper)}
+
+  /* ── the tape ── */
+  .tape{font-family:var(--mono);font-size:12px;max-height:15rem;overflow-y:auto;
+    border:1px solid var(--rule);border-radius:2px;background:var(--ink-2)}
+  .tape:empty::after{content:"no requests yet";color:var(--faint);display:block;padding:.8rem}
+  .row{display:grid;grid-template-columns:auto auto 1fr auto;gap:.7rem;align-items:baseline;
+    padding:.42rem .7rem;border-bottom:1px dotted var(--rule)}
+  .row:last-child{border-bottom:0}
+  .row .st{font-weight:700;font-variant-numeric:tabular-nums}
+  .row.ok .st{color:var(--settled)}
+  .row.pay .st{color:var(--money)}
+  .row.err .st{color:var(--declined)}
+  .row .tg{color:var(--faint)}
+  .row .msg{color:var(--paper);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .row .rt{color:var(--faint);white-space:nowrap;font-variant-numeric:tabular-nums}
+
+  section{padding:2rem 0;border-bottom:1px solid var(--rule)}
+  h2{font-family:var(--mono);font-size:11px;letter-spacing:.22em;text-transform:uppercase;
+    color:var(--faint);font-weight:600;margin:0 0 1.1rem}
+  .hint{color:var(--faint);font-size:13.5px;margin:0 0 1rem;max-width:60ch}
+
+  pre{font-family:var(--mono);font-size:11.5px;line-height:1.55;color:var(--paper);
+    background:var(--ink-2);border:1px solid var(--rule);border-radius:2px;
+    padding:.8rem;overflow-x:auto;margin:0 0 .8rem;white-space:pre-wrap;word-break:break-word}
+  .cap{font-family:var(--mono);font-size:10.5px;letter-spacing:.16em;text-transform:uppercase;
+    color:var(--faint);margin:0 0 .35rem}
+
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:.9rem}
+  .stat{background:var(--ink-2);border:1px solid var(--rule);border-radius:2px;padding:.75rem .85rem}
+  .stat .k{font-family:var(--mono);font-size:10px;letter-spacing:.14em;text-transform:uppercase;
+    color:var(--faint);margin-bottom:.25rem}
+  .stat .v{font-family:var(--mono);font-size:1.35rem;font-weight:700;
+    font-variant-numeric:tabular-nums;color:var(--paper)}
+
+  .declined{display:grid;grid-template-columns:1fr auto auto;gap:.75rem;align-items:center;
+    padding:.6rem 0;border-bottom:1px dotted var(--rule);font-size:13.5px}
+  .declined:last-of-type{border-bottom:0}
+  .verdict{font-family:var(--mono);font-size:11.5px;color:var(--faint);text-align:right}
+  .verdict.good{color:var(--settled)}
+  .verdict.bad{color:var(--declined)}
+
+  /* ── the wheel, now just one of the targets ── */
+  .wheelwrap{display:none;flex-direction:column;align-items:center;gap:1rem;
+    padding:1.4rem 0 .4rem}
+  .wheelwrap.on{display:flex}
+  .wheelbox{position:relative;width:min(300px,74vw);aspect-ratio:1;flex:0 0 auto}
+  .needle{position:absolute;top:-2px;left:50%;transform:translateX(-50%);z-index:3;
+    width:0;height:0;border-left:11px solid transparent;border-right:11px solid transparent;
+    border-top:22px solid #f6f3e8;filter:drop-shadow(0 3px 4px rgba(0,0,0,.6))}
+  #wheel{width:100%;height:100%;border-radius:50%;
+    box-shadow:0 0 0 6px #2b1608,0 0 0 9px #c9922f,0 22px 60px -18px rgba(0,0,0,.9);
+    transition:transform 5s cubic-bezier(.12,.72,.09,1)}
+  /* The payoff, on screen just long enough to be believed. */
+  .win{position:absolute;inset:0;display:grid;place-items:center;z-index:4;text-align:center;
+    font-family:var(--mono);font-weight:700;font-size:clamp(1rem,4.4vw,1.5rem);
+    letter-spacing:.06em;color:#231704;background:rgba(242,180,65,.94);border-radius:50%;
+    opacity:0;transform:scale(.82);pointer-events:none;padding:2rem;
+    transition:opacity .18s ease,transform .18s cubic-bezier(.2,1.5,.4,1)}
+  .win.on{opacity:1;transform:scale(1)}
+  .prize-overlay{position:fixed;inset:0;z-index:100;display:none;place-items:center;background:#000}
+  .prize-overlay.on{display:grid}
+  #video{width:100vw;height:100vh;object-fit:contain;background:#000}
+  .prize-controls{position:absolute;top:max(.9rem,env(safe-area-inset-top));
+    right:max(.9rem,env(safe-area-inset-right));z-index:101;display:flex;gap:.5rem}
+  .prize-controls button{background:rgba(13,24,29,.72);border-color:rgba(246,243,232,.35);
+    color:#f6f3e8;backdrop-filter:blur(6px);padding:.6rem .85rem;font-size:12px;
+    min-width:44px;min-height:44px}
+  .prize-controls button:hover{background:rgba(13,24,29,.9);filter:none}
+
+  footer{padding:2rem 0 0;font-family:var(--mono);font-size:11px;color:var(--faint);
+    letter-spacing:.08em}
+
+  @media (max-width:520px){
+    .declined{grid-template-columns:1fr auto;grid-template-areas:"n v" "b b"}
+    .declined > span:first-child{grid-area:n}
+    .verdict{grid-area:v}
+    .declined button{grid-area:b;justify-self:start}
+    .w{grid-template-columns:auto 1fr;grid-template-areas:"l a" ". b"}
+    .w .lbl{grid-area:l}.w .addr{grid-area:a}.w .bal{grid-area:b;text-align:left}
   }
-  button {
-    font: 600 14px/1 ui-sans-serif, system-ui, sans-serif;
-    padding: .65rem 1.1rem; border-radius: 8px; border: 1px solid transparent;
-    background: var(--accent); color: #fff; cursor: pointer;
+  @media (prefers-reduced-motion:reduce){
+    *{animation:none!important;transition:none!important}
   }
-  button.ghost { background: transparent; border-color: var(--line); color: var(--ink); }
-  button:disabled { opacity: .45; cursor: not-allowed; }
-  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: .75rem; }
-  .stat { background: var(--code-bg); border-radius: 9px; padding: .7rem .8rem; }
-  .stat .k { font-size: .72rem; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
-  .stat .v { font: 600 1.25rem ui-monospace, Menlo, monospace; margin-top: .2rem; }
-  .tier-free { color: var(--warn); } .tier-paid { color: var(--ok); } .tier-none { color: var(--muted); }
-  pre {
-    background: var(--code-bg); border-radius: 9px; padding: .8rem;
-    font: 12px/1.5 ui-monospace, Menlo, monospace; overflow-x: auto; margin: .6rem 0 0;
-    white-space: pre-wrap; word-break: break-word;
-  }
-  .log { max-height: 300px; overflow-y: auto; font: 12px/1.7 ui-monospace, Menlo, monospace; }
-  .log div { padding: .18rem 0; border-bottom: 1px solid var(--line); }
-  .s200 { color: var(--ok); } .s402 { color: var(--warn); } .sErr { color: var(--err); }
-  .hint { font-size: .82rem; color: var(--muted); margin-top: .7rem; }
-  code { font: 12px ui-monospace, Menlo, monospace; background: var(--code-bg); padding: .1rem .3rem; border-radius: 4px; }
 </style>
 </head>
 <body>
-<div class="wrap">
-  <h1>Pay for your rate limit</h1>
-  <p class="sub">
-    An <strong>x402</strong> demo against Sui testnet. Anonymous calls are rate limited;
-    exhausting the free tier returns <code>402 Payment Required</code> with machine-readable
-    terms instead of a dead-end <code>429</code>. Paying unlocks a higher-limit session.
-  </p>
+<div class="sheet">
 
-  <div class="panel">
-    <label for="endpoint">Gateway endpoint</label>
-    <input id="endpoint" value="http://localhost:10000" spellcheck="false">
-    <div class="row" style="margin-top:.9rem">
-      <button id="call">Call the API</button>
-      <button id="spam" class="ghost">Call it 10&times;</button>
-      <button id="pay" class="ghost">Pay &amp; unlock</button>
-      <button id="reset" class="ghost">Reset session</button>
+  <div class="bar">
+    <span class="live"><span class="dot"></span>sui testnet</span>
+    <span id="bar-right">envoy · x402</span>
+  </div>
+
+  <div class="lede">
+    <h1>Anything with a URL<br>can be metered and sold.</h1>
+    <p>This is an <strong>Envoy filter</strong> that puts the x402 payment protocol in front of
+      arbitrary upstreams. Pick a target below and hold down send. Watch the free
+      allowance run out, read the <strong>402</strong>, buy a session, watch that drain instead.
+      Four targets, four prices, two receiving wallets, one gateway.</p>
+  </div>
+
+  <div class="console">
+    <div class="targets" id="targets"></div>
+    <div class="panel">
+      <div class="meterhead">
+        <span id="meter-what" class="what">free allowance</span>
+        <span id="meter-reset"></span>
+      </div>
+      <div class="gauge" id="gauge"></div>
+      <div class="count">
+        <span id="meter-count">—</span>
+        <span id="meter-price"></span>
+      </div>
+
+      <div class="wheelwrap" id="wheelwrap">
+        <div class="wheelbox">
+          <div class="needle"></div>
+          <svg id="wheel" viewBox="0 0 100 100" aria-hidden="true"></svg>
+          <div class="win" id="win" role="status" aria-live="polite"></div>
+        </div>
+      </div>
+
+      <div class="actions">
+        <button id="send">send request</button>
+        <button id="send10" class="ghost">×10</button>
+        <button id="reset" class="quiet">forget session</button>
+      </div>
+      <div class="note" id="note"></div>
     </div>
   </div>
 
-  <div class="panel stats">
-    <div class="stat"><div class="k">Requests</div><div class="v" id="s-total">0</div></div>
-    <div class="stat"><div class="k">Served 200</div><div class="v s200" id="s-ok">0</div></div>
-    <div class="stat"><div class="k">Blocked 402</div><div class="v s402" id="s-402">0</div></div>
-    <div class="stat"><div class="k">Tier</div><div class="v tier-none" id="s-tier">none</div></div>
-  </div>
+  <section>
+    <h2>Where the money is</h2>
+    <p class="hint">Balances read live from the fullnode. The demo pays from one small
+      testnet wallet so you do not need one; each target credits the wallet its own
+      policy names, which is why two of them differ.</p>
+    <div class="wallets" id="wallets"></div>
+  </section>
 
-  <div class="panel">
-    <strong>Payment challenge</strong>
-    <div class="hint" id="challenge-hint">
-      Keep calling until the free tier is spent — the decoded <code>PAYMENT-REQUIRED</code>
-      header will appear here.
+  <section>
+    <h2>Tape</h2>
+    <div class="tape" id="tape"></div>
+  </section>
+
+  <section>
+    <h2>Trace</h2>
+    <p class="hint">Every bar is a real measurement, reported by whoever did the work:
+      this page times itself, the verifier reports its decide/settle split via
+      <code>Server-Timing</code>, and Envoy reports the upstream call via
+      <code>x-envoy-upstream-service-time</code>. Nothing here is estimated.</p>
+    <div id="trace" class="trace"></div>
+  </section>
+
+  <section>
+    <h2>The wire</h2>
+    <p class="hint">The last exchange, decoded from the actual headers. Nothing here is
+      reconstructed for display.</p>
+    <p class="cap">402 · payment-required</p>
+    <pre id="w-challenge">—</pre>
+    <p class="cap">payment-signature</p>
+    <pre id="w-payment">—</pre>
+    <p class="cap">payment-response · receipt</p>
+    <pre id="w-receipt">—</pre>
+  </section>
+
+  <section>
+    <h2>Gateway</h2>
+    <p class="hint">Read from the verifier's Prometheus endpoint. Envoy, the verifier and
+      this page all run on one small VM.</p>
+    <div class="grid">
+      <div class="stat"><div class="k">free served</div><div class="v" id="m-free">—</div></div>
+      <div class="stat"><div class="k">402 issued</div><div class="v" id="m-402">—</div></div>
+      <div class="stat"><div class="k">paid served</div><div class="v" id="m-paid">—</div></div>
+      <div class="stat"><div class="k">settled</div><div class="v" id="m-settled">—</div></div>
+      <div class="stat"><div class="k">refused</div><div class="v" id="m-refused">—</div></div>
+      <div class="stat"><div class="k">budget left</div><div class="v" id="m-left">—</div></div>
     </div>
-    <pre id="challenge" hidden></pre>
-  </div>
+  </section>
 
-  <div class="panel">
-    <strong>Session</strong>
-    <div class="hint" id="session-hint">No session. Pay to get one.</div>
-    <pre id="session" hidden></pre>
-  </div>
+  <section>
+    <h2>Declined</h2>
+    <p class="hint">Each of these was a real bypass found while building this, and each is
+      closed. They run against the live gateway from your browser. If one says
+      <em>got through</em>, that is a bug and I want to hear about it.</p>
+    <div id="attacks"></div>
+    <pre id="attack-detail" hidden></pre>
+  </section>
 
-  <div class="panel">
-    <strong>Request log</strong>
-    <div class="log" id="log"></div>
-  </div>
+  <footer>testnet · worthless USDC · worthless prize<br>
+    <a href="https://github.com/0xfreak0/sui-x402-verifier" target="_blank" rel="noopener">source ↗</a>
+  </footer>
+</div>
 
-  <p class="hint">
-    <strong>Which mode is the gateway in?</strong> In <code>stub-accept-all</code> the
-    Pay button works as-is: payments are accepted without touching the chain and
-    <strong>no funds move</strong>. In <code>sui-grpc</code> the signature is verified
-    on chain and the transfer is simulated, so this button's placeholder payment is
-    correctly refused — a real payment needs a wallet signature
-    (<code>@mysten/dapp-kit</code>'s <code>signTransaction</code>, or
-    <code>scripts/pay-with-sui-cli.sh</code>). Either way the free tier, the 402
-    challenge and the session flow above behave identically.
-  </p>
+<div class="prize-overlay" id="prize">
+  <div class="prize-controls">
+    <button id="mute" class="quiet">🔊 on</button>
+    <button id="close" class="quiet">✕ close</button>
+  </div>
+  <video id="video" src="/rickroll.mp4" playsinline preload="auto"></video>
 </div>
 
 <script>
-// Deliberately dependency-free: no build step, no CDN, so this page can be
-// dropped next to the gateway and opened anywhere.
-const $ = (id) => document.getElementById(id);
-const QUERY = JSON.stringify({ query: '{ chainIdentifier }' });
+const $ = id => document.getElementById(id);
+const API = location.origin;
 
-// Terms captured from the last 402 challenge. A conformant client echoes the
-// requirements it chose back in PaymentPayload.accepted — it does not invent
-// them — so we cannot pay until the server has told us the price.
-let accepted = null;
-let resourceInfo = null;
+/* ── formatting ──────────────────────────────────────────────────────── */
+const DECIMALS = { USDC: 6, SUI: 9 };
 
-let session = null;
-let stats = { total: 0, ok: 0, blocked: 0 };
-
-function endpoint() {
-  return $('endpoint').value.replace(/\/+$/, '');
+/** Render a base-unit amount the way a person reads money. */
+function formatAmount(base, assetType){
+  const symbol = (assetType || '').split('::').pop() || '';
+  const dp = DECIMALS[symbol.toUpperCase()] ?? 0;
+  const n = Number(base || 0) / Math.pow(10, dp);
+  // Small demo prices need their significant digits; big ones do not.
+  const text = n === 0 ? '0' : n < 1 ? n.toFixed(dp).replace(/0+$/,'').replace(/\.$/,'') : n.toFixed(2);
+  return symbol ? `${text} ${symbol}` : text;
 }
 
-function log(status, note) {
-  const cls = status === 200 ? 's200' : status === 402 ? 's402' : 'sErr';
-  const line = document.createElement('div');
-  const stamp = new Date().toLocaleTimeString();
+const short = a => !a ? '—' : a.length > 20 ? `${a.slice(0,8)}…${a.slice(-6)}` : a;
 
-  // `note` can contain upstream response text, so it is inserted as TEXT.
-  // Building this with innerHTML made any upstream able to script this page.
-  const badge = document.createElement('span');
-  badge.className = cls;
-  badge.textContent = status;
-  line.append(badge, document.createTextNode(` · ${stamp} · ${note}`));
-
-  $('log').prepend(line);
+/**
+ * Explorer base URL for a CAIP-2 network.
+ *
+ * Suivision puts every chain except mainnet on its own subdomain, so a bare
+ * suivision.xyz link silently points at mainnet — where a testnet digest does
+ * not exist. Derived from the gateway's configured network rather than
+ * hardcoded, so this cannot drift if the gateway moves chains.
+ */
+function explorerFor(network){
+  const chain = String(network || 'sui:testnet').split(':')[1] || 'testnet';
+  return chain === 'mainnet' ? 'https://suivision.xyz' : `https://${chain}.suivision.xyz`;
 }
-
-function render() {
-  $('s-total').textContent = stats.total;
-  $('s-ok').textContent = stats.ok;
-  $('s-402').textContent = stats.blocked;
-  const tier = $('s-tier');
-  tier.textContent = session ? 'paid' : (stats.total ? 'free' : 'none');
-  tier.className = 'v ' + (session ? 'tier-paid' : stats.total ? 'tier-free' : 'tier-none');
-}
-
-// The browser can only read these headers because Envoy sends
-// Access-Control-Expose-Headers. Without that, JS sees the 402 status but not
-// the terms — which is what makes x402 unusable from a page by default.
-function showChallenge(b64) {
-  try {
-    const decoded = JSON.parse(atob(b64));
-    $('challenge').textContent = JSON.stringify(decoded, null, 2);
-    $('challenge').hidden = false;
-    // v2: `resource` is a top-level object; `accepts[]` entries carry `amount`
-    // (v1 called it maxAmountRequired) and no longer repeat the resource.
-    accepted = (decoded.accepts && decoded.accepts[0]) || null;
-    resourceInfo = decoded.resource || null;
-    $('challenge-hint').textContent = accepted
-      ? `Pay ${accepted.amount} base units of ${accepted.asset.split('::').pop()} to ${accepted.payTo.slice(0, 14)}… on ${accepted.network}.`
-      : (decoded.error || 'Payment required.');
-  } catch (e) {
-    $('challenge').textContent = 'Could not decode challenge: ' + e;
-    $('challenge').hidden = false;
-  }
-}
-
-async function callApi(extraHeaders = {}) {
-  const headers = { 'Content-Type': 'application/json', ...extraHeaders };
-  if (session && !headers['payment-signature']) headers['x-payment-session'] = session;
-
-  let res;
-  try {
-    res = await fetch(endpoint() + '/graphql', { method: 'POST', headers, body: QUERY });
-  } catch (e) {
-    stats.total++; render();
-    log('ERR', 'network error — is the gateway running and reachable? ' + e.message);
-    return null;
-  }
-
-  stats.total++;
-  const challenge = res.headers.get('payment-required');
-  const newSession = res.headers.get('x-payment-session');
-  const receipt = res.headers.get('payment-response');
-
-  if (newSession) {
-    session = newSession;
-    $('session').textContent = session;
-    $('session').hidden = false;
-    let hint = 'Session active — subsequent calls ride this token, no further payment.';
-    if (receipt) {
-      try { hint += '\nReceipt: ' + JSON.stringify(JSON.parse(atob(receipt))); } catch {}
-    }
-    $('session-hint').textContent = hint;
-  }
-
-  // A refused payment carries a receipt with a machine-readable reason, which
-  // is how a client distinguishes "rejected" from "you never paid".
-  if (receipt && res.status === 402) {
-    try {
-      const parsed = JSON.parse(atob(receipt));
-      if (parsed.errorReason === 'invalid_payload') {
-        $('session-hint').textContent =
-          'This gateway is running verification_mode: sui-grpc, so it verifies the ' +
-          'signature on chain and the placeholder payment above cannot satisfy it. ' +
-          'That is the correct answer, not a bug. Produce a real wallet-signed ' +
-          'payment with: scripts/pay-with-sui-cli.sh — or run the gateway in ' +
-          'stub-accept-all mode to exercise the protocol without a wallet.';
-      } else {
-        $('session-hint').textContent = 'Payment refused: ' + parsed.errorReason;
-      }
-    } catch {}
-  }
-
-  if (res.status === 200) {
-    stats.ok++;
-    const body = await res.json().catch(() => ({}));
-    const id = body?.data?.chainIdentifier;
-    log(200, session ? `paid tier · chainIdentifier ${id ?? '—'}` : `free tier · chainIdentifier ${id ?? '—'}`);
-  } else if (res.status === 402) {
-    stats.blocked++;
-    if (challenge) showChallenge(challenge);
-    log(402, 'payment required — free tier exhausted');
-  } else {
-    log(res.status, await res.text().catch(() => 'unexpected status'));
-  }
-
-  render();
-  return res;
-}
-
-$('call').onclick = () => callApi();
-
-$('spam').onclick = async (e) => {
-  e.target.disabled = true;
-  for (let i = 0; i < 10; i++) await callApi();
-  e.target.disabled = false;
+let EXPLORER = explorerFor('sui:testnet');
+const clock = s => {
+  s = Math.max(0, Math.floor(s || 0));
+  const m = Math.floor(s / 60);
+  return m >= 60 ? `${Math.floor(m/60)}h${String(m%60).padStart(2,'0')}m`
+                 : `${m}:${String(s%60).padStart(2,'0')}`;
 };
 
-$('pay').onclick = async (e) => {
-  if (!accepted) {
-    log('—', 'nothing to pay yet — call the API until it returns a 402 with terms');
+/* ── state ───────────────────────────────────────────────────────────── */
+let TARGETS = [];
+let current = null;
+/** Session token per target. One payment buys a session; it drains from there. */
+const sessions = {};
+/** Last meter reported per target, so switching targets does not lose it. */
+const meters = {};
+/** Price and tier per target, read from the gateway's policy table on load. */
+const terms = {};
+let lastBalances = null;
+let busy = false;
+
+/* ── targets ─────────────────────────────────────────────────────────── */
+async function loadTargets(){
+  // Both up front, so prices and allowances render before anything is spent.
+  // Asking the gateway for a 402 to learn a price would consume the very
+  // allowance the meter is about to show.
+  const [targets, policies] = await Promise.all([
+    fetch(API + '/targets').then(r => r.json()),
+    fetch(API + '/policies').then(r => r.json()).catch(() => []),
+  ]);
+  TARGETS = targets;
+  for (const p of policies) terms[p.name] = p;
+  if (policies.length) EXPLORER = explorerFor(policies[0].network);
+  const host = $('targets');
+  host.textContent = '';
+  for (const t of TARGETS){
+    const b = document.createElement('button');
+    b.className = 't';
+    b.setAttribute('aria-pressed', 'false');
+    b.dataset.id = t.id;
+
+    // A radio-style marker, because these are mutually exclusive and a
+    // highlight alone does not say "pick one".
+    const mark = document.createElement('span');
+    mark.className = 'mark'; mark.textContent = '○';
+
+    const name = document.createElement('span');
+    name.className = 'name'; name.textContent = t.label;
+
+    const p = terms[t.id];
+    const price = document.createElement('span');
+    price.className = 'price' + (t.free ? ' free' : '');
+    price.id = `price-${t.id}`;
+    price.textContent = t.free ? 'free' : p ? formatAmount(p.amount, p.asset) : '—';
+
+    const sub = document.createElement('span');
+    sub.className = 'sub';
+    // Say what each row actually sells, since that is what differs between
+    // them — the path alone reads as four copies of the same thing.
+    // Say what this row sells, since that is what differs between them.
+    sub.textContent = p
+      ? (p.freeRequests === 0
+          ? `every request paid · ${p.sessionQuota} per session · ${t.upstream}`
+          : t.free
+            ? `${p.freeRequests} free per ${p.freeWindowSecs}s · ${t.upstream}`
+            : `${p.freeRequests} free per ${p.freeWindowSecs}s, then ${p.sessionQuota} per session · ${t.upstream}`)
+      : `${t.path} → ${t.upstream}`;
+
+    b.append(mark, name, price, sub);
+    b.onclick = () => select(t.id);
+    host.append(b);
+  }
+  select(TARGETS[0].id);
+}
+
+function select(id){
+  current = TARGETS.find(t => t.id === id);
+  for (const b of document.querySelectorAll('.t')) {
+    const on = b.dataset.id === id;
+    b.setAttribute('aria-pressed', String(on));
+    b.querySelector('.mark').textContent = on ? '●' : '○';
+  }
+  $('wheelwrap').classList.toggle('on', id === 'spin');
+  $('send').textContent = id === 'spin' ? 'spin' : 'send request';
+  $('note').textContent = current.detail;
+  $('note').className = 'note';
+  renderMeter();
+}
+
+/* ── the meter ───────────────────────────────────────────────────────── */
+/** Cap on drawn segments. Beyond this a per-request gauge is unreadable. */
+const MAX_SEGMENTS = 30;
+
+/**
+ * Draw a gauge with one segment per request, not a fixed number.
+ *
+ * A rate limit is countable, so the gauge must be too: with a fixed segment
+ * count, spending 1 of 5 moves it by a fifth of a bar and reads as a bug.
+ */
+function drawGauge(remaining, total, spent){
+  const gauge = $('gauge');
+  gauge.className = 'gauge' + (spent ? ' spent' : '');
+  gauge.textContent = '';
+  const n = Math.min(Math.max(total, 1), MAX_SEGMENTS);
+  const lit = total > 0 ? Math.round(remaining / total * n) : 0;
+  const low = total > 0 && remaining / total <= 0.34;
+  for (let i = 0; i < n; i++){
+    const seg = document.createElement('span');
+    seg.className = 'seg' + (i < lit ? (low ? ' on low' : ' on') : '');
+    gauge.append(seg);
+  }
+}
+
+function setPrice(){
+  const t = terms[current.id];
+  if (current.free){ $('meter-price').textContent = 'no payment accepted'; return; }
+  $('meter-price').textContent = t
+    ? `${formatAmount(t.amount, t.asset)} buys ${t.sessionQuota} requests for ${clock(t.sessionDurationSecs)}`
+    : '';
+}
+
+function renderMeter(){
+  if (!current) return;
+  const m = meters[current.id];
+  const policy = terms[current.id];
+  const what = $('meter-what');
+  setPrice();
+
+  // A paid session supersedes the free allowance entirely.
+  if (m && m.sessionQuota != null){
+    drawGauge(m.sessionRemaining, m.sessionQuota, false);
+    what.textContent = 'paid session'; what.className = 'what paid';
+    $('meter-count').innerHTML = `<b>${m.sessionRemaining}</b> of ${m.sessionQuota} requests`;
+    $('meter-reset').textContent = m.sessionExpires != null
+      ? `expires in ${clock(m.sessionExpires)}` : '';
     return;
   }
-  e.target.disabled = true;
 
-  // x402 v2 PaymentPayload (spec §5.2.1). `accepted` is echoed verbatim from
-  // the challenge: the server re-checks every field, so altering the amount,
-  // asset or payTo here is refused rather than honoured.
-  const payload = {
-    x402Version: 2,
-    ...(resourceInfo ? { resource: resourceInfo } : {}),
-    accepted,
-    // Sui `exact` scheme payload: exactly { signature, transaction }, both
-    // base64. In stub mode these are placeholders and no funds move. With a
-    // real wallet, @mysten/dapp-kit's useSignTransaction returns
-    // { bytes, signature } which map to { transaction, signature }.
-    payload: {
-      signature: btoa('placeholder-signature'),
-      transaction: btoa('placeholder-transaction'),
-    },
-  };
-  await callApi({ 'payment-signature': btoa(JSON.stringify(payload)) });
-  e.target.disabled = false;
+  const limit = m?.freeLimit ?? policy?.freeRequests;
+  const window = policy?.freeWindowSecs;
+
+  // No free allowance at all: every request is paid. Saying "0 of 0" beside an
+  // empty bar reads as a broken meter rather than as a deliberate price.
+  if (limit === 0){
+    drawGauge(0, 1, true);
+    what.textContent = 'no free allowance'; what.className = 'what wall';
+    $('meter-count').innerHTML = `<b>every</b> request is paid`;
+    $('meter-reset').textContent = '';
+    return;
+  }
+
+  // Nothing measured yet. The configured allowance is known from the policy
+  // table, so draw it full rather than showing an empty gauge — but say that
+  // it is the configured number, not a live reading.
+  if (!m){
+    if (limit == null){
+      drawGauge(0, 1, false);
+      what.textContent = 'free allowance'; what.className = 'what';
+      $('meter-count').textContent = 'send one to measure';
+      $('meter-reset').textContent = '';
+      return;
+    }
+    drawGauge(limit, limit, false);
+    what.textContent = 'free allowance'; what.className = 'what';
+    $('meter-count').innerHTML = `<b>${limit}</b> per ${window ? window + 's' : 'window'}, as configured`;
+    $('meter-reset').textContent = 'not yet measured';
+    return;
+  }
+
+  const remaining = m.freeRemaining ?? 0;
+  drawGauge(remaining, limit ?? 0, remaining === 0);
+  if (remaining === 0){
+    what.textContent = '402 payment required'; what.className = 'what wall';
+  } else {
+    what.textContent = 'free allowance'; what.className = 'what';
+  }
+  $('meter-count').innerHTML = `<b>${remaining}</b> of ${limit} free requests`;
+  $('meter-reset').textContent = m.freeReset != null ? `resets in ${m.freeReset}s` : '';
+}
+
+/* ── sending ─────────────────────────────────────────────────────────── */
+async function send(){
+  if (busy || !current) return;
+  busy = true;
+  $('send').disabled = $('send10').disabled = true;
+  const target = current.id;
+  const started = performance.now();
+
+  try {
+    const res = await fetch(API + '/send', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ target, session: sessions[target] || null }),
+    });
+    const ms = Math.round(performance.now() - started);
+    const data = await res.json();
+
+    if (!res.ok){
+      tape('err', target, data.detail || data.error || 'refused', ms, res.status);
+      $('note').textContent = data.detail || data.error;
+      $('note').className = 'note bad';
+      return;
+    }
+
+    if (data.session) sessions[target] = data.session;
+    meters[target] = data.meter || {};
+    renderMeter();
+    showWire(data.wire);
+    showTrace(data.trace);
+    $('m-left').textContent = data.playsRemaining;
+
+    const kind = data.status !== 200 ? 'err' : (data.paid ? 'pay' : 'ok');
+    const detail = data.paid && !data.settled
+      ? 'verified, not charged'
+      : data.paid
+        ? `paid ${data.transaction ? short(data.transaction) : 'settled'}`
+        : summarize(data.body);
+    tape(kind, target, detail, ms, data.status, data.transaction);
+
+    if (data.paid && !data.settled){
+      // Verified, served a failure, never charged. Say so in the loudest
+      // place on the panel, because it is the least believable claim here.
+      $('note').textContent =
+        `upstream returned ${data.status} — payment verified but NOT settled, nothing was charged`;
+      $('note').className = 'note bad';
+      refreshBalances();
+    } else if (data.paid){
+      $('note').innerHTML = data.transaction
+        ? `settled on chain · <a href="${EXPLORER}/txblock/${data.transaction}" target="_blank" rel="noopener">${short(data.transaction)} ↗</a>`
+        : 'payment settled';
+      $('note').className = 'note good';
+      refreshBalances();
+    } else {
+      $('note').textContent = current.detail;
+      $('note').className = 'note';
+    }
+
+    if (target === 'spin' && data.status === 200) spin(data.body);
+    metrics();
+  } catch (e) {
+    tape('err', target, String(e), 0, 0);
+    $('note').textContent = String(e);
+    $('note').className = 'note bad';
+  } finally {
+    busy = false;
+    $('send').disabled = $('send10').disabled = false;
+  }
+}
+
+/** Fire ten in a row. Sequential on purpose: the point is watching it count. */
+async function sendTen(){
+  for (let i = 0; i < 10 && !document.hidden; i++){
+    await send();
+    await new Promise(r => setTimeout(r, 140));
+  }
+}
+
+function summarize(body){
+  if (!body) return 'no body';
+  try {
+    const j = JSON.parse(body);
+    if (j.data && j.data.chainIdentifier) return `chain ${j.data.chainIdentifier}`;
+    if (j.data && j.data.checkpoint) return `checkpoint ${j.data.checkpoint.sequenceNumber}`;
+    if (j.roll != null) return `rolled ${j.roll}`;
+    if (j.errors) return `upstream error`;
+  } catch {}
+  return body.length > 48 ? body.slice(0, 48) + '…' : body;
+}
+
+/* ── tape ────────────────────────────────────────────────────────────── */
+function tape(kind, target, msg, ms, status, tx){
+  const row = document.createElement('div');
+  row.className = 'row ' + kind;
+
+  const st = document.createElement('span');
+  st.className = 'st'; st.textContent = status || '···';
+
+  const tg = document.createElement('span');
+  tg.className = 'tg'; tg.textContent = target;
+
+  const m = document.createElement('span');
+  m.className = 'msg';
+  if (tx){
+    const a = document.createElement('a');
+    a.href = `${EXPLORER}/txblock/${tx}`;
+    a.target = '_blank'; a.rel = 'noopener'; a.textContent = msg;
+    m.append(a);
+  } else {
+    m.textContent = msg;
+  }
+
+  const rt = document.createElement('span');
+  rt.className = 'rt'; rt.textContent = ms ? `${ms}ms` : '';
+
+  row.append(st, tg, m, rt);
+  const host = $('tape');
+  host.prepend(row);
+  while (host.children.length > 40) host.lastChild.remove();
+}
+
+/* ── trace ───────────────────────────────────────────────────────────── */
+function showTrace(trace){
+  const host = $('trace');
+  host.textContent = '';
+  if (!trace || !trace.length) return;
+
+  // Scale to the whole exchange so the bars are comparable to each other,
+  // which is the only reason to draw them rather than list numbers.
+  const total = Math.max(...trace.map(s => s.startMs + s.durMs), 1);
+
+  for (const s of trace){
+    const row = document.createElement('div');
+    row.className = `sp ${s.outcome}` + (s.depth ? ' child' : '');
+
+    const lane = document.createElement('div'); lane.className = 'lane';
+    const bar = document.createElement('div'); bar.className = 'bar';
+    bar.style.left = `${(s.startMs / total) * 100}%`;
+    bar.style.width = `${Math.max((s.durMs / total) * 100, 0.6)}%`;
+
+    const txt = document.createElement('div'); txt.className = 'txt';
+    const name = document.createElement('span'); name.className = 'name'; name.textContent = s.name;
+    const who = document.createElement('span'); who.className = 'who'; who.textContent = s.actor;
+    txt.append(name, who);
+    // The skipped settlement is the point of the whole trace, so it says why
+    // in place rather than making anyone hover or guess.
+    if (s.outcome === 'skip'){
+      const why = document.createElement('span');
+      why.className = 'note-inline'; why.textContent = s.detail;
+      txt.append(why);
+    }
+
+    lane.append(bar, txt);
+    const ms = document.createElement('div'); ms.className = 'ms';
+    ms.textContent = s.outcome === 'skip' ? '—' : `${s.durMs.toFixed(0)}ms`;
+
+    row.append(lane, ms);
+    host.append(row);
+  }
+}
+
+/* ── wire ────────────────────────────────────────────────────────────── */
+function showWire(wire){
+  if (!wire) return;
+  const put = (id, v) => $(id).textContent = v ? JSON.stringify(v, null, 2) : '—';
+  put('w-challenge', wire.challenge);
+  put('w-payment', wire.payment);
+  put('w-receipt', wire.receipt);
+}
+
+/* ── wallets ─────────────────────────────────────────────────────────── */
+async function refreshBalances(){
+  try {
+    const b = await (await fetch(API + '/balances')).json();
+    const host = $('wallets');
+    host.textContent = '';
+
+    const row = (label, address, balance, previous) => {
+      const el = document.createElement('div'); el.className = 'w';
+      const l = document.createElement('span'); l.className = 'lbl'; l.textContent = label;
+      const a = document.createElement('span'); a.className = 'addr';
+      const link = document.createElement('a');
+      link.href = `${EXPLORER}/account/${address}`;
+      link.target = '_blank'; link.rel = 'noopener'; link.textContent = short(address);
+      a.append(link);
+      const v = document.createElement('span'); v.className = 'bal';
+      v.textContent = balance == null ? '—' : formatAmount(balance, b.asset);
+      // A delta is the part a receipt cannot convey: money actually moved.
+      if (previous != null && balance != null && previous !== balance){
+        const d = document.createElement('span');
+        d.className = 'delta' + (balance > previous ? ' up' : '');
+        d.textContent = ` ${balance > previous ? '+' : '−'}${formatAmount(Math.abs(balance - previous), b.asset)}`;
+        v.append(d);
+      }
+      el.append(l, a, v);
+      host.append(el);
+    };
+
+    row('from', b.payer, b.payerBalance, lastBalances && lastBalances.payerBalance);
+    for (const p of b.payees){
+      const before = lastBalances && (lastBalances.payees.find(x => x.address === p.address) || {}).balance;
+      row(`to · ${p.target}`, p.address, p.balance, before);
+    }
+    lastBalances = b;
+  } catch {}
+}
+
+/* ── metrics ─────────────────────────────────────────────────────────── */
+function sum(text, name, labels){
+  let total = 0;
+  for (const line of text.split('\n')){
+    if (!line.startsWith(name)) continue;
+    if (labels.some(l => !line.includes(l))) continue;
+    const v = parseFloat(line.slice(line.lastIndexOf(' ')));
+    if (!Number.isNaN(v)) total += v;
+  }
+  return total;
+}
+
+async function metrics(){
+  try {
+    const t = await (await fetch(API + '/metrics')).text();
+    $('m-free').textContent    = sum(t,'x402_requests_total',['tier="free"','decision="allow"']);
+    $('m-402').textContent     = sum(t,'x402_requests_total',['decision="challenge"']);
+    $('m-paid').textContent    = sum(t,'x402_requests_total',['tier="paid"']);
+    $('m-settled').textContent = sum(t,'x402_payments_total',['outcome="settled"']);
+    $('m-refused').textContent = sum(t,'x402_payments_total',['outcome="rejected"']);
+  } catch {}
+}
+
+/* ── the wheel, for the one target that is a game ─────────────────────── */
+// Labels stay short because they are drawn radially: past about ten
+// characters they run off the rim. The winning slice is deliberately the one
+// thing everybody in the room actually wants, at a half-percent of the wheel —
+// and you land on it every single time.
+const SEGS = [
+  {label:'BAD LUCK',w:9},{label:'RUGGED',w:9},{label:'REORG',w:9},{label:'GAS SPIKE',w:9},
+  {label:'SLASHED',w:9},{label:'SUI $20',w:0.5,win:true},{label:'HACKED',w:9},{label:'TAXED',w:9},
+  {label:'SEC CALLS',w:9},{label:'FORKED',w:9},{label:'DELISTED',w:9},{label:'SEED LEAK',w:9},
+  {label:'LIQUIDATED',w:9},
+];
+const TOTAL_W = SEGS.reduce((a,s) => a + s.w, 0);
+
+(function drawWheel(){
+  let angle = 0, out = '';
+  SEGS.forEach((seg, i) => {
+    const sweep = seg.w / TOTAL_W * 360;
+    const a0 = angle, a1 = angle + sweep;
+    seg._mid = a0 + sweep / 2;
+    const pt = a => [50 + 48 * Math.cos((a - 90) * Math.PI/180),
+                     50 + 48 * Math.sin((a - 90) * Math.PI/180)];
+    const [x0,y0] = pt(a0), [x1,y1] = pt(a1);
+    const fill = seg.win ? '#f2b441' : (i % 2 ? '#16303a' : '#102229');
+    out += `<path d="M50,50 L${x0},${y0} A48,48 0 ${sweep>180?1:0},1 ${x1},${y1} Z"
+             fill="${fill}" stroke="${seg.win ? '#fff3d6' : '#0b1418'}"
+             stroke-width="${seg.win ? '.9' : '.4'}"/>`;
+    // Radial labels: a chord long enough for "LIQUIDATED" does not exist at
+    // this radius, so the text runs outward instead of across.
+    out += `<g transform="translate(50,50) rotate(${seg._mid - 90})">
+      <text x="15" y="0" font-family="ui-monospace,monospace" font-size="3.4"
+        font-weight="${seg.win ? '700' : '600'}"
+        fill="${seg.win ? '#231704' : '#9fc0cc'}"
+        text-anchor="start" dominant-baseline="central">${seg.label}</text></g>`;
+    angle = a1;
+  });
+  out += `<circle cx="50" cy="50" r="6" fill="#0b1418" stroke="#c9922f" stroke-width="1"/>`;
+  $('wheel').innerHTML = out;
+})();
+
+let turns = 0;
+const SPIN_MS = 5000;
+
+function spin(body){
+  const win = SEGS.find(s => s.win);
+  // Everyone wins. That is the joke, and it is also why the prize is a rickroll.
+  turns += 6;
+  const target = turns * 360 - win._mid + (Math.random() * 3 - 1.5);
+  $('wheel').style.transform = `rotate(${target}deg)`;
+  $('win').classList.remove('on');
+  // Unlock the media element inside the click that started this, or iOS will
+  // refuse to play with sound six seconds later.
+  primeAudio();
+
+  setTimeout(() => {
+    $('win').textContent = `YOU WIN · ${win.label}`;
+    $('win').classList.add('on');
+  }, SPIN_MS + 120);
+  // Just long enough to believe it.
+  setTimeout(() => {
+    $('win').classList.remove('on');
+    playPrize();
+  }, SPIN_MS + 1200);
+}
+
+/* ── prize ───────────────────────────────────────────────────────────── */
+const MUTE_KEY = 'x402.muted';
+let wantSound = localStorage.getItem(MUTE_KEY) !== '1';
+
+/** Unlock the media element during the click, so sound is allowed later. */
+function primeAudio(){
+  const v = $('video');
+  v.muted = true;
+  const p = v.play();
+  if (p && p.then) p.then(() => { v.pause(); v.currentTime = 0; }).catch(() => {});
+}
+
+function playPrize(){
+  const v = $('video');
+  $('prize').classList.add('on');
+  v.muted = !wantSound;
+  v.currentTime = 0;
+  const p = v.play();
+  if (p && p.catch) p.catch(() => { v.muted = true; v.play().catch(() => {}); });
+  syncMute();
+}
+
+function syncMute(){ $('mute').textContent = wantSound ? '🔊 on' : '🔇 off'; }
+
+function closePrize(){
+  const v = $('video');
+  v.pause(); v.currentTime = 0;
+  $('prize').classList.remove('on');
+}
+
+$('mute').onclick = () => {
+  wantSound = !wantSound;
+  localStorage.setItem(MUTE_KEY, wantSound ? '0' : '1');
+  $('video').muted = !wantSound;
+  if (wantSound) $('video').play().catch(() => {});
+  syncMute();
 };
+$('close').onclick = closePrize;
+$('video').onclick = closePrize;
+$('video').onended = closePrize;
+addEventListener('keydown', e => {
+  if (e.key === 'Escape') closePrize();
+  if (e.key === 'm' || e.key === 'M') $('mute').click();
+});
 
+/* ── declined ────────────────────────────────────────────────────────── */
+const ATTACKS = [
+  { name:'Pay less than the price',      mutate:t=>({...t, amount:'1'}) },
+  { name:'Pay yourself instead',         mutate:t=>({...t, payTo:'0x'+'1'.repeat(64)}) },
+  { name:'Pay in a worthless token',     mutate:t=>({...t, asset:'0xdead::fake::FAKE'}) },
+  { name:'Name a chain we do not serve', mutate:t=>({...t, network:'sui:mainnet'}) },
+  { name:'Send a v1-shaped payload',     v1:true },
+  { name:'Assert x-x402-tier: paid',     header:true },
+  { name:'Reuse a session on a pricier route', crossPolicy:true },
+];
+
+(function(){
+  const host = $('attacks');
+  for (const a of ATTACKS) {
+    const row = document.createElement('div');
+    row.className = 'declined';
+    const name = document.createElement('span'); name.textContent = a.name;
+    const verdict = document.createElement('span'); verdict.className = 'verdict'; verdict.textContent = '—';
+    const btn = document.createElement('button'); btn.className = 'quiet'; btn.textContent = 'try';
+    btn.onclick = () => attack(a, verdict, btn);
+    row.append(name, verdict, btn);
+    host.append(row);
+  }
+})();
+
+// Each attack needs a transaction blob nobody has sent before, or replay
+// protection rejects it for the wrong reason and the demo proves nothing.
+// NOT crypto.randomUUID(): that is secure-context only, so it is undefined
+// over plain http on a LAN address — which is exactly how this gets shared.
+let nonceSeq = 0;
+const nonce = () => `${Date.now()}-${nonceSeq++}-${Math.random().toString(36).slice(2)}`;
+
+async function attack(a, verdict, btn){
+  btn.disabled = true;
+  verdict.className = 'verdict'; verdict.textContent = 'trying…';
+  try {
+    await runAttack(a, verdict);
+  } catch (e) {
+    verdict.className = 'verdict bad';
+    verdict.textContent = 'client error';
+    $('attack-detail').hidden = false;
+    $('attack-detail').textContent =
+      `${a.name}\n  ${e}\n  → the attack never reached the gateway; this is a bug in the page`;
+  }
+  btn.disabled = false;
+  metrics();
+}
+
+/**
+ * Read the gateway's own account of how a request was served.
+ *
+ * This is the difference between a real bypass and a request the free tier
+ * would have served anyway. A bare 200 proves nothing: if the allowance had
+ * room, an attack that attached no payment at all still gets one.
+ */
+function servedAs(res){
+  if (res.status === 402) return 'refused';
+  if (res.headers.get('x-x402-session-remaining') != null) return 'paid';
+  if (res.headers.get('x-x402-free-remaining') != null) return 'free';
+  return 'unknown';
+}
+
+/**
+ * Spend the free allowance on `path` so the gate is actually challenging.
+ *
+ * Without this the attacks are non-deterministic: the same forged payment
+ * reads as blocked or as "got through" depending on how many requests the
+ * page happened to make first. These are free requests, so the only cost is
+ * the meter above resetting a minute later.
+ */
+async function drain(path, headers, body){
+  for (let i = 0; i < 14; i++){
+    const res = await fetch(API + path, { method:'POST', headers, body });
+    if (res.status === 402) return true;
+  }
+  return false;
+}
+
+async function runAttack(a, verdict){
+  const body = JSON.stringify({ query:'{ chainIdentifier }' });
+  const json = {'content-type':'application/json'};
+  const gated = '/graphql';
+
+  // Cross-policy reuse needs a session bought somewhere cheaper. Without one
+  // there is nothing to test, and saying so beats a false pass.
+  if (a.crossPolicy){
+    const token = sessions.graphql;
+    if (!token){
+      verdict.className = 'verdict';
+      verdict.textContent = 'buy a graphql session first';
+      detail(a, 'no session held',
+        'send on "GraphQL · latest checkpoint" until you pay, then retry');
+      return;
+    }
+    const grpcPath = '/sui.rpc.v2.LedgerService/GetServiceInfo';
+    const grpcHeaders = {'content-type':'application/grpc-web+proto','x-grpc-web':'1'};
+    const frame = new Uint8Array([0,0,0,0,0]);
+    // The gRPC route has its own small allowance; spend it or a refused
+    // session is indistinguishable from a served one.
+    await drain(grpcPath, grpcHeaders, frame);
+
+    const res = await fetch(API + grpcPath, {
+      method:'POST',
+      headers:{...grpcHeaders, 'x-payment-session':token},
+      body: frame,
+    });
+    const how = servedAs(res);
+    verdictFor(verdict, how);
+    detail(a, `HTTP ${res.status} · served as ${how}`, explain(how,
+      'refused: a session is scoped to the policy that minted it'));
+    return;
+  }
+
+  // Every other attack needs a live challenge to mutate, which only exists
+  // once the allowance is gone.
+  const exhausted = await drain(gated, json, body);
+  if (!exhausted){
+    verdict.className = 'verdict';
+    verdict.textContent = 'allowance would not empty';
+    detail(a, 'still being served for free',
+      'could not reach the paid path, so nothing was actually tested');
+    return;
+  }
+
+  const probe = await fetch(API + gated, {method:'POST', headers:json, body});
+  const raw = probe.headers.get('payment-required');
+  const t = raw ? JSON.parse(atob(raw)).accepts[0] : null;
+  if (!t && !a.header){
+    verdict.className = 'verdict';
+    verdict.textContent = 'no challenge to mutate';
+    detail(a, 'the gateway issued no terms', 'nothing was tested');
+    return;
+  }
+
+  const headers = {...json};
+  if (a.header){
+    headers['x-x402-tier']='paid'; headers['x-x402-payer']='0x'+'a'.repeat(64);
+  } else {
+    const payload = a.v1
+      ? {x402Version:2,scheme:'exact',network:t.network,
+         payload:{transactionBytes:'dHg=',signatures:['c2ln'],payer:'0xclaimed'}}
+      : {x402Version:2,accepted:a.mutate(t),
+         payload:{signature:btoa('x'),transaction:btoa('y-'+nonce())}};
+    headers['payment-signature'] = btoa(JSON.stringify(payload));
+  }
+
+  const res = await fetch(API + gated,{method:'POST',headers,body});
+  const rec = res.headers.get('payment-response');
+  const reason = rec ? (JSON.parse(atob(rec)).errorReason || '') : '';
+  const how = servedAs(res);
+
+  verdictFor(verdict, how, reason);
+  detail(a, `HTTP ${res.status}${reason ? '  ·  ' + reason : ''}  ·  served as ${how}`,
+    explain(how, 'refused, as it should be'));
+}
+
+function verdictFor(verdict, how, reason){
+  if (how === 'paid'){
+    verdict.className = 'verdict bad';
+    verdict.textContent = 'got through';
+  } else if (how === 'refused'){
+    verdict.className = 'verdict good';
+    verdict.textContent = reason || '402 refused';
+  } else {
+    // Served, but by the free tier — the attack bought nothing.
+    verdict.className = 'verdict good';
+    verdict.textContent = 'free tier only';
+  }
+}
+
+function explain(how, refusedText){
+  if (how === 'paid') return 'this is a bug — please tell me';
+  if (how === 'refused') return refusedText;
+  return 'served by the free allowance, not by the forged payment — it bought nothing';
+}
+
+function detail(a, line, verdictLine){
+  $('attack-detail').hidden = false;
+  $('attack-detail').textContent = `${a.name}\n  ${line}\n  → ${verdictLine}`;
+}
+
+/* ── boot ────────────────────────────────────────────────────────────── */
+$('send').onclick = send;
+$('send10').onclick = sendTen;
 $('reset').onclick = () => {
-  session = null;
-  $('session').hidden = true;
-  $('session-hint').textContent = 'No session. Pay to get one.';
-  render();
-  log('—', 'session discarded locally (server-side session still exists until it expires)');
+  if (!current) return;
+  delete sessions[current.id];
+  delete meters[current.id];
+  renderMeter();
+  $('note').textContent = 'session forgotten; the next request starts from the free tier';
+  $('note').className = 'note';
 };
 
-render();
+loadTargets().catch(e => { $('note').textContent = String(e); $('note').className = 'note bad'; });
+refreshBalances();
+metrics();
+setInterval(metrics, 5000);
+setInterval(refreshBalances, 20000);
+// Reset and expiry countdowns are only truthful if they actually tick.
+setInterval(() => {
+  let changed = false;
+  for (const [id, m] of Object.entries(meters)){
+    if (m.freeReset > 0){
+      m.freeReset--;
+      // The window has rolled: the allowance really is back, so restore it
+      // rather than leaving a spent gauge parked at "resets in 0s".
+      if (m.freeReset === 0 && m.freeLimit != null){
+        m.freeRemaining = m.freeLimit;
+        m.freeReset = terms[id]?.freeWindowSecs ?? null;
+      }
+      changed = true;
+    }
+    if (m.sessionExpires > 0){
+      m.sessionExpires--;
+      // An expired session stops covering requests; fall back to the free
+      // meter so the page does not promise access it no longer has.
+      if (m.sessionExpires === 0) delete meters[id];
+      changed = true;
+    }
+  }
+  if (changed) renderMeter();
+}, 1000);
 </script>
 </body>
 </html>

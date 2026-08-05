@@ -68,7 +68,10 @@ static_resources:
                           allow_headers: "content-type, payment-signature, x-payment-session, x-grpc-web, grpc-timeout, x-user-agent"
                           # grpc-status/grpc-message must be exposed too, or a
                           # grpc-web client cannot read the denial status.
-                          expose_headers: "payment-required, payment-response, x-payment-session, grpc-status, grpc-message"
+                          # The meter headers must be exposed too, or a page can
+                          # only discover the free-tier wall by hitting it and
+                          # cannot show how much of a bought session is left.
+                          expose_headers: "payment-required, payment-response, x-payment-session, grpc-status, grpc-message, x-x402-tier, x-x402-free-remaining, x-x402-free-limit, x-x402-free-reset, x-x402-session-remaining, x-x402-session-quota, x-x402-session-expires"
                           max_age: "86400"
                       routes:
                         # gRPC method paths are /<package>.<Service>/<Method>,
@@ -124,6 +127,67 @@ static_resources:
                               check_settings:
                                 context_extensions:
                                   x402_policy: grpc
+
+                        # A genuinely free route. Same upstream and same
+                        # filter chain as the priced GraphQL rule below — only
+                        # the policy differs, which is what makes "free" a
+                        # pricing decision rather than a bypass.
+                        - match: { prefix: "/free/graphql" }
+                          route:
+                            cluster: sui_graphql
+                            host_rewrite_literal: graphql.testnet.sui.io
+                            prefix_rewrite: "/graphql"
+                            timeout: 30s
+                          metadata:
+                            filter_metadata:
+                              envoy.filters.http.ext_proc:
+                                x402_policy: free
+                          typed_per_filter_config:
+                            envoy.filters.http.ext_authz:
+                              "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute
+                              check_settings:
+                                context_extensions:
+                                  x402_policy: free
+
+                        # An upstream that fails on purpose. Gated identically
+                        # to everything else: the only difference is that the
+                        # backend returns 503, so ext_proc's response phase
+                        # discards the verified payment instead of settling it.
+                        - match: { prefix: "/boom" }
+                          route:
+                            cluster: demo_backend
+                            prefix_rewrite: "/broken"
+                            timeout: 10s
+                          metadata:
+                            filter_metadata:
+                              envoy.filters.http.ext_proc:
+                                x402_policy: broken
+                          typed_per_filter_config:
+                            envoy.filters.http.ext_authz:
+                              "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute
+                              check_settings:
+                                context_extensions:
+                                  x402_policy: broken
+
+                        # An ordinary application behind the same gate, proving
+                        # the upstream need not be a blockchain node at all.
+                        # The demo backend serves the spin result; the gateway
+                        # decides whether it is allowed to.
+                        - match: { prefix: "/spin" }
+                          route:
+                            cluster: demo_backend
+                            prefix_rewrite: "/wheel"
+                            timeout: 10s
+                          metadata:
+                            filter_metadata:
+                              envoy.filters.http.ext_proc:
+                                x402_policy: spin
+                          typed_per_filter_config:
+                            envoy.filters.http.ext_authz:
+                              "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute
+                              check_settings:
+                                context_extensions:
+                                  x402_policy: spin
 
                         # Everything else goes to GraphQL.
                         - match: { prefix: "/" }
@@ -247,6 +311,23 @@ static_resources:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
 
   clusters:
+    # The demo application. Plain HTTP/1.1 on loopback: it is the "anything"
+    # in "payments in front of anything", and it is deliberately unaware that
+    # it is being sold — it has no payment code of its own.
+    - name: demo_backend
+      type: STRICT_DNS
+      connect_timeout: 1s
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: demo_backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: 8402
+
     # The verifier. HTTP/2 is mandatory — this is a gRPC service.
     - name: x402_verifier
       type: STRICT_DNS

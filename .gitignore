@@ -9,13 +9,17 @@
 /config.yaml
 /config.*.yaml
 !/config.example.yaml
+# config.demo.yaml is tracked: it carries no wallet and no secret (both come
+# from the environment), and it is the reference for the four-policy setup the
+# demo runs on.
+!/config.demo.yaml
 
 .DS_Store
 
-# Local working notes and parked deploy work — see LOCAL-NOTES.md.
-# Deliberately untracked until the x402 conformance work lands; deploying a
-# non-conformant demo would show clients something they cannot talk to.
-/LOCAL-NOTES.md
+# Development scratch: session notes, design spikes, parked work, runbooks.
+# Never committed. See CLAUDE.md for what belongs here versus in docs/.
+/scratchpad/
+
 /X402-CONFORMANCE-PROMPT.md
 /Dockerfile
 /.dockerignore

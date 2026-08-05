@@ -1,0 +1,118 @@
+# Configuration for the public demo at suisonar.dev.
+#
+# Four routes behind one gateway, each a different product: a free one, two
+# priced differently in different protocols, and an application. The point of
+# the demo is that these differ in every dimension the gateway can price —
+# amount, receiving wallet, free allowance, and what one payment buys.
+#
+# NO WALLET ADDRESSES LIVE IN THIS FILE. Supply them via the environment:
+#
+#   export X402_SESSION_HMAC_SECRET=$(openssl rand -hex 32)
+#   export X402_PAY_TO=0x<default receiving wallet>
+#   export X402_PAY_TO_GRPC=0x<a second wallet, to prove routes differ>
+#
+# The `pay_to` below is the zero-address placeholder and the service REFUSES TO
+# START with it, so a missing environment variable fails loudly at boot rather
+# than quietly settling somewhere wrong.
+
+listen_addr: "127.0.0.1:50051"
+metrics_listen_addr: "127.0.0.1:9090"
+
+# The §7 facilitator API. Loopback only — /settle moves money and none of
+# this is authenticated. The demo page reads GET /policies through it so it
+# can price the target list without spending a free-tier request to find out.
+facilitator_api_listen_addr: "127.0.0.1:50052"
+
+sui_grpc_url: "https://fullnode.testnet.sui.io:443"
+sui_chain: "testnet"
+verification_mode: sui-grpc
+
+# Placeholder. Override with X402_SESSION_HMAC_SECRET.
+session_hmac_secret: "abababababababababababababababababababababababababababababababab"
+
+payment:
+  scheme: "exact"
+  network: "sui:testnet"
+  # Base units. USDC has 6 decimals, so "10" == 0.00001 USDC.
+  amount: "10"
+  # Circle's USDC on Sui testnet. Faucet: https://faucet.circle.com
+  asset: "0xa1ec7fc00a6f40db9693ad1415d0c193ad3906494428cf252621037bd7117e29::usdc::USDC"
+  pay_to: "0x0000000000000000000000000000000000000000000000000000000000000000"
+  max_timeout_seconds: 60
+  description: "Sui testnet gateway"
+
+# Fallbacks for any route that names no policy. Every policy below overrides
+# these, so if a request lands here it means Envoy and this file have drifted.
+free_tier:
+  max_requests: 5
+  window_secs: 60
+paid_tier:
+  quota: 1000
+  duration_secs: 3600
+
+store:
+  backend: memory
+
+policies:
+  # 1. Genuinely free. Proves the gate is transparent when policy says so —
+  #    the request is metered and passed through, never challenged.
+  #    A limit rather than no limit: "free" is a price, not an absence of
+  #    rate limiting, and an unmetered public route is an outage waiting to
+  #    happen.
+  free:
+    description: "Sui testnet GraphQL — free tier"
+    free_tier:
+      max_requests: 600
+      window_secs: 60
+
+  # 2. The metered read. Small free allowance so the wall arrives in seconds,
+  #    which is the entire demo.
+  graphql:
+    amount: "10"
+    description: "Sui testnet GraphQL queries"
+    free_tier:
+      max_requests: 5
+      window_secs: 60
+    paid_tier:
+      quota: 1000
+      duration_secs: 3600
+
+  # 3. A different protocol, a different price, and a DIFFERENT WALLET. This
+  #    is the one that shows a single gateway serving unrelated sellers.
+  #    Set X402_PAY_TO_GRPC or it inherits the default wallet and the demo
+  #    silently loses its point.
+  grpc:
+    amount: "50"
+    description: "Sui testnet fullnode gRPC calls"
+    free_tier:
+      max_requests: 2
+      window_secs: 60
+    paid_tier:
+      quota: 200
+      duration_secs: 3600
+
+  # 4. An upstream that always fails. Same price and same gate as anything
+  #    else — the difference is that its 503 means settlement never runs, which
+  #    is the property `ext_proc` exists to provide and the one people most
+  #    reasonably disbelieve.
+  broken:
+    amount: "20"
+    description: "An upstream that always fails"
+    free_tier:
+      max_requests: 0
+      window_secs: 60
+    paid_tier:
+      quota: 50
+      duration_secs: 1800
+
+  # 5. An ordinary application behind the same gate. No free allowance: every
+  #    spin is paid, which keeps the wire view honest.
+  spin:
+    amount: "20"
+    description: "Spin the wheel"
+    free_tier:
+      max_requests: 0
+      window_secs: 60
+    paid_tier:
+      quota: 50
+      duration_secs: 1800
