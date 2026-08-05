@@ -29,6 +29,14 @@ reviewed, and expected to stay true. If a scratchpad note starts getting cited
 in conversation, that is the signal to rewrite it for that audience and promote
 it — not to leave it in two places.
 
+## Nothing goes upstream
+
+This is an exploratory prototype. Do not open issues or pull requests against
+`coinbase/x402` or any other external repository, and do not otherwise publish
+on its behalf. The notes in `docs/upstream-issues/` record where the spec is
+underspecified for our own reference — they are not drafts awaiting submission,
+whatever their filenames suggest.
+
 ## Never commit a wallet address
 
 Not a real one, not a placeholder that looks real, not "just for testing".

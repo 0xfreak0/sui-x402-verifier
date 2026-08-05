@@ -2,7 +2,9 @@
 
 **Repo:** coinbase/x402
 **Against:** `specs/x402-specification-v2.md` §9, `specs/schemes/exact/scheme_exact_sui.md`
-**Status:** draft — not yet filed
+**Status:** DO NOT FILE. This repo is an exploratory prototype; nothing here
+is to be opened against coinbase/x402 or any other external repo. Kept as
+notes on where the spec is underspecified, for our own reference only.
 
 ---
 
