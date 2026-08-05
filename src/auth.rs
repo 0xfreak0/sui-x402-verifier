@@ -163,6 +163,9 @@ pub enum Decision {
 #[derive(Debug)]
 pub struct AppState {
     pub config: Config,
+    /// Settlement health per policy. Stops the gateway serving paid traffic
+    /// for free when settlement is systematically failing.
+    pub breaker: crate::breaker::SettlementBreaker,
     pub sessions: Arc<SessionStore>,
     pub limiter: RateLimiter,
     /// Shared with the optional facilitator HTTP API so both surfaces enforce
@@ -1128,6 +1131,7 @@ pub mod test_support {
         let limiter = RateLimiter::Memory(MemoryRateLimiter::new());
         Arc::new(AppState {
             config,
+            breaker: crate::breaker::SettlementBreaker::new(),
             sessions,
             limiter,
             facilitator,

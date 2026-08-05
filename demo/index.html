@@ -221,6 +221,11 @@
     opacity:0;transform:scale(.82);pointer-events:none;padding:2rem;
     transition:opacity .18s ease,transform .18s cubic-bezier(.2,1.5,.4,1)}
   .win.on{opacity:1;transform:scale(1)}
+  .prize-fallback{position:absolute;inset:0;display:grid;place-content:center;gap:.8rem;
+    text-align:center;padding:2rem;color:var(--paper);font-family:var(--mono)}
+  .pf-win{font-size:clamp(1.6rem,7vw,3rem);font-weight:700;color:var(--money);letter-spacing:.06em}
+  .pf-sub{color:var(--paper);max-width:34ch;margin:0 auto;line-height:1.5}
+  .pf-hint{color:var(--faint);font-size:12px}
   .prize-overlay{position:fixed;inset:0;z-index:100;display:none;place-items:center;background:#000}
   .prize-overlay.on{display:grid}
   #video{width:100vw;height:100vh;object-fit:contain;background:#000}
@@ -423,6 +428,12 @@ done      # 200 200 200 200 200 402</pre>
     <button id="close" class="quiet">✕ close</button>
   </div>
   <video id="video" src="/rickroll.mp4" playsinline preload="auto"></video>
+  <div class="prize-fallback" id="fallback" hidden>
+    <div class="pf-win">YOU WIN</div>
+    <div class="pf-sub">Your prize is a video that is not in this repository,
+      because it belongs to Rick Astley.</div>
+    <div class="pf-hint">Drop any mp4 at <code>demo/rickroll.mp4</code> to restore it.</div>
+  </div>
 </div>
 
 <script>
@@ -949,6 +960,14 @@ function playPrize(){
   if (p && p.catch) p.catch(() => { v.muted = true; v.play().catch(() => {}); });
   syncMute();
 }
+
+// The prize video is not in the repo — it is someone else's copyrighted work.
+// A fresh clone therefore has no /rickroll.mp4, and the overlay would sit black
+// forever. Say what happened instead.
+$('video').onerror = () => {
+  $('fallback').hidden = false;
+  $('video').style.display = 'none';
+};
 
 function syncMute(){ $('mute').textContent = wantSound ? '🔊 on' : '🔇 off'; }
 

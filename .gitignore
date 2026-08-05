@@ -16,6 +16,11 @@
 
 .DS_Store
 
+# The prize video. Someone else's copyrighted work, and there is no reason to
+# redistribute it from this repo. Fetch or supply your own; the page degrades to
+# a text card when it is absent.
+/demo/rickroll.mp4
+
 # Development scratch: session notes, design spikes, parked work, runbooks.
 # Never committed. See CLAUDE.md for what belongs here versus in docs/.
 /scratchpad/

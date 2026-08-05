@@ -165,6 +165,53 @@ fn header_map(
         .unwrap_or_default()
 }
 
+/// Refuse a payment because settlement is currently failing.
+///
+/// 503 rather than 402: a 402 invites the client to pay again, and the problem
+/// is that we cannot take their money right now. `Retry-After` gives them
+/// something better to do than hammer it.
+fn settlement_unavailable(path: &str) -> ProcessingResponse {
+    let grpc = path.starts_with("/sui.rpc.v2.") || path.starts_with("/grpc.");
+    let body = serde_json::json!({
+        "error": "settlement_unavailable",
+        "message": "Payments are temporarily refused because settlement is failing. \
+                    The free tier is unaffected. Try again shortly.",
+    });
+
+    let mut headers = vec![
+        header("retry-after", "30"),
+        header("content-type", if grpc { "application/grpc" } else { "application/json" }),
+    ];
+    if grpc {
+        // 14 UNAVAILABLE is the gRPC status a client will retry on.
+        headers.push(header("grpc-status", "14"));
+        headers.push(header("grpc-message", "settlement%20unavailable"));
+    }
+
+    ProcessingResponse {
+        response: Some(processing_response::Response::ImmediateResponse(
+            ImmediateResponse {
+                status: Some(HttpStatus {
+                    // A gRPC denial is a trailers-only 200; see auth.rs.
+                    code: if grpc {
+                        HttpStatusCode::Ok as i32
+                    } else {
+                        HttpStatusCode::ServiceUnavailable as i32
+                    },
+                }),
+                headers: Some(HeaderMutation {
+                    set_headers: headers,
+                    remove_headers: Vec::new(),
+                }),
+                body: serde_json::to_vec(&body).unwrap_or_default(),
+                grpc_status: None,
+                details: String::new(),
+            },
+        )),
+        ..Default::default()
+    }
+}
+
 /// How long a gRPC stream may run, expressed as a `grpc-timeout` value.
 ///
 /// Streaming is sold by duration: a payment buys a window, and the stream must
@@ -416,6 +463,32 @@ async fn handle_request_headers(
     let path = map.get(":path").cloned().unwrap_or_default();
     let resource_url = resource_url(&map, &path);
 
+    // Check before verifying: accepting a payment we cannot settle means
+    // serving the resource and never being paid for it. The free tier is
+    // deliberately left alone — an outage should degrade the paid tier, not
+    // take the whole gateway down.
+    let breaker_policy = policy
+        .clone()
+        .unwrap_or_else(|| crate::config::DEFAULT_POLICY_LABEL.to_string());
+    let breaker = state.breaker.state(&breaker_policy);
+    if !breaker.accepts_payment() && view.get(x402::HEADER_PAYMENT_SIGNATURE).is_some() {
+        // The state is the label so an operator can tell a tripped breaker
+        // from a half-open probe that lost the race, which look identical from
+        // the client's side.
+        metrics::counter!(
+            m::PAYMENTS,
+            "outcome" => "breaker_open",
+            "code" => breaker.as_str(),
+            "mode" => "deferred",
+        )
+        .increment(1);
+        tracing::warn!(
+            policy = %breaker_policy,
+            "refusing a payment: the settlement circuit breaker is open"
+        );
+        return settlement_unavailable(&path);
+    }
+
     let started = std::time::Instant::now();
     let decision = X402Decider { state }
         .decide(&view, client_ip, &path, policy.as_deref(), &resource_url)
@@ -598,8 +671,14 @@ async fn handle_response_headers(
         ]),
     ));
 
+    let policy_label = stream_state
+        .policy
+        .clone()
+        .unwrap_or_else(|| crate::config::DEFAULT_POLICY_LABEL.to_string());
+
     match settled {
         Ok(mut settlement) => {
+            state.breaker.record_success(&policy_label);
             let token = match &settlement.payer {
                 None => None,
                 Some(payer) => state
@@ -659,6 +738,10 @@ async fn handle_response_headers(
             // so the operator eats this one — which is the better failure than
             // charging for something the client never received.
             // The alert-worthy counter: revenue is being lost right now.
+            // Feeds the breaker. One of these is noise; a run of them means
+            // the gateway is giving the resource away and must stop taking
+            // payments it cannot settle.
+            state.breaker.record_failure(&policy_label);
             metrics::counter!(m::SETTLEMENT_AFTER_SERVE_FAILURES, "code" => e.code()).increment(1);
             metrics::counter!(
                 m::PAYMENTS,

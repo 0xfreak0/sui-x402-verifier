@@ -5,6 +5,7 @@
 //! payment get an elevated tier backed by a time- and quota-limited session.
 
 mod auth;
+mod breaker;
 mod config;
 mod ext_proc;
 mod facilitator_api;
@@ -154,6 +155,7 @@ async fn main() -> Result<()> {
 
     let state = Arc::new(AppState {
         config,
+        breaker: breaker::SettlementBreaker::new(),
         sessions: Arc::clone(&sessions),
         limiter,
         facilitator: Arc::clone(&facilitator),
