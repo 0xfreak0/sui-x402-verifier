@@ -302,7 +302,11 @@ fn attempt_spans(attempt: &payclient::Attempt, start_ms: f64, paid: bool) -> Vec
 
     if let Some(decide) = timing("x402-decide") {
         spans.push(Span::new(
-            if paid { "verify payment" } else { "check the meter" },
+            if paid {
+                "verify payment"
+            } else {
+                "check the meter"
+            },
             "verifier",
             start_ms,
             decide,
@@ -506,12 +510,22 @@ async fn send(
         })?;
 
     let mut trace = vec![Span::new(
-        if first.status == 402 { "request without payment" } else { "request" },
+        if first.status == 402 {
+            "request without payment"
+        } else {
+            "request"
+        },
         "demo → gateway",
         0.0,
         first.elapsed_ms,
         0,
-        if first.status == 402 { "pay" } else if first.status == 200 { "ok" } else { "err" },
+        if first.status == 402 {
+            "pay"
+        } else if first.status == 200 {
+            "ok"
+        } else {
+            "err"
+        },
         format!("HTTP {}", first.status),
     )];
     trace.extend(attempt_spans(&first, 0.0, false));
@@ -649,7 +663,10 @@ async fn send(
         target = target.id,
         status = paid.status,
         settled,
-        transaction = receipt.as_ref().map(|r| r.transaction.as_str()).unwrap_or(""),
+        transaction = receipt
+            .as_ref()
+            .map(|r| r.transaction.as_str())
+            .unwrap_or(""),
         plays_remaining,
         "sold a request"
     );
@@ -661,8 +678,14 @@ async fn send(
         // A fresh session supersedes whatever the page was holding.
         session: paid.session.clone().or(request.session),
         meter: paid.meter,
-        transaction: receipt.as_ref().map(|r| r.transaction.clone()).unwrap_or_default(),
-        network: receipt.as_ref().map(|r| r.network.clone()).unwrap_or_default(),
+        transaction: receipt
+            .as_ref()
+            .map(|r| r.transaction.clone())
+            .unwrap_or_default(),
+        network: receipt
+            .as_ref()
+            .map(|r| r.network.clone())
+            .unwrap_or_default(),
         body: trim_body(&paid.body),
         plays_remaining,
         wire: Wire {
@@ -715,13 +738,21 @@ fn trim_body(body: &str) -> String {
     const MAX: usize = 600;
     // Binary grpc-web frames are not text; say so rather than emitting
     // replacement characters the page would render as noise.
-    if body.chars().any(|c| c.is_control() && c != '\n' && c != '\r' && c != '\t') {
+    if body
+        .chars()
+        .any(|c| c.is_control() && c != '\n' && c != '\r' && c != '\t')
+    {
         return format!("<{} bytes of grpc-web frames>", body.len());
     }
     if body.len() <= MAX {
         return body.to_string();
     }
-    let cut = body.char_indices().map(|(i, _)| i).take_while(|i| *i <= MAX).last().unwrap_or(0);
+    let cut = body
+        .char_indices()
+        .map(|(i, _)| i)
+        .take_while(|i| *i <= MAX)
+        .last()
+        .unwrap_or(0);
     format!("{}…", &body[..cut])
 }
 
@@ -754,12 +785,19 @@ async fn policies_proxy(State(state): State<AppState>) -> impl IntoResponse {
     );
     match reqwest::get(&url).await {
         Ok(response) => match response.text().await {
-            Ok(body) => ([(axum::http::header::CONTENT_TYPE, "application/json")], body)
+            Ok(body) => (
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                body,
+            )
                 .into_response(),
             Err(_) => (StatusCode::BAD_GATEWAY, "[]").into_response(),
         },
         // The page degrades to unpriced targets rather than failing to load.
-        Err(_) => ([(axum::http::header::CONTENT_TYPE, "application/json")], "[]").into_response(),
+        Err(_) => (
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            "[]",
+        )
+            .into_response(),
     }
 }
 
@@ -841,10 +879,7 @@ async fn wheel(State(state): State<AppState>) -> impl IntoResponse {
     // Derive the result from chain state rather than this process's RNG, so
     // anyone can recompute it from the digest.
     let http = reqwest::Client::new();
-    let url = format!(
-        "{}/free/graphql",
-        state.args.gateway.trim_end_matches('/')
-    );
+    let url = format!("{}/free/graphql", state.args.gateway.trim_end_matches('/'));
     let seed = match http
         .post(&url)
         .header("content-type", "application/json")
@@ -892,7 +927,10 @@ async fn index(State(state): State<AppState>) -> impl IntoResponse {
                 // Never cache the page. While iterating on the demo, a stale
                 // copy in a phone's browser looks exactly like a bug that was
                 // already fixed.
-                (axum::http::header::CACHE_CONTROL, "no-store, must-revalidate"),
+                (
+                    axum::http::header::CACHE_CONTROL,
+                    "no-store, must-revalidate",
+                ),
             ],
             body,
         )

@@ -1,14 +1,17 @@
 # When settlement fails after the resource is served
 
-The failure mode this design carries, what currently happens, and what should be
-built. None of the mitigations below are implemented — this is the analysis, not
-a changelog.
+The failure mode this design carries, what happens now, and what is still
+missing. Mitigation 1 shipped after this was written; 2 through 4 have not.
 
 ## What happens today
 
 `ext_proc.rs`, response phase, `Err` branch: log at ERROR, increment
 `x402_settlement_after_serve_failures_total`, attach a failure receipt, and
-**serve the response anyway**.
+**serve the response anyway**. That request was given away.
+
+Since `a48009e` the outcome also feeds a circuit breaker (`src/breaker.rs`,
+wired at `src/ext_proc.rs`), so a *run* of these stops being invisible — see
+mitigation 1.
 
 Two things already bound the damage, both worth keeping:
 
@@ -27,10 +30,18 @@ Nothing currently notices that failures are systemic rather than incidental.
 
 ## Planned mitigations, in priority order
 
-1. **Circuit-break on settlement health.** Track failure rate per policy; past
-   a threshold, stop deferring — either flip the policy to settle-first
-   (`ext_authz` semantics) or reject payments with 503 and serve only the free
-   tier. Converts an unbounded outage into a bounded, visible one. Small.
+1. ~~**Circuit-break on settlement health.**~~ **Implemented.**
+   `src/breaker.rs` tracks outcomes per policy and opens past a 50% failure
+   rate over at least five samples, refusing payments with 503 and a
+   `Retry-After` while leaving the free tier untouched. One request is allowed
+   through after a 30s cooldown to test recovery, and a single success closes
+   it immediately. gRPC callers get `grpc-status: 14 UNAVAILABLE`, which they
+   retry on.
+
+   Note that the `ext_authz` path deliberately has no breaker, and that is
+   correct by construction: settling before serving means a fullnode outage
+   produces denials rather than free service, so there is nothing for a breaker
+   to prevent.
 
 2. **Distinguish the two causes.** Currently identical, actually opposite:
 

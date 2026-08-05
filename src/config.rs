@@ -499,14 +499,17 @@ impl Config {
 
     /// Every policy's effective price, including the default terms.
     fn priced_policies(&self) -> Vec<(String, &str)> {
-        std::iter::once((DEFAULT_POLICY_LABEL.to_string(), self.payment.amount.as_str()))
-            .chain(self.policies.iter().map(|(name, over)| {
-                (
-                    name.clone(),
-                    over.amount.as_deref().unwrap_or(&self.payment.amount),
-                )
-            }))
-            .collect()
+        std::iter::once((
+            DEFAULT_POLICY_LABEL.to_string(),
+            self.payment.amount.as_str(),
+        ))
+        .chain(self.policies.iter().map(|(name, over)| {
+            (
+                name.clone(),
+                over.amount.as_deref().unwrap_or(&self.payment.amount),
+            )
+        }))
+        .collect()
     }
 
     /// Resolve the payment terms for a request.
@@ -550,7 +553,6 @@ impl Config {
 
         resolved
     }
-
 
     /// True when `policy` was supplied but matches no configured policy.
     pub fn is_unknown_policy(&self, policy: &str) -> bool {
@@ -627,8 +629,7 @@ paid_tier:
   quota: 100
   duration_secs: 3600
 "#,
-            TEST_HMAC_SECRET,
-            TEST_PAY_TO
+            TEST_HMAC_SECRET, TEST_PAY_TO
         )
     }
 
@@ -672,7 +673,11 @@ paid_tier:
         // Below 0.01 the gasless stablecoin path refuses to execute, which
         // silently forces payers back onto coin objects and SUI gas. The
         // shipped configs must not demonstrate the wrong thing.
-        for path in ["config.example.yaml", "config.demo.yaml", "deploy/config.prod.yaml"] {
+        for path in [
+            "config.example.yaml",
+            "config.demo.yaml",
+            "deploy/config.prod.yaml",
+        ] {
             let full = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(path);
             let raw = std::fs::read_to_string(&full)
                 .unwrap_or_else(|e| panic!("{} must exist and be readable: {e}", full.display()));
@@ -680,7 +685,10 @@ paid_tier:
                 let Some(rest) = line.trim().strip_prefix("amount: ") else {
                     continue;
                 };
-                let amount: u128 = rest.trim_matches('"').parse().expect("amount is an integer");
+                let amount: u128 = rest
+                    .trim_matches('"')
+                    .parse()
+                    .expect("amount is an integer");
                 assert!(
                     amount >= GASLESS_MINIMUM_BASE_UNITS,
                     "{}: amount {amount} is below the gasless floor of {}",
@@ -814,7 +822,9 @@ routes:
 
         // "/sui.rpc.v2." is longer than "/", so it must win even though the
         // "/" rule is listed first.
-        let grpc = config.policy_for("/sui.rpc.v2.LedgerService/GetServiceInfo", None).payment;
+        let grpc = config
+            .policy_for("/sui.rpc.v2.LedgerService/GetServiceInfo", None)
+            .payment;
         assert_eq!(grpc.pay_to, format!("0x{}", "3".repeat(64)));
         assert_eq!(grpc.amount, "5000");
         assert_eq!(grpc.description, "gRPC calls");
@@ -828,9 +838,15 @@ routes:
     fn unset_route_fields_fall_back_to_the_defaults() {
         let config = parse(&routed_yaml()).unwrap();
         // The "/" rule sets no pay_to, so the default wallet applies.
-        assert_eq!(config.policy_for("/graphql", None).payment.pay_to, TEST_PAY_TO);
+        assert_eq!(
+            config.policy_for("/graphql", None).payment.pay_to,
+            TEST_PAY_TO
+        );
         // And unrelated fields are untouched.
-        assert_eq!(config.policy_for("/graphql", None).payment.network, "sui:testnet");
+        assert_eq!(
+            config.policy_for("/graphql", None).payment.network,
+            "sui:testnet"
+        );
     }
 
     /// Base config plus named policies — the Envoy-driven mechanism, which

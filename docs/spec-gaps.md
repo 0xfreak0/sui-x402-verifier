@@ -1,6 +1,7 @@
 # Gaps found in the x402 spec while implementing Sui
 
-Recorded against vendored commit `dd927a26` (see `spec/upstream/README.md`).
+Recorded against the vendored spec; see `spec/upstream/README.md` for the
+commit it came from.
 These are places where the spec does not say enough to implement Sui without
 inventing something. Where this project had to choose, the choice and its
 reasoning are noted so a future reader can tell a deliberate deviation from an

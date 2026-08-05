@@ -148,7 +148,13 @@ impl MemoryRateLimiter {
     ///
     /// # Panics
     /// If `window_secs` is zero. `Config::validate` rejects that at startup.
-    pub fn check(&self, policy: &str, ip: IpAddr, max_requests: u64, window_secs: u64) -> Allowance {
+    pub fn check(
+        &self,
+        policy: &str,
+        ip: IpAddr,
+        max_requests: u64,
+        window_secs: u64,
+    ) -> Allowance {
         self.check_at(policy, ip, max_requests, window_secs, now_epoch_secs())
     }
 

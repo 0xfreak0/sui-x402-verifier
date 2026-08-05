@@ -180,7 +180,14 @@ fn settlement_unavailable(path: &str) -> ProcessingResponse {
 
     let mut headers = vec![
         header("retry-after", "30"),
-        header("content-type", if grpc { "application/grpc" } else { "application/json" }),
+        header(
+            "content-type",
+            if grpc {
+                "application/grpc"
+            } else {
+                "application/json"
+            },
+        ),
     ];
     if grpc {
         // 14 UNAVAILABLE is the gRPC status a client will retry on.

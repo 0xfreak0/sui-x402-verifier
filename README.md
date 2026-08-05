@@ -98,8 +98,9 @@ category:
   x402 implementation that handles gRPC at all, and there is no transport
   binding for it in the spec — see `docs/` for how denials are framed as
   trailers-only responses.
-- **Sui.** Upstream has a Sui *scheme document* but no Sui implementation, and a
-  public search finds no other one.
+- **Sui.** Upstream has a Sui *scheme document* and no Sui implementation. This
+  was briefly the only working one; a [live Sui facilitator](https://forums.sui.io/t/the-first-live-x402-facilitator-on-sui-agents-pay-usdc-per-api-call-verified-humans-read-free/49391)
+  now exists too, so treat "first" claims about Sui as expired.
 
 None of that makes this a product. It is an exploratory prototype, and the most
 transferable thing to come out of it is the verification gap documented in
@@ -119,7 +120,7 @@ transferable thing to come out of it is the verification gap documented in
 | Streaming RPCs | **Not metered** — see Limitations |
 | Gas sponsorship | Advertised only, not implemented |
 
-138 unit tests, plus a 15-assertion end-to-end script that can run against real
+182 unit tests, plus a 15-assertion end-to-end script that can run against real
 on-chain payments.
 
 ## Quick start
@@ -515,7 +516,7 @@ Gaps found in the spec while implementing, with drafted upstream issues:
 ## Testing
 
 ```bash
-cargo test                                                # 138 unit tests
+cargo test                                                # 182 unit tests
 redis-server --port 6399 --daemonize yes
 X402_TEST_REDIS_URL=redis://127.0.0.1:6399 cargo test      # + Redis integration
 scripts/e2e-test.sh                                        # 15 assertions

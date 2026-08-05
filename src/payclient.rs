@@ -11,8 +11,8 @@ use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use sui_crypto::SuiSigner;
 use sui_crypto::ed25519::Ed25519PrivateKey;
 use sui_rpc::proto::sui::rpc::v2 as pb;
-use sui_sdk_types::{Address, Digest};
 use sui_sdk_types::Identifier;
+use sui_sdk_types::{Address, Digest};
 use sui_transaction_builder::{Function, ObjectInput, TransactionBuilder};
 
 /// Gas budget for a coin-split-and-transfer. Generous: an underfunded budget
@@ -82,11 +82,7 @@ async fn build_gasless_payment(
     // gasless one has none by definition — `GasPayment.objects` is allowed to
     // be empty at the protocol level. So satisfy the builder with a placeholder
     // and drop it below. Purely a limitation of sui-transaction-builder 0.3.
-    builder.add_gas_objects(vec![ObjectInput::owned(
-        Address::ZERO,
-        0,
-        Digest::ZERO,
-    )]);
+    builder.add_gas_objects(vec![ObjectInput::owned(Address::ZERO, 0, Digest::ZERO)]);
 
     // Reserves `amount` from the sender's address balance and redeems it into
     // a Coin, without any object being selected, pinned, or versioned.
@@ -463,8 +459,8 @@ pub async fn send(
     let server_timing = header("server-timing")
         .map(|raw| parse_server_timing(&raw))
         .unwrap_or_default();
-    let upstream_ms = header("x-envoy-upstream-service-time")
-        .and_then(|v| v.trim().parse::<f64>().ok());
+    let upstream_ms =
+        header("x-envoy-upstream-service-time").and_then(|v| v.trim().parse::<f64>().ok());
 
     Ok(Attempt {
         status,
@@ -498,10 +494,7 @@ pub async fn balance(rpc: &str, owner: Address, coin_type: &str) -> Result<u64> 
 
     // An address that has never held this coin has no balance object at all,
     // which is zero rather than an error.
-    Ok(response
-        .balance
-        .and_then(|b| b.balance)
-        .unwrap_or_default())
+    Ok(response.balance.and_then(|b| b.balance).unwrap_or_default())
 }
 
 /// Build the base64 `PAYMENT-SIGNATURE` header for a set of terms.
@@ -523,7 +516,12 @@ pub async fn build_payment_header(
 
     let transaction = build_payment(rpc, sender, payee, &terms.asset, amount)
         .await
-        .with_context(|| format!("building the payment transaction for {amount} of {}", terms.asset))?;
+        .with_context(|| {
+            format!(
+                "building the payment transaction for {amount} of {}",
+                terms.asset
+            )
+        })?;
     let signature = key
         .sign_transaction(&transaction)
         .context("signing the payment")?;

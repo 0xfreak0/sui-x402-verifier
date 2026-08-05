@@ -39,9 +39,15 @@ shape will fail the test suite rather than pass silently.
 ## Note on an earlier design assumption
 
 `scheme_exact_sui.md` §Appendix "Future Work" lists Sui **Address Balances** —
-gasless stablecoin transfers with no coin-object selection — as *in development*,
-not current. An earlier design document for this project assumed that feature
-shipped and concluded settlement would be free for everyone. It is not: the
-current scheme requires a fully-formed signed transaction where either the
-client pays gas, or the facilitator sponsors it through the interactive gas
-station protocol.
+gasless stablecoin transfers with no coin-object selection — as *in
+development*.
+
+**That is out of date, and this note used to repeat it.** Address Balances has
+shipped on testnet and mainnet, gasless settlement works, and it is what this
+implementation does by default. Measured at `computation_cost: 0,
+storage_cost: 0` with the payer holding no SUI. See
+`../../sui-scheme-conformance.md` for the three conditions that apply and are
+nowhere in the spec text.
+
+The vendored file is kept verbatim, stale appendix included, because the point
+of vendoring is to diff against what upstream actually says.

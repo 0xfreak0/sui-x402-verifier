@@ -79,7 +79,8 @@ async fn main() -> Result<()> {
         .collect::<Result<_>>()?;
 
     // ---- 1. Ask for the resource, expect a challenge --------------------
-    let first = payclient::send(&client, &args.method, &args.url, &headers, &args.data, None).await?;
+    let first =
+        payclient::send(&client, &args.method, &args.url, &headers, &args.data, None).await?;
     if first.status != 402 {
         println!("{} (no payment required)", first.status);
         println!("{}", first.body);
@@ -135,7 +136,10 @@ async fn main() -> Result<()> {
 
     if let Some(receipt) = &paid.payment_response {
         if receipt.success {
-            println!("  settled  tx {} on {}", receipt.transaction, receipt.network);
+            println!(
+                "  settled  tx {} on {}",
+                receipt.transaction, receipt.network
+            );
         } else {
             println!(
                 "  refused  {}",

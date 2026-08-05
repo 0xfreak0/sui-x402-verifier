@@ -162,11 +162,8 @@ async fn main() -> Result<()> {
     });
 
     if let Some(addr) = facilitator_api_addr {
-        let router = facilitator_api::router(
-            Arc::clone(&facilitator),
-            Arc::clone(&sessions),
-            api_config,
-        );
+        let router =
+            facilitator_api::router(Arc::clone(&facilitator), Arc::clone(&sessions), api_config);
         tracing::info!(
             %addr,
             "serving the x402 facilitator HTTP API (POST /verify, POST /settle, GET /supported, GET /policies)"

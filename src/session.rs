@@ -690,7 +690,9 @@ mod tests {
         let token = s.mint(PAYER, None, NOW);
 
         match s.consume_at(&token, None, NOW + 1) {
-            SessionOutcome::Accepted { payer, remaining, .. } => {
+            SessionOutcome::Accepted {
+                payer, remaining, ..
+            } => {
                 assert_eq!(payer, PAYER);
                 assert_eq!(remaining, 2);
             }
@@ -896,7 +898,9 @@ mod tests {
         let token = s.mint(PAYER, None).await.unwrap();
 
         match s.consume(&token, None).await {
-            SessionOutcome::Accepted { payer, remaining, .. } => {
+            SessionOutcome::Accepted {
+                payer, remaining, ..
+            } => {
                 assert_eq!(payer, PAYER);
                 assert_eq!(remaining, 2);
             }

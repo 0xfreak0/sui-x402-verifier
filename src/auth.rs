@@ -1374,8 +1374,8 @@ mod tests {
 
         assert_eq!(challenge.accepts[0].amount, "5000");
         // `pricey` sets no paid_tier, so it inherits the global one.
-        let advertised = &challenge.extensions.as_ref().unwrap()
-            [crate::x402::SESSION_EXTENSION]["info"];
+        let advertised =
+            &challenge.extensions.as_ref().unwrap()[crate::x402::SESSION_EXTENSION]["info"];
         assert_eq!(advertised["quota"], 77);
 
         // `cheap` overrides it, and must advertise its own numbers.
@@ -1396,8 +1396,8 @@ mod tests {
             panic!("cheap's free tier should be spent by now");
         };
         assert_eq!(challenge.accepts[0].amount, "10");
-        let advertised = &challenge.extensions.as_ref().unwrap()
-            [crate::x402::SESSION_EXTENSION]["info"];
+        let advertised =
+            &challenge.extensions.as_ref().unwrap()[crate::x402::SESSION_EXTENSION]["info"];
         assert_eq!(advertised["quota"], 500);
         assert_eq!(advertised["durationSeconds"], 600);
     }
@@ -1752,8 +1752,7 @@ mod tests {
                     SettlePolicy::Immediate
                 )
                 .await,
-                Decision::Deny {
-                .. }
+                Decision::Deny { .. }
             ),
             "a session must not cross policies"
         );
