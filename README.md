@@ -633,6 +633,7 @@ than estimating it.
 
 | | |
 |---|---|
+| [`docs/how-it-works.md`](docs/how-it-works.md) | **start here** — the shape of the thing, a request end to end, and the questions it gets |
 | [`docs/configuring.md`](docs/configuring.md) | setting up Envoy and the verifier, and checking each setting is doing what you think |
 | [`docs/sui-scheme-conformance.md`](docs/sui-scheme-conformance.md) | line-by-line audit against the Sui `exact` scheme, both payment paths |
 | [`docs/settlement-failure.md`](docs/settlement-failure.md) | what happens when settlement fails after the resource was served, and what should be built |
