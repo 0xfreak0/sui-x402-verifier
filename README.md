@@ -88,7 +88,10 @@ category:
 
 - **It plugs into a proxy you already run.** `ext_authz`
   and `ext_proc` are standard interfaces, so the same implementation works under
-  Envoy, Istio, Kong, APISIX and Gloo. For anyone already running one, the
+  Envoy and anything whose data plane *is* Envoy — Istio, Gloo, Consul, Envoy
+  Gateway, Emissary. Not Kong or APISIX; those are OpenResty-based and have
+  their own plugin models rather than these protocols. For anyone running the
+  former, the
   difference is adding a filter config rather than adopting another hop.
 - **Settlement happens on the response path.** `ext_proc` gives a bidirectional
   stream per request, so the payment is verified on the way in and broadcast
@@ -336,7 +339,7 @@ the upstream then failed to serve.
 | Filter | Sequencing | Charged on upstream failure? | Portability |
 |---|---|---|---|
 | **`ext_proc`** (default) | verify → upstream → settle on 2xx | no | Envoy only |
-| `ext_authz` | verify + settle → upstream | **yes** | Envoy, Istio, Kong, APISIX, Gloo |
+| `ext_authz` | verify + settle → upstream | **yes** | Envoy and Envoy-based meshes (Istio, Gloo, Consul, Envoy Gateway) |
 
 `ext_authz` is a *pre-upstream* filter: it cannot see the response, so there is
 nowhere later to settle from. `ext_proc` gets one bidirectional gRPC stream per

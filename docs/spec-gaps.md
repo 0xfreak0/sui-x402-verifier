@@ -93,7 +93,7 @@ that do not support ext_proc.
 
 Still worth raising upstream: the spec assumes the resource server can call the
 facilitator twice around its own work, which silently rules out the entire class
-of pre-upstream authorization filters (`ext_authz`, Kong plugins, NGINX
+of pre-upstream authorization filters (Envoy's `ext_authz`, Kong plugins, NGINX
 `auth_request`). Those are an obvious way to deploy x402, and an implementer
 reaching for one will produce a conformant-looking service with the payment
 ordering inverted and no indication anything is wrong. Naming the constraint —

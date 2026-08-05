@@ -212,6 +212,9 @@
     opacity:0;transform:scale(.82);pointer-events:none;padding:2rem;
     transition:opacity .18s ease,transform .18s cubic-bezier(.2,1.5,.4,1)}
   .win.on{opacity:1;transform:scale(1)}
+  /* An author `display` rule outranks the UA stylesheet's [hidden]{display:none},
+     so without this the fallback renders on top of a perfectly good video. */
+  .prize-fallback[hidden]{display:none}
   .prize-fallback{position:absolute;inset:0;display:grid;place-content:center;gap:.8rem;
     text-align:center;padding:2rem;color:var(--paper);font-family:var(--mono)}
   .pf-win{font-size:clamp(1.6rem,7vw,3rem);font-weight:700;color:var(--money);letter-spacing:.06em}
@@ -254,7 +257,7 @@
   <div class="lede">
     <h1>Payments as a filter<br>in a proxy you already run.</h1>
     <p>Not another proxy to put in your path — an <strong>Envoy filter</strong>. The same
-      <code>ext_proc</code> interface works under Istio, Consul, Gloo and APISIX, so
+      <code>ext_proc</code> interface works under Istio, Consul, Gloo and Envoy Gateway, so
       metering and payment become a policy rather than a new hop. The upstreams below
       have <strong>no payment code of their own</strong> and never learn they are being sold.</p>
     <p style="margin-top:.7rem">Pick one and hold down send: watch the free allowance run
@@ -379,9 +382,8 @@ done      # 200 200 200 200 200 402</pre>
   <video id="video" src="/rickroll.mp4" playsinline preload="auto"></video>
   <div class="prize-fallback" id="fallback" hidden>
     <div class="pf-win">YOU WIN</div>
-    <div class="pf-sub">Your prize is a video that is not in this repository,
-      because it belongs to Rick Astley.</div>
-    <div class="pf-hint">Drop any mp4 at <code>demo/rickroll.mp4</code> to restore it.</div>
+    <div class="pf-sub">SUI $20</div>
+    <div class="pf-hint">(the prize video did not load)</div>
   </div>
 </div>
 
@@ -852,10 +854,16 @@ const TOTAL_W = SEGS.reduce((a,s) => a + s.w, 0);
              stroke-width="${seg.win ? '.9' : '.4'}"/>`;
     // Radial labels: a chord long enough for "LIQUIDATED" does not exist at
     // this radius, so the text runs outward instead of across.
+    // The winning slice is half a percent of the wheel, so a label sized for
+    // the losers is unreadable on it. Give it its own size and push it out to
+    // the rim where there is room.
     out += `<g transform="translate(50,50) rotate(${seg._mid - 90})">
-      <text x="15" y="0" font-family="ui-monospace,monospace" font-size="3.4"
+      <text x="${seg.win ? 12 : 15}" y="0" font-family="ui-monospace,monospace"
+        font-size="${seg.win ? 6 : 3.4}"
         font-weight="${seg.win ? '700' : '600'}"
         fill="${seg.win ? '#231704' : '#9fc0cc'}"
+        stroke="${seg.win ? '#fff3d6' : 'none'}" stroke-width="${seg.win ? '.35' : '0'}"
+        paint-order="stroke"
         text-anchor="start" dominant-baseline="central">${seg.label}</text></g>`;
     angle = a1;
   });
