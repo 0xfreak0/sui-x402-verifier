@@ -298,10 +298,11 @@
   <section>
     <h2>Point a real client at it</h2>
     <p class="hint">Nothing above requires this page. The gate is the public endpoint, so
-      any x402 client can hit it — this one signs from your own wallet, not the demo's.</p>
+      any x402 client can hit it. This one signs with your wallet instead of the demo's.</p>
     <pre id="cli">git clone https://github.com/0xfreak0/sui-x402-verifier &amp;&amp; cd sui-x402-verifier
 
-# needs testnet SUI for gas + testnet USDC
+# You need testnet USDC, from faucet.circle.com (chain: Sui Testnet).
+# You do not need any SUI. Payments above 0.01 USDC run gasless.
 cargo run --bin x402-pay -- https://x402.suisonar.dev/graphql \
   -X POST -H 'content-type: application/json' \
   -d '{"query":"{ chainIdentifier }"}'</pre>
@@ -314,8 +315,8 @@ done      # 200 200 200 200 200 402</pre>
 
   <section>
     <h2>What broke</h2>
-    <p class="hint">The useful output of an experiment is where it fails. All of these are
-      measured, not estimated.</p>
+    <p class="hint">Four things went wrong while building this. Every number below came
+      off a real transaction on testnet.</p>
     <div class="broke">
       <div class="b">
         <div class="bk">Verification passes on already-spent coins</div>
@@ -660,7 +661,7 @@ async function send(){
 
     const kind = data.status !== 200 ? 'err' : (data.paid ? 'pay' : 'ok');
     const detail = data.paid && !data.settled
-      ? 'verified, not charged'
+      ? 'verified, no charge'
       : data.paid
         ? `paid ${data.transaction ? short(data.transaction) : 'settled'}`
         : summarize(data.body);
@@ -1138,7 +1139,7 @@ function verdictFor(verdict, how, reason){
 function explain(how, refusedText){
   if (how === 'paid') return 'this is a bug — please tell me';
   if (how === 'refused') return refusedText;
-  return 'served by the free allowance, not by the forged payment — it bought nothing';
+  return 'the free allowance covered this. The forged payment bought nothing';
 }
 
 function detail(a, line, verdictLine){

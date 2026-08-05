@@ -2,13 +2,12 @@
 
 Sell API access for stablecoin, at the gateway, without accounts or API keys.
 
-> **This is an experiment, not a product.** It was built to find out what putting
-> x402 in front of real infrastructure actually costs, and the most useful thing
-> it produced is the list of things that broke — see [What broke](#what-broke).
-> It is not maintained, not audited, has run only on testnet, and no part of it
-> should be treated as production-ready. There is no support and no roadmap.
+> **This is an experiment.** I built it to find out what putting x402 in front of
+> real infrastructure actually costs. The most useful thing it produced is the
+> list of things that broke — see [What broke](#what-broke).
 >
-> It is public so the findings and the code are readable together.
+> Unmaintained, unaudited, testnet only. Do not run it in production. No support,
+> no roadmap. It is public so the findings and the code can be read together.
 
 An [x402](https://github.com/x402-foundation/x402) payment gate written in Rust. It sits
 beside an Envoy proxy and decides, per request, whether the caller is on the free
@@ -87,7 +86,7 @@ along than this one on features like dashboards and provider catalogues. What is
 different here is narrower, and worth stating precisely rather than claiming a
 category:
 
-- **This is a filter for a proxy you already run, not a new proxy.** `ext_authz`
+- **It plugs into a proxy you already run.** `ext_authz`
   and `ext_proc` are standard interfaces, so the same implementation works under
   Envoy, Istio, Kong, APISIX and Gloo. For anyone already running one, the
   difference is adding a filter config rather than adopting another hop.
@@ -95,7 +94,7 @@ category:
   stream per request, so the payment is verified on the way in and broadcast
   only after the upstream returns 2xx — the ordering the spec asks for. A
   reverse proxy can buffer to achieve this too, but nothing else appears to.
-- **gRPC and grpc-web are gated, not just REST.** A public search finds no other
+- **gRPC and grpc-web are gated too.** A public search finds no other
   x402 implementation that handles gRPC at all, and there is no transport
   binding for it in the spec — see `docs/` for how denials are framed as
   trailers-only responses.
@@ -401,7 +400,7 @@ chain finality.
 settles before the upstream runs. There is then no window — the client instead
 bears the risk of being charged for a request that later errors, which is how
 most paid APIs already behave. Both modes are implemented; `envoy.yaml` selects
-between them. This is a policy choice, not a limitation.
+between them. That is deliberate.
 
 Note that the exposure is a property of the **spec's ordering**, not of running
 at a gateway: in-app middleware doing verify → work → settle has exactly the same
@@ -470,9 +469,9 @@ The last two are the ones worth alerting on. Everything else is throughput.
 
 ## What broke
 
-The useful output of an experiment is where it fails. Ranked by how much of a
-surprise each one should be to someone who already works on Sui — the first two
-are the ones worth your time, the rest are confirmations with numbers attached.
+Seven things, roughly in order of how surprising they should be to someone who
+already works on Sui. The first two are worth your time. The rest are things you
+probably suspected, now with numbers attached.
 
 ### Verification passes on already-spent coins
 
@@ -510,8 +509,8 @@ client whose request then 500s.
 
 `ext_proc` can, because Envoy opens one bidirectional stream per request: verify
 on the way in, hold the verified-but-unsettled payment as stream-local state,
-settle on the way out and only on a 2xx. That is a filter choice, not a code
-choice, and it is invisible until you try to be conformant.
+settle on the way out and only on a 2xx. Which filter you pick decides this, and
+you will not discover it until you try to be conformant.
 
 The residual exposure is real and stated rather than solved: between verify and
 settle the payer can spend the pinned coins and kill the authorization. Bounded
@@ -540,7 +539,7 @@ enforced off-chain by the facilitator and nothing stops a third party
 broadcasting the authorization later. `TransactionExpiration::ValidDuring`
 timestamps would fix it and are documented as not yet implemented.
 
-### Payment has a floor, and it is not gas
+### Gas stopped being the constraint. A 0.01 USDC floor took its place
 
 **Corrected.** This section previously claimed gas made per-request payment
 economically incoherent — ~0.0023 SUI per settlement against a 0.00001 USDC
@@ -577,7 +576,7 @@ Redis carries that across a redeploy.
 The gap is on the streaming side, and it only exists for duration billing.
 
 `ext_proc` is headers-only, so the gateway authorizes a stream when it opens and
-**never observes it again** — not its messages, not its end. A client that
+**never observes it again**. Neither the messages nor the end of it. A client that
 disconnects thirty seconds into an hour-long window has burned the remaining
 fifty-nine minutes, and nothing in the system can tell. There is no refund, no
 pause, and no detection. Seeing the disconnect would mean
