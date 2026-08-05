@@ -123,6 +123,39 @@ payment-required: eyJ4NDAyVmVyc2lvbiI6MiwiZXJyb3IiOiJmcmVlIHRpZXIg...
 Base64-decode that header for the terms: `payTo`, `amount`, `asset`, `network`,
 `maxTimeoutSeconds`.
 
+### `x402-pay` — the client
+
+There was no Sui x402 client: the official SDK ships mechanisms for aptos, avm,
+evm, stellar and svm, and a GitHub search for x402 + sui returns nothing. So a
+conformant Sui *server* had nothing that could pay it.
+
+```bash
+cargo run --bin x402-pay -- http://localhost:10000/graphql \
+  -H 'content-type: application/json' \
+  -d '{"query":"{ chainIdentifier }"}'
+```
+
+```
+402 Payment Required
+  resource  http://localhost:10000/graphql
+  network   sui:testnet
+  amount    10 of 0xa1ec7fc0…::usdc::USDC
+  payTo     0x908b8519…
+  paying as 0x83cb1430…
+
+retrying with payment…
+200
+  settled  tx HLhwtE5yNTfAMM36oFBG32wqqoNgs8pSmSeAS1XTj5dW on sui:testnet
+  session  0x83cb1430…:1785892270:eb7c2dda…
+{"data":{"chainIdentifier":"69WiPg3DAQiwdxfncX6wYQ2siKwAe6L9BZthQea3JNMD"}}
+```
+
+It does the whole protocol — request, decode the challenge, build a PTB paying
+exactly the advertised amount, sign locally, resend — with no `sui` CLI
+involved. Keys come from `X402_SUI_PRIVATE_KEY` (a `suiprivkey1…` string) or the
+standard CLI keystore, and never leave the machine; only the signature is sent.
+`--dry-run` builds and signs without sending.
+
 ### Paying for real
 
 `stub-accept-all` accepts well-formed payments without touching the chain, which

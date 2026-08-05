@@ -19,13 +19,14 @@ prost = "0.14"
 prost-types = "0.14"
 rand = "0.9"
 redis = { version = "1.5.0", features = ["tokio-comp", "connection-manager", "script"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_norway = "0.9"
 sha2 = "0.10"
-sui-crypto = { version = "0.3", features = ["ed25519"] }
+sui-crypto = { version = "0.3", features = ["ed25519", "bech32"] }
 sui-rpc = "0.3"
-sui-sdk-types = { version = "0.3", features = ["serde"] }
+sui-sdk-types = { version = "0.3", features = ["hash", "serde"] }
 sui-transaction-builder = "0.3"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
