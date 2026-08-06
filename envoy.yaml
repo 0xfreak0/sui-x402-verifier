@@ -163,6 +163,13 @@ static_resources:
                           # the route table; the verifier only knows what the
                           # policy *name* costs. No path prefixes are
                           # duplicated between the two configs.
+                          #
+                          # INERT AS SHIPPED. ext_proc reads the policy from
+                          # `metadata` above; this block is the ext_authz
+                          # equivalent, and that filter is commented out of the
+                          # chain below. Kept so switching filters is a one-line
+                          # change rather than a re-plumbing; it costs nothing
+                          # while the filter is absent.
                           typed_per_filter_config:
                             envoy.filters.http.ext_authz:
                               "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute

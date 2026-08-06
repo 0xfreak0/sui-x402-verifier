@@ -1,8 +1,16 @@
-//! x402 payment-gated Envoy `ext_authz` verifier for Sui.
+//! x402 payment gate for Envoy, settling on Sui.
 //!
-//! Sits beside an Envoy proxy and answers authorization callouts: anonymous
+//! Sits beside an Envoy proxy and answers its callouts per request: anonymous
 //! clients get a rate-limited free tier, and clients presenting a valid x402
 //! payment get an elevated tier backed by a time- and quota-limited session.
+//!
+//! Two filter interfaces are served on the same port. **`ext_proc` is the
+//! default and the one the shipped `envoy.yaml` enables** — it sees the
+//! response, so a payment settles only after the upstream succeeds, which is
+//! the ordering the Sui scheme specifies. `ext_authz` is also implemented and
+//! served, but it is pre-upstream and can only settle before the work is done;
+//! enabling it means uncommenting its filter in `envoy.yaml`. See
+//! `docs/how-it-works.md`.
 
 mod auth;
 mod breaker;

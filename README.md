@@ -118,13 +118,25 @@ transferable thing to come out of it is the verification gap documented in
 | On-chain verification (`sui-grpc`) | Working, validated on testnet |
 | On-chain settlement | Working, settled real USDC on testnet |
 | Per-route pricing and per-route wallets | Working |
-| Redis backend (multi-replica) | Working, integration-tested |
+| Redis backend (multi-replica) | Working; exercised in CI, **skipped locally** unless `X402_TEST_REDIS_URL` is set |
 | Facilitator API (`/verify`, `/settle`, `/supported`) | Working, off by default |
 | Streaming RPCs | **Not metered** — see Limitations |
-| Gas sponsorship | Advertised only, not implemented |
+| Gas sponsorship | Advertised via `extra.gasStation`, not implemented — and unnecessary above the gasless floor, since the payer needs no SUI |
+| `ext_proc` filter | **Default.** Settles after the upstream succeeds |
+| `ext_authz` filter | Implemented and unit-tested, **not enabled** in the shipped `envoy.yaml`, not exercised end to end |
 
-182 unit tests, plus a 15-assertion end-to-end script that can run against real
-on-chain payments.
+182 unit tests, and a 14-check end-to-end script.
+
+```bash
+cargo test                                   # 182 unit tests
+scripts/e2e-test.sh --real                   # 14 checks, real on-chain payment
+```
+
+`--real` builds and signs a transaction with your local `sui` CLI wallet, which
+is what `verification_mode: sui-grpc` requires, and **it settles** — real testnet
+USDC moves. Without the flag the script sends placeholder bytes, which only a
+verifier running `stub-accept-all` will accept; against a `sui-grpc` verifier
+the payment steps will fail, correctly.
 
 ## Quick start
 
@@ -340,6 +352,12 @@ the upstream then failed to serve.
 |---|---|---|---|
 | **`ext_proc`** (default) | verify → upstream → settle on 2xx | no | Envoy only |
 | `ext_authz` | verify + settle → upstream | **yes** | Envoy and Envoy-based meshes (Istio, Gloo, Consul, Envoy Gateway) |
+
+Both are served on the same port, but **only `ext_proc` is enabled in the
+shipped `envoy.yaml`**. `ext_authz` is implemented and unit-tested; switching to
+it means uncommenting its filter, and it has not been exercised end to end since
+`ext_proc` became the default. The per-route `ExtAuthzPerRoute` blocks in
+`envoy.yaml` exist for that switch and are inert until it happens.
 
 `ext_authz` is a *pre-upstream* filter: it cannot see the response, so there is
 nowhere later to settle from. `ext_proc` gets one bidirectional gRPC stream per
