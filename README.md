@@ -27,7 +27,7 @@ flowchart LR
         extproc["ext_proc :50051<br/><i>resource-server role</i>"]
         policy["tier policy<br/>session → payment → free tier"]
         facil["facilitator<br/>verify · settle"]
-        api["§7 HTTP API<br/>/verify /settle /supported<br/><i>off by default</i>"]
+        api["§7 HTTP API<br/>/verify /settle /supported /policies<br/><i>off by default</i>"]
         store[("store<br/>sessions · replay · limits<br/>memory | redis")]
     end
 
@@ -121,7 +121,7 @@ transferable thing to come out of it is the verification gap documented in
 | On-chain settlement | Working, settled real USDC on testnet |
 | Per-route pricing and per-route wallets | Working |
 | Redis backend (multi-replica) | Working; exercised in CI, **skipped locally** unless `X402_TEST_REDIS_URL` is set |
-| Facilitator API (`/verify`, `/settle`, `/supported`) | Working, off by default |
+| Facilitator API (`/verify`, `/settle`, `/supported`, `/policies`) | Working, off by default |
 | Streaming RPCs | **Not metered** — see Limitations |
 | Gas sponsorship | Advertised via `extra.gasStation`, not implemented — and unnecessary above the gasless floor, since the payer needs no SUI |
 | `ext_proc` filter | **Default.** Settles after the upstream succeeds |
@@ -168,9 +168,11 @@ Base64-decode that header for the terms: `payTo`, `amount`, `asset`, `network`,
 
 ### `x402-pay` — the client
 
-There was no Sui x402 client: the official SDK ships mechanisms for aptos, avm,
-evm, stellar and svm, and a GitHub search for x402 + sui returns nothing. So a
-conformant Sui *server* had nothing that could pay it.
+When this was written there was no Sui x402 client: the official SDK ships
+mechanisms for aptos, avm, evm, stellar and svm, and a GitHub search for x402 +
+sui turned up nothing, so a conformant Sui *server* had nothing that could pay
+it. That was a point-in-time observation and it has since expired — see the live
+Sui facilitator linked above.
 
 ```bash
 cargo run --bin x402-pay -- http://localhost:10000/graphql \
@@ -252,11 +254,17 @@ balances  sender 20000000 → 19999990,  payee 0 → 10
 ### Browser demo
 
 ```bash
-python3 -m http.server 8080 -d demo     # then open localhost:8080
+cargo run --bin x402-demo               # then open localhost:8402
 ```
 
+The page calls `/targets`, `/send`, `/balances` and `/policies` on its own
+origin, so it has to be served by `x402-demo` rather than by a static file
+server — and `x402-demo` is what holds the hot testnet wallet that pays on a
+visitor's behalf. It needs Envoy and the verifier already running; see
+`scripts/run-local.sh`.
+
 Drives the whole flow: spend the free tier, watch the decoded challenge appear,
-pay, watch calls resume on a session. Dependency-free, no build step.
+pay, watch calls resume on a session. No build step on the page itself.
 
 ## The decision, per request
 
@@ -352,8 +360,13 @@ the upstream then failed to serve.
 
 | Filter | Sequencing | Charged on upstream failure? | Portability |
 |---|---|---|---|
-| **`ext_proc`** (default) | verify → upstream → settle on 2xx | no | Envoy only |
-| `ext_authz` | verify + settle → upstream | **yes** | Envoy and Envoy-based meshes (Istio, Gloo, Consul, Envoy Gateway) |
+| **`ext_proc`** (default) | verify → upstream → settle on 2xx | no | Envoy and Envoy-based meshes; needs a newer Envoy than `ext_authz` |
+| `ext_authz` | verify + settle → upstream | **yes** | Envoy and Envoy-based meshes |
+
+Both are Envoy interfaces, so both work under anything whose data plane *is*
+Envoy — Istio, Gloo, Consul, Envoy Gateway, Emissary. `deploy/istio-envoyfilter.yaml`
+is a working `ext_proc` filter for Istio. Neither works on Kong or APISIX, which
+are OpenResty-based and implement neither protocol.
 
 Both are served on the same port, but **only `ext_proc` is enabled in the
 shipped `envoy.yaml`**. `ext_authz` is implemented and unit-tested; switching to
@@ -435,7 +448,8 @@ window.
 
 ## The facilitator API
 
-`POST /verify`, `POST /settle`, `GET /supported` (spec §7) — **disabled unless
+`POST /verify`, `POST /settle`, `GET /supported` (spec §7), plus a non-spec
+`GET /policies` that reports what each route costs — **disabled unless
 `facilitator_api_listen_addr` is set**.
 
 Envoy never calls these. It uses the gateway path above, where verification and
@@ -533,8 +547,10 @@ Sessions are exposed as a declared extension (§5.1.2) with an `info` and a JSON
 header still works as a deprecated alias.
 
 Conformance against the Sui scheme specifically: `docs/sui-scheme-conformance.md`.
-Gaps found in the spec while implementing, with drafted upstream issues:
-`docs/spec-gaps.md` and `docs/upstream-issues/`.
+Gaps found in the spec while implementing: `docs/spec-gaps.md` and
+`docs/upstream-issues/`. Those are written up in issue form because that was the
+clearest way to state them, but nothing there has been or will be filed against
+`x402-foundation/x402` — this is a prototype, and each note says so at the top.
 
 ## Testing
 
@@ -555,13 +571,17 @@ machine without Redis.
 src/
   auth.rs             tier policy; the ext_authz service
   ext_proc.rs         the ext_proc service (settle-after-success)
+  breaker.rs          per-policy settlement circuit breaker
   facilitator_api.rs  spec §7 HTTP endpoints
   metrics.rs          Prometheus registry and exporter
   x402.rs             v2 wire types, header codecs, facilitator
   sui.rs              on-chain verification and settlement
+  payclient.rs        client-side payment building (gasless and coin-object)
   session.rs          HMAC session tokens, quota, replay cache
   ratelimit.rs        free-tier sliding window
   config.rs           configuration and validation
+  bin/x402-pay.rs     the CLI client
+  bin/x402-demo.rs    the demo server; holds a hot testnet wallet
 ```
 
 ## License

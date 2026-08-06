@@ -57,9 +57,9 @@ const PLACEHOLDER_HMAC_SECRET: &str =
 /// created and pinned, and the authorization becomes spendable out from under
 /// itself. All of which is avoidable by charging at least a cent.
 ///
-/// This is why sessions matter here. Per-request pricing cannot go below a cent
-/// at all; one payment buying a thousand requests brings the effective price to
-/// $0.00001 while staying above the floor.
+/// This is why sessions matter here. Sub-cent per-request pricing is possible
+/// but only on that fallback path; one payment buying a thousand requests brings
+/// the effective price to $0.00001 while every settlement stays above the floor.
 pub const GASLESS_MINIMUM_BASE_UNITS: u128 = 10_000;
 
 /// Decimals assumed when reporting a price against the gasless floor. Only used

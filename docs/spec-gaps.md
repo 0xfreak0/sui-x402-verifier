@@ -91,7 +91,8 @@ verified payment as stream-local state, settle on the way out only after a 2xx.
 It is the default here, and `ext_authz` is kept only as a fallback for gateways
 that do not support ext_proc.
 
-Still worth raising upstream: the spec assumes the resource server can call the
+Worth stating plainly, though nothing here is being filed upstream: the spec
+assumes the resource server can call the
 facilitator twice around its own work, which silently rules out the entire class
 of pre-upstream authorization filters (Envoy's `ext_authz`, Kong plugins, NGINX
 `auth_request`). Those are an obvious way to deploy x402, and an implementer

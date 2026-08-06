@@ -251,7 +251,7 @@ request.
 |---|---|
 | Gasless payments as the default | The spec describes only the coin-object flow, written before Address Balances shipped. The gasless path is strictly better for the payer and removes two of the scheme's sharpest edges |
 | `ext_authz` path settles before the work | The filter is pre-upstream and cannot observe the response. `ext_proc` is the default and does not have this problem |
-| Sessions: one payment buys many requests | The scheme describes per-request payment. Below 0.01 USDC a gasless transfer will not execute at all, so per-request pricing has a hard floor of one cent; a session is how the effective price gets below it. Declared as an x402 extension (§5.1.2) rather than invented as a private header |
+| Sessions: one payment buys many requests | The scheme describes per-request payment. Below 0.01 USDC a gasless transfer will not execute, so sub-cent per-request pricing falls back to coin objects and makes the payer find SUI for gas; a session keeps the effective price below a cent while every settlement stays above the gasless floor. Declared as an x402 extension (§5.1.2) rather than invented as a private header |
 | `maxTimeoutSeconds` enforced off-chain | Sui's finest on-chain expiry is one epoch (~24h). `ValidDuring` carries `min_timestamp`/`max_timestamp` fields that would fix this, documented as not yet implemented. See `spec-gaps.md` |
 | Sui failures map to generic §9 error codes | No Sui-specific codes exist upstream; inventing spec-shaped names would be worse than being generic. See `upstream-issues/01` |
 | gRPC reflection and health are not gated | Clients attach headers to the reflection call, so gating it consumed the payment and the real call was then refused as a replay |

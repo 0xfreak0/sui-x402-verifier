@@ -97,10 +97,12 @@ terms and logs a warning. A routing change should not take payments down.
 
 ## Sessions
 
-Settlement takes around 750ms and cannot be smaller than 0.01 USDC. Doing that
-once per request is unusable, so one payment mints a **session**: an HMAC-signed
-token carrying a random id, good for a quota and a duration, whichever runs out
-first. One payment at the floor covering 1000 requests is $0.00001 each.
+Settlement takes around 750ms, and below 0.01 USDC it leaves the gasless path —
+the payment still works, but it pins a coin object and the payer needs SUI for
+gas. Doing that once per request is unusable, so one payment mints a
+**session**: an HMAC-signed token carrying a random id, good for a quota and a
+duration, whichever runs out first. One payment at the floor covering 1000
+requests is $0.00001 each, without dropping off the gasless path.
 
 A session is prepaid credits. The thing that makes it worth having is that it is
 prepaid credits requiring **no account** — no signup, no card, no human — which

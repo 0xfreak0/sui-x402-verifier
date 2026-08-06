@@ -35,7 +35,7 @@ digraph x402 {
     extauthz  [label="ext_authz :50051\n(fallback, settles early)", fillcolor="#f0f0f0", style="rounded,filled,dashed"];
     policy    [label="tier policy\nsession → payment → free tier"];
     facil     [label="facilitator\nverify / settle"];
-    api       [label="§7 HTTP API\n/verify /settle /supported\n(off by default)", fillcolor="#f0f0f0", style="rounded,filled,dashed"];
+    api       [label="§7 HTTP API\n/verify /settle /supported /policies\n(off by default)", fillcolor="#f0f0f0", style="rounded,filled,dashed"];
     store     [label="store\nsessions · replay · limits\nmemory | redis"];
     metrics   [label="/metrics\n(off by default)", fillcolor="#f0f0f0", style="rounded,filled,dashed"];
   }
