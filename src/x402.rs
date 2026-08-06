@@ -9,9 +9,9 @@
 //! # Header case
 //!
 //! Envoy normalizes incoming HTTP header names to lowercase before handing
-//! them to ext_authz, so every *lookup* constant here is lowercase. Response
-//! header constants keep the spec's uppercase spelling purely for readability
-//! on the wire; HTTP header names are case-insensitive.
+//! them to either filter service, so every *lookup* constant here is
+//! lowercase. Response header constants keep the spec's uppercase spelling
+//! purely for readability on the wire; HTTP header names are case-insensitive.
 
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use serde::{Deserialize, Serialize};
@@ -448,8 +448,8 @@ impl FacilitatorError {
 ///
 /// Two modes. `stub-accept-all` performs the structural checks only and moves
 /// no funds; `sui-grpc` delegates to [`crate::sui::SuiVerifier`], which runs the
-/// four `scheme_exact_sui.md` steps against a fullnode. Sui fullnodes have
-/// removed JSON-RPC, so gRPC is the only path. The steps map as follows:
+/// four `scheme_exact_sui.md` steps against a fullnode over gRPC, Sui's
+/// supported interface since JSON-RPC was deprecated. The steps map as follows:
 ///
 /// | Scheme step | Sui gRPC call |
 /// |---|---|

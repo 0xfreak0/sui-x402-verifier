@@ -16,6 +16,10 @@
 
 .DS_Store
 
+# Installed dependencies for the browser client. A `git add -A` at the repo root
+# otherwise sweeps in a few thousand vendored files.
+node_modules/
+
 # The prize video. Someone else's copyrighted work, and there is no reason to
 # redistribute it from this repo. Fetch or supply your own; the page degrades to
 # a text card when it is absent.

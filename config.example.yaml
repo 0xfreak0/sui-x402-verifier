@@ -21,8 +21,8 @@ listen_addr: "127.0.0.1:50051"
 
 # Sui fullnode used for verification and settlement.
 #
-# NOTE: public Sui fullnodes have REMOVED JSON-RPC. gRPC (sui.rpc.v2.*) is the
-# only supported interface, which is why this is a gRPC URL.
+# NOTE: Sui has deprecated JSON-RPC in favour of gRPC (sui.rpc.v2.*), which is
+# why this is a gRPC URL.
 sui_grpc_url: "https://fullnode.testnet.sui.io:443"
 sui_chain: "testnet"
 
@@ -122,8 +122,8 @@ policies:
     description: "Sui testnet fullnode gRPC calls"
 
 # Path-prefix overrides, matched by the verifier itself. Fallback for gateways
-# that cannot attach per-route metadata to an ext_authz callout (Kong, APISIX).
-# This DOES duplicate path knowledge, so prefer `policies` with Envoy.
+# that can route to this service but cannot attach per-route metadata to the
+# callout. This DOES duplicate path knowledge, so prefer `policies` with Envoy.
 # routes:
 #   - path_prefix: "/sui.rpc.v2."
 #     amount: "5000"

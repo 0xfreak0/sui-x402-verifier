@@ -223,7 +223,7 @@ async fn main() -> Result<()> {
         .add_service(AuthorizationServer::new(X402Auth::new(state)))
         .serve_with_shutdown(listen_addr, shutdown_signal())
         .await
-        .context("ext_authz gRPC server failed")?;
+        .context("filter gRPC server failed")?;
 
     tracing::info!("shutdown complete");
     Ok(())

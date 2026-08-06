@@ -81,9 +81,13 @@ pub enum VerificationMode {
     /// chain. Development and protocol-plumbing work only.
     #[serde(rename = "stub-accept-all")]
     StubAcceptAll,
-    /// Verify and settle against a Sui fullnode over gRPC. Not yet implemented;
-    /// selecting it currently causes every payment to be rejected rather than
-    /// silently falling back to the stub.
+    /// Verify and settle against a Sui fullnode over gRPC. This is the real
+    /// path and what every deployed config selects; the stub above exists only
+    /// so protocol plumbing can be exercised without a fullnode.
+    ///
+    /// A connection failure here rejects payments rather than silently falling
+    /// back to the stub, so a misconfigured node cannot quietly start giving
+    /// the upstream away.
     #[serde(rename = "sui-grpc")]
     SuiGrpc,
 }
@@ -312,7 +316,9 @@ pub struct StoreConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    /// Address the ext_authz gRPC server binds to.
+    /// Address the filter gRPC server binds to. Both `ext_proc` and `ext_authz`
+    /// are served here as distinct gRPC services, so Envoy reaches whichever one
+    /// its filter chain points at.
     pub listen_addr: SocketAddr,
     /// Optional address for the Prometheus exporter, serving `/metrics`.
     ///
@@ -324,12 +330,14 @@ pub struct Config {
     /// `/verify`, `/settle`, `/supported`).
     ///
     /// **Disabled unless set.** Envoy never calls these endpoints — it uses the
-    /// ext_authz gRPC service above, where verification and settlement happen
-    /// together inside one `Check()`. §7 exists so *other* x402 resource
-    /// servers can delegate Sui work to this service.
+    /// filter gRPC service above. §7 exists so *other* x402 resource servers can
+    /// delegate Sui work to this service without running Envoy at all.
     ///
-    /// Unauthenticated: bind loopback or a private interface. `/settle` is the
-    /// endpoint that moves money once real settlement lands.
+    /// Unauthenticated. Bind loopback or a private interface: `/settle`
+    /// broadcasts a payment, and an exposed one lets anybody who has captured a
+    /// signed payload push it on chain. The replay claim bounds that to once per
+    /// payment, which is a limit on the damage rather than a substitute for
+    /// putting the listener somewhere reachable only by callers you trust.
     #[serde(default)]
     pub facilitator_api_listen_addr: Option<SocketAddr>,
     /// Sui fullnode gRPC endpoint used for verification and settlement.
@@ -340,8 +348,9 @@ pub struct Config {
     /// How payments are verified.
     pub verification_mode: VerificationMode,
     pub payment: PaymentConfig,
-    /// Named payment policies, selected by Envoy per route via
-    /// `context_extensions: { x402_policy: <name> }`.
+    /// Named payment policies, selected by Envoy per route. `ext_proc` reads the
+    /// name from route `filter_metadata`; `ext_authz` reads it from
+    /// `context_extensions`. Both spell the key `x402_policy`.
     ///
     /// **This is the preferred way to price multiple routes.** Envoy stays the
     /// single source of truth for which paths exist and which policy each one
@@ -351,9 +360,10 @@ pub struct Config {
     pub policies: std::collections::HashMap<String, PaymentOverride>,
     /// Path-prefix overrides, matched by the verifier itself.
     ///
-    /// Fallback for gateways that cannot attach per-route metadata to an
-    /// ext_authz call. This *does* duplicate path knowledge between the gateway
-    /// and this file, so prefer `policies` when running Envoy.
+    /// Fallback for gateways that can route to this service but cannot attach
+    /// per-route metadata to the callout. This *does* duplicate path knowledge
+    /// between the gateway and this file, so prefer `policies` when running
+    /// Envoy.
     #[serde(default)]
     pub routes: Vec<RouteOverride>,
     pub free_tier: FreeTierConfig,

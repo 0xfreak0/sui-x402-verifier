@@ -4,7 +4,7 @@
 #   client ──▶ Envoy :10000 ─────────┤
 #                    │               └─▶ fullnode.testnet.sui.io (gRPC/TLS)
 #                    │
-#                    └──ext_authz──▶ x402-verifier :50051
+#                    └──ext_proc───▶ x402-verifier :50051
 #
 # Both upstreams are the Sui testnet itself, so the API being rate limited and
 # the chain being paid on are the same network.
@@ -295,13 +295,17 @@ static_resources:
                   #
                   # ORDERING IS LOAD-BEARING, twice over:
                   #
-                  # 1. cors BEFORE ext_authz. The CORS filter answers preflight
-                  #    OPTIONS itself and short-circuits the chain. If ext_authz
-                  #    ran first, the preflight would be metered and 402'd, and
-                  #    the browser would never send the real request at all.
-                  # 2. ext_authz BEFORE router (and before any ratelimit filter)
-                  #    so the headers it injects exist by the time descriptors
-                  #    are built.
+                  # Both rules apply to whichever payment filter is enabled;
+                  # ext_proc is the one in the chain as shipped.
+                  #
+                  # 1. cors BEFORE the payment filter. The CORS filter answers
+                  #    preflight OPTIONS itself and short-circuits the chain. If
+                  #    the payment filter ran first, the preflight would be
+                  #    metered and 402'd, and the browser would never send the
+                  #    real request at all.
+                  # 2. the payment filter BEFORE router (and before any ratelimit
+                  #    filter) so the headers it injects exist by the time
+                  #    descriptors are built.
                   # Browsers cannot speak native gRPC — fetch/XHR give no control
                   # over HTTP/2 frames, and HTTP/2 trailers are unreadable from
                   # JS. grpc-web carries trailers in the response body instead.

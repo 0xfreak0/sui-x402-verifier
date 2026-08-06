@@ -3,7 +3,9 @@
 //! `POST /verify`, `POST /settle`, `GET /supported` — the standard endpoints a
 //! *resource server* calls to delegate blockchain work. Plus `GET /policies`,
 //! which is not in the spec; see below. This runs on its own listener, separate
-//! from the ext_authz gRPC service, and shares the same [`Facilitator`].
+//! from the filter gRPC service, and shares the same [`Facilitator`] — and the
+//! same replay claim, so a payment spent through the gateway cannot be spent
+//! again through `/settle`.
 //!
 //! # Why this exists
 //!

@@ -13,7 +13,8 @@
 //! other three prove *someone signed something that would execute*; only step 4
 //! proves the money moves to the right place in the right amount.
 //!
-//! Sui fullnodes have removed JSON-RPC, so gRPC is the only interface.
+//! Sui has deprecated JSON-RPC in favour of gRPC, so gRPC is the interface
+//! this targets.
 
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use sui_rpc::proto::sui::rpc::v2 as pb;
