@@ -96,11 +96,13 @@ category:
 - **Settlement happens on the response path.** `ext_proc` gives a bidirectional
   stream per request, so the payment is verified on the way in and broadcast
   only after the upstream returns 2xx — the ordering the spec asks for. A
-  reverse proxy can buffer to achieve this too, but nothing else appears to.
-- **gRPC and grpc-web are gated too.** A public search finds no other
-  x402 implementation that handles gRPC at all, and there is no transport
-  binding for it in the spec — see `docs/` for how denials are framed as
-  trailers-only responses.
+  reverse proxy could buffer to achieve the same thing; as of August 2026 none
+  that I could find does.
+- **gRPC and grpc-web are gated too.** The spec defines HTTP, MCP and A2A
+  transports and nothing for gRPC, so the framing here — trailers-only denials
+  carrying `grpc-status: 8` — had to be chosen rather than followed. As of
+  August 2026 a public search turned up no other x402 implementation handling
+  gRPC; that is a point-in-time observation and the sort of claim that expires.
 - **Sui.** Upstream has a Sui *scheme document* and no Sui implementation. This
   was briefly the only working one; a [live Sui facilitator](https://forums.sui.io/t/the-first-live-x402-facilitator-on-sui-agents-pay-usdc-per-api-call-verified-humans-read-free/49391)
   now exists too, so treat "first" claims about Sui as expired.
@@ -540,8 +542,8 @@ Gaps found in the spec while implementing, with drafted upstream issues:
 cargo test                                                # 182 unit tests
 redis-server --port 6399 --daemonize yes
 X402_TEST_REDIS_URL=redis://127.0.0.1:6399 cargo test      # + Redis integration
-scripts/e2e-test.sh                                        # 15 assertions
-scripts/e2e-test.sh --real                                 # …with real payments
+scripts/e2e-test.sh --real                                 # 14 checks, settles on chain
+scripts/e2e-test.sh                                        # …placeholder bytes; needs stub-accept-all
 ```
 
 Redis tests no-op when `X402_TEST_REDIS_URL` is unset, so the suite passes on a

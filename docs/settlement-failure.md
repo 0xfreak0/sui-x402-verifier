@@ -28,7 +28,7 @@ the fullnode going down: *every* settlement fails and the gateway silently
 degrades into a free public proxy, exactly when that is least affordable.
 Nothing currently notices that failures are systemic rather than incidental.
 
-## Planned mitigations, in priority order
+## Mitigations, in priority order — one shipped, three not
 
 1. ~~**Circuit-break on settlement health.**~~ **Implemented.**
    `src/breaker.rs` tracks outcomes per policy and opens past a 50% failure
