@@ -334,7 +334,10 @@
     <pre id="cli">git clone https://github.com/0xfreak0/sui-x402-verifier &amp;&amp; cd sui-x402-verifier
 
 # You need testnet USDC, from faucet.circle.com (chain: Sui Testnet).
-# You do not need any SUI. Payments above 0.01 USDC run gasless.
+# Payments above 0.01 USDC settle gasless, but they spend from your ADDRESS
+# BALANCE and faucet USDC lands as coin objects. Moving it across is a one-off
+# that does cost a little SUI; the README has the command. After that, nothing
+# you pay needs gas.
 cargo run --bin x402-pay -- https://x402.suisonar.dev/graphql \
   -X POST -H 'content-type: application/json' \
   -d '{"query":"{ chainIdentifier }"}'</pre>
