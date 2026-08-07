@@ -75,6 +75,93 @@ The demo fronts the Sui testnet itself, so the API being metered and the chain
 being paid on are the same network. Nothing above the scheme layer is
 Sui-specific.
 
+## What this found
+
+The code is a prototype. These are the parts worth taking somewhere else.
+
+### Simulating a payment does not prove it can still execute
+
+The Sui scheme says to "simulate the transaction to ensure it would succeed and
+has not already been executed." Following that literally leaves a hole, measured
+on testnet before the fix:
+
+```
+1. sign a payment pinning USDC coin 0x3a4d…   →  /verify says isValid: true
+2. spend that coin in an unrelated transaction   (Success)
+3. /verify again                              →  STILL isValid: true
+4. /settle                                    →  invalid argument
+```
+
+No race required. Spend the coin first, present the dead authorization, get
+verified, get served, watch settlement fail. **Any facilitator that verifies by
+simulating alone has this.** The fix reads every pinned input — owned and
+receiving inputs plus gas objects — and confirms each still exists at its pinned
+version, treating `NotFound` as spent rather than as an RPC error. Shared inputs
+are skipped, since consensus versions those at execution.
+
+Honest limit: a gasless payment pins nothing, so the check is a no-op on the
+path this gateway is normally paid through. The finding is true of the scheme as
+written. [`sui-scheme-conformance.md`](docs/sui-scheme-conformance.md)
+
+### "Gasless" has a cold start that the word hides
+
+Sui's address balances make a payment cost zero gas — but only once funds are
+*in* the address balance, and USDC from a faucet, an exchange or an ordinary
+transfer arrives as coin objects. Moving it across costs gas. So a payer holding
+only stablecoins cannot make their first gasless payment, which is precisely the
+agent case the whole approach is aimed at.
+
+Selecting the gasless path on price alone therefore builds a transaction that
+cannot execute. The client now probes the address balance and falls through to
+coin objects, and reports what every path needed when none work.
+[`deployment-architecture.md`](docs/deployment-architecture.md)
+
+### The spec's ordering rules out a whole class of gateway
+
+x402 sequences payment as verify → do the work → settle, so a client is only
+charged once the resource exists. That silently excludes every pre-upstream
+authorization filter — Envoy's `ext_authz`, NGINX `auth_request`, most gateway
+plugin models — because none of them can observe the response.
+
+An implementer reaching for one produces a conformant-*looking* service with the
+payment ordering inverted and no indication anything is wrong. `ext_proc` is the
+way out: one bidirectional stream per request, so a verified payment is held as
+stream-local state and settled on the way out. Proved by a route that always
+returns 503 — payment verified, nothing charged.
+[`spec-gaps.md`](docs/spec-gaps.md)
+
+### The spec is chain-agnostic in shape and EVM-shaped in content
+
+Six of the fifteen standard error codes are named
+`invalid_exact_evm_payload_*`. There is no non-EVM equivalent for any of them,
+so a Sui or Solana facilitator rejecting a bad signature has no standard code
+for it — everything collapses into `invalid_payload`. §10's replay protection
+leans on EIP-3009 contracts enforcing nonce non-reuse on chain, which does not
+generalise either. And `maxTimeoutSeconds` has no on-chain expression on Sui,
+whose finest expiry is one epoch (~24h).
+[`upstream-issues/`](docs/upstream-issues/)
+
+### gRPC had to be framed, because nothing specifies it
+
+The spec defines HTTP, MCP and A2A transports and says nothing about gRPC, where
+a non-200 status collapses into an opaque transport error. Denials here are
+trailers-only responses carrying `grpc-status: 8`, with `grpc-timeout` injected
+so a paid stream cannot outlive its session. Chosen rather than followed.
+
+### Measured, not estimated
+
+Settlement lands on the response path: three payments verified against a 503
+upstream left the payee balance unchanged. Live traffic shows verification at
+~22ms mean and settlement at ~439ms — which is why one payment buys a session
+rather than a request.
+
+The gate's own decision measures 0.3–0.5ms, but **that is a single-host figure**:
+Envoy, the verifier and Redis share a network namespace on the demo box, so
+every internal hop is loopback and the Envoy↔verifier transit is not in the
+number at all. Isolating true gate cost needs a bypass route under identical
+load, which has not been done.
+[`deployment-architecture.md`](docs/deployment-architecture.md)
+
 ## Why a gateway
 
 Most x402 implementations are **middleware you import into an app you control**
@@ -536,6 +623,7 @@ The last two are the ones worth alerting on. Everything else is throughput.
 |---|---|
 | [`docs/how-it-works.md`](docs/how-it-works.md) | **start here** — the shape of the thing, a request end to end, and the questions it gets |
 | [`docs/configuring.md`](docs/configuring.md) | setting up Envoy and the verifier, and checking each setting is doing what you think |
+| [`docs/deployment-architecture.md`](docs/deployment-architecture.md) | where the verifier runs, what state it needs, and the latency model — including what has *not* been measured |
 | [`docs/sui-scheme-conformance.md`](docs/sui-scheme-conformance.md) | line-by-line audit against the Sui `exact` scheme, both payment paths |
 | [`docs/settlement-failure.md`](docs/settlement-failure.md) | what happens when settlement fails after the resource was served, and what should be built |
 | [`docs/spec-gaps.md`](docs/spec-gaps.md) | where the spec does not say enough to implement from |
