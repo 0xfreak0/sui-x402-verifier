@@ -190,11 +190,33 @@ splitting a coin and transferring it.
 | Run the interactive gas-station protocol | **N** | Out of scope |
 | Facilitator adds its own signature at settle time | **N** | Out of scope |
 
-Deliberate, and less costly than it was. Sponsorship exists in the spec so a
-payer without SUI can still pay; on the gasless path the payer needs no SUI in
-the first place, so the motivating problem is gone for any price at or above the
-floor. It would still be needed to cover sub-cent payments, and
-`WithdrawFrom::Sponsor` exists in the SDK for a non-interactive version.
+Deliberate, and less costly than it was — but not free, and the reason this was
+originally skipped does not fully hold.
+
+Sponsorship exists in the spec so a payer without SUI can still pay. The gasless
+path removes that need in **steady state**: at or above the floor, a payer
+spending from their address balance needs no SUI ever again. It does not remove
+it at **cold start**. Gasless spends from the address balance, USDC arrives as
+coin objects, and moving funds across is a `0x2::coin::send_funds` that costs
+gas. A payer holding only stablecoins therefore cannot bootstrap, which is
+precisely the case sponsorship covers.
+
+So the honest position is:
+
+| Payer holds | Gasless | Coin object | Sponsored |
+|---|---|---|---|
+| Funded address balance | Y | — | — |
+| Coin objects **and** SUI | N | Y | Y |
+| Coin objects, **no SUI** | N | N | **only this** |
+
+The client falls through the first two automatically (`payclient::build_payment`),
+so rows one and two need nothing. Row three needs a gas station, and for an
+agent holding only stablecoins row three is the normal state rather than an edge
+case.
+
+`WithdrawFrom::Sponsor` exists in the SDK for a non-interactive version, which is
+the shape to build if this is ever wanted — the spec's own appendix says Address
+Balances should make the interactive protocol unnecessary.
 
 Implementing it would mean holding a funded hot wallet, which changes the
 security posture from "this service holds no keys" — checkable via the empty

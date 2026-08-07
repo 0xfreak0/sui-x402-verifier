@@ -607,16 +607,21 @@ async fn send(
         detail: e.to_string(),
     })?;
     let build_start = began.elapsed().as_secs_f64() * 1000.0;
-    let payment =
-        payclient::build_payment_header(&state.args.rpc, &key, &challenge.resource.url, terms)
-            .await
-            .map_err(|e| {
-                tracing::error!(error = %e, target = target.id, "building the payment failed");
-                ApiError {
-                    error: "payment_failed".into(),
-                    detail: e.to_string(),
-                }
-            })?;
+    let payment = payclient::build_payment_header(
+        &state.args.rpc,
+        &key,
+        &challenge.resource.url,
+        terms,
+        payclient::DEFAULT_PAYMENT_PATHS,
+    )
+    .await
+    .map_err(|e| {
+        tracing::error!(error = %e, target = target.id, "building the payment failed");
+        ApiError {
+            error: "payment_failed".into(),
+            detail: e.to_string(),
+        }
+    })?;
 
     let build_ms = began.elapsed().as_secs_f64() * 1000.0 - build_start;
     trace.push(Span::new(

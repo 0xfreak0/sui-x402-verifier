@@ -225,6 +225,11 @@ impl X402Auth {
             url: resource_url.to_string(),
             description: Some(payment.description.clone()),
             mime_type: Some("application/json".to_string()),
+            service_name: payment.service_name.clone(),
+            // An empty list is absent, not `[]`: a discovery index should see
+            // "no tags declared" rather than "declared, and empty".
+            tags: (!payment.tags.is_empty()).then(|| payment.tags.clone()),
+            icon_url: payment.icon_url.clone(),
         };
 
         // Advertise that a settled payment buys a reusable session, using the
@@ -1096,10 +1101,14 @@ pub mod test_support {
                 network: "sui:testnet".into(),
                 amount: "1000".into(),
                 asset: "0xa1::usdc::USDC".into(),
+                asset_decimals: crate::config::DEFAULT_ASSET_DECIMALS,
                 pay_to: "0xmerchant".into(),
                 max_timeout_seconds: 60,
                 description: "test".into(),
                 gas_station: None,
+                service_name: None,
+                tags: Vec::new(),
+                icon_url: None,
             },
             policies,
             routes: Vec::new(),
@@ -1160,6 +1169,9 @@ mod tests {
             url: RESOURCE_URL.into(),
             description: Some("test".into()),
             mime_type: Some("application/json".into()),
+            service_name: None,
+            tags: None,
+            icon_url: None,
         }
     }
 

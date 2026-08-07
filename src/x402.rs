@@ -46,6 +46,21 @@ pub struct ResourceInfo {
     pub description: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mime_type: Option<String>,
+    /// Human-readable name of the service. Printable ASCII, max 32 characters.
+    ///
+    /// This and the two fields below exist to feed §8 discovery: they are what
+    /// a Bazaar indexes and filters on. Omitting them leaves a resource listed
+    /// but unnamed and unfilterable, so they are cheap to populate and
+    /// expensive to leave out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_name: Option<String>,
+    /// Topical tags for discovery filtering. Max 5, each printable ASCII and
+    /// max 32 characters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tags: Option<Vec<String>>,
+    /// Absolute http(s) URL to an icon. Max 2048 characters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon_url: Option<String>,
 }
 
 /// One acceptable way to pay (§5.1.2).
@@ -804,10 +819,14 @@ mod tests {
             network: "sui:testnet".into(),
             amount: "1000".into(),
             asset: "0xa1::usdc::USDC".into(),
+            asset_decimals: crate::config::DEFAULT_ASSET_DECIMALS,
             pay_to: "0xabc".into(),
             max_timeout_seconds: 60,
             description: "test".into(),
             gas_station: None,
+            service_name: None,
+            tags: Vec::new(),
+            icon_url: None,
         };
 
         // Unset: no `extra` at all, rather than an empty object claiming
@@ -902,6 +921,9 @@ mod tests {
             url: "https://api.example.com/graphql".into(),
             description: Some("test".into()),
             mime_type: Some("application/json".into()),
+            service_name: None,
+            tags: None,
+            icon_url: None,
         }
     }
 

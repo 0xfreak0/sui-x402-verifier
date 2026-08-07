@@ -31,9 +31,10 @@ sui_chain: "testnet"
 #   stub-accept-all  Accept any well-formed payment WITHOUT touching the chain.
 #                    No funds move. Development only — the service logs a loud
 #                    warning at startup when this is set.
-#   sui-grpc         Verify and settle against the fullnode. Not implemented
-#                    yet; currently rejects every payment rather than falling
-#                    back to the stub.
+#   sui-grpc         Verify and settle against the fullnode. This is the real
+#                    path and what every deployed config uses. If the node is
+#                    unreachable it rejects payments rather than quietly falling
+#                    back to the stub and giving the upstream away.
 verification_mode: stub-accept-all
 
 # Placeholder key (32 bytes of 0xab). REPLACE THIS.
@@ -60,6 +61,13 @@ payment:
   # Faucet: https://faucet.circle.com — select "Sui Testnet".
   asset: "0xa1ec7fc00a6f40db9693ad1415d0c193ad3906494428cf252621037bd7117e29::usdc::USDC"
 
+  # Decimals of `asset`. Never sent on the wire — x402 carries `amount` in base
+  # units and says nothing about scale. This only sets where the gasless floor
+  # (0.01 of the asset) lands: 6 decimals puts it at 10000, 9 decimals at
+  # 10000000. Leave it matching the asset, or the startup price check is wrong
+  # in the direction that lets a mispriced policy through.
+  asset_decimals: 6
+
   # Address that receives payment.
   #
   # This is the ZERO ADDRESS placeholder and the service REFUSES TO START
@@ -78,6 +86,19 @@ payment:
   # facilitator will sponsor (pay gas for) transactions. Advertising only — the
   # interactive gas station protocol itself is not implemented.
   # gas_station: "https://gas.example.com"
+
+  # Discovery metadata (spec §5.1.2), published in the challenge's `resource`
+  # object. All optional, and omitted from the challenge when unset.
+  #
+  # This is what a §8 Bazaar indexes and filters on. Without it a resource can
+  # still be listed, but it appears unnamed and cannot be found by tag. The
+  # spec's limits are enforced at startup rather than truncated on the wire:
+  # service_name and each tag are printable ASCII up to 32 characters, at most
+  # 5 tags, and icon_url is an absolute http(s) URL up to 2048 characters.
+  #
+  # service_name: "Sui Testnet Gateway"
+  # tags: ["rpc", "sui", "graphql"]
+  # icon_url: "https://example.com/icon.png"
 
 # Anonymous tier, metered per source IP. Deliberately small so the 402 flow is
 # easy to trigger by hand during local testing.

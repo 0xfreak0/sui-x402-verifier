@@ -123,7 +123,7 @@ transferable thing to come out of it is the verification gap documented in
 | Redis backend (multi-replica) | Working; exercised in CI, **skipped locally** unless `X402_TEST_REDIS_URL` is set |
 | Facilitator API (`/verify`, `/settle`, `/supported`, `/policies`) | Working, off by default |
 | Streaming RPCs | **Not metered** — see Limitations |
-| Gas sponsorship | Advertised via `extra.gasStation`, not implemented — and unnecessary above the gasless floor, since the payer needs no SUI |
+| Gas sponsorship | Advertised via `extra.gasStation`, not implemented. Unnecessary once a payer's address balance is funded; still the only path for a payer holding stablecoins and no SUI at all |
 | `ext_proc` filter | **Default.** Settles after the upstream succeeds |
 | `ext_authz` filter | Implemented and unit-tested, **not enabled** in the shipped `envoy.yaml`, not exercised end to end |
 
@@ -224,10 +224,16 @@ everything is derived at runtime.
 | Testnet SUI | `sui client faucet`, or [faucet.sui.io](https://faucet.sui.io) |
 | Your address | `sui client active-address` |
 
-**USDC is the only one you actually need.** Payments at or above 0.01 USDC take
-the gasless path and cost no SUI at all. SUI is
-required only for sub-cent prices, which fall back to coin objects, and for the
-one-off transaction that moves USDC into your address balance:
+**You need a little SUI once, then never again.** Payments at or above 0.01 USDC
+take the gasless path and cost no SUI — but gasless spends from your *address
+balance*, and faucet USDC arrives as coin objects. Moving it across is the
+one-off below, and it costs gas.
+
+`x402-pay` handles the case where you have not done that yet: it probes the
+address balance and falls back to coin objects rather than building a
+transaction that cannot execute. That fallback needs SUI for gas, so doing the
+one-off is still the better setup. `--payment-paths` pins a single path if you
+want to see one fail rather than fall through.
 
 ```bash
 # Gasless payments spend from the address balance, not from coin objects.

@@ -60,6 +60,15 @@ struct Args {
     /// Verify the payment without sending it to the resource.
     #[arg(long)]
     dry_run: bool,
+
+    /// Funding paths to try, in order. Comma-separated: `gasless`,
+    /// `sponsored`, `coin-object`.
+    ///
+    /// The default tries all three, cheapest for the payer first. Naming a
+    /// single one makes the choice deterministic instead of dependent on what
+    /// the wallet happens to hold, which is what the end-to-end script wants.
+    #[arg(long, default_value = "gasless,sponsored,coin-object")]
+    payment_paths: String,
 }
 
 #[tokio::main]
@@ -112,8 +121,10 @@ async fn main() -> Result<()> {
     let key = payclient::load_key()?;
     println!("  paying as {}", key.public_key().derive_address());
 
+    let paths = payclient::PaymentPath::parse_list(&args.payment_paths)?;
     let header =
-        payclient::build_payment_header(&args.rpc, &key, &challenge.resource.url, terms).await?;
+        payclient::build_payment_header(&args.rpc, &key, &challenge.resource.url, terms, &paths)
+            .await?;
 
     if args.dry_run {
         println!("\n--dry-run: built and signed, not sent");

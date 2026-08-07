@@ -49,8 +49,12 @@ const SUI_ADDRESS_HEX_LEN: usize = 64;
 const PLACEHOLDER_HMAC_SECRET: &str =
     "abababababababababababababababababababababababababababababababab";
 
-/// Smallest transfer Sui's gasless stablecoin path will execute, in base units
-/// of a 6-decimal stablecoin: 0.01.
+/// Decimals assumed for the billed asset when none is configured. USDC and most
+/// stablecoins use 6.
+pub const DEFAULT_ASSET_DECIMALS: u32 = 6;
+
+/// Smallest transfer Sui's gasless stablecoin path will execute: 0.01 of the
+/// asset, expressed in its base units.
 ///
 /// Below this the transfer is simply not executed, so a price set under it
 /// forces the old coin-object path — the payer needs SUI for gas, an object is
@@ -60,11 +64,21 @@ const PLACEHOLDER_HMAC_SECRET: &str =
 /// This is why sessions matter here. Sub-cent per-request pricing is possible
 /// but only on that fallback path; one payment buying a thousand requests brings
 /// the effective price to $0.00001 while every settlement stays above the floor.
-pub const GASLESS_MINIMUM_BASE_UNITS: u128 = 10_000;
+///
+/// **Derived from decimals rather than hardcoded.** The floor was `10_000` for
+/// as long as the only asset was 6-decimal USDC, which silently computes a
+/// threshold 1000x too small for a 9-decimal coin — and too small in the
+/// accepting direction, so a mispriced policy passes the check instead of
+/// tripping it.
+pub fn gasless_minimum_base_units(decimals: u32) -> u128 {
+    // 0.01 of one whole unit. Saturating because a coin claiming absurd
+    // decimals should not panic the process at startup.
+    10u128.saturating_pow(decimals) / 100
+}
 
-/// Decimals assumed when reporting a price against the gasless floor. Only used
-/// for the startup warning, never for anything on the wire.
-const STABLECOIN_DECIMALS: u32 = 6;
+fn default_asset_decimals() -> u32 {
+    DEFAULT_ASSET_DECIMALS
+}
 
 /// Minimum accepted HMAC key length in bytes. 32 bytes matches the SHA-256
 /// block security level; shorter keys are rejected outright rather than
@@ -113,6 +127,15 @@ pub struct PaymentConfig {
     pub amount: String,
     /// Fully-qualified Move coin type to be paid in.
     pub asset: String,
+    /// Decimals of `asset`, used to turn the gasless floor (0.01 of the asset)
+    /// into base units for the startup price check.
+    ///
+    /// Never appears on the wire — x402 carries `amount` in base units and says
+    /// nothing about decimals. This exists so the floor check is right for a
+    /// coin that is not 6-decimal USDC; set it wrong and the check is wrong in
+    /// the accepting direction, which is worse than an error.
+    #[serde(default = "default_asset_decimals")]
+    pub asset_decimals: u32,
     /// Sui address that receives payment. Must be this operator's wallet.
     pub pay_to: String,
     /// How long a signed authorization stays acceptable, in seconds.
@@ -120,6 +143,19 @@ pub struct PaymentConfig {
     /// Human-readable description of the resource. In v2 this belongs to the
     /// top-level `resource` object, not to each `accepts` entry.
     pub description: String,
+    /// Service name published in `resource.serviceName` (§5.1.2).
+    ///
+    /// This and the next two are discovery metadata: what a §8 Bazaar indexes
+    /// and filters on. All optional, and absent from the challenge when unset,
+    /// because publishing an empty string is worse than publishing nothing.
+    #[serde(default)]
+    pub service_name: Option<String>,
+    /// Topical tags published in `resource.tags`, for discovery filtering.
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// Icon URL published in `resource.iconUrl`.
+    #[serde(default)]
+    pub icon_url: Option<String>,
     /// Gas station URL advertised as `extra.gasStation` when set, signalling
     /// to clients that this facilitator will sponsor transactions. Advertising
     /// only — the interactive sponsorship protocol itself is not implemented.
@@ -150,6 +186,16 @@ pub struct PaymentOverride {
     /// Price for this policy.
     #[serde(default)]
     pub amount: Option<String>,
+    /// Coin this policy bills in. Unset inherits the global asset.
+    ///
+    /// Set this and `asset_decimals` together or the floor check for this
+    /// policy is computed against the wrong scale — which is why the two are
+    /// validated as a pair rather than independently.
+    #[serde(default)]
+    pub asset: Option<String>,
+    /// Decimals of `asset`. Only meaningful alongside it.
+    #[serde(default)]
+    pub asset_decimals: Option<u32>,
     /// Description surfaced in the challenge.
     #[serde(default)]
     pub description: Option<String>,
@@ -169,6 +215,15 @@ impl PaymentOverride {
         }
         if let Some(amount) = &self.amount {
             resolved.payment.amount = amount.clone();
+        }
+        if let Some(asset) = &self.asset {
+            resolved.payment.asset = asset.clone();
+        }
+        // Decimals follow the asset independently: a policy may override the
+        // coin without changing scale (another 6-decimal stablecoin), so this
+        // is not conditioned on `asset` being set.
+        if let Some(decimals) = self.asset_decimals {
+            resolved.payment.asset_decimals = decimals;
         }
         if let Some(description) = &self.description {
             resolved.payment.description = description.clone();
@@ -454,6 +509,7 @@ impl Config {
 
         self.free_tier.validate("free_tier")?;
         self.paid_tier.validate("paid_tier")?;
+        self.validate_discovery_metadata()?;
 
         self.warn_if_below_the_gasless_floor();
 
@@ -481,6 +537,51 @@ impl Config {
         Ok(())
     }
 
+    /// Enforce the §5.1.2 bounds on discovery metadata.
+    ///
+    /// Refused at startup rather than truncated on the wire: an index that
+    /// silently drops an over-long tag leaves the operator wondering why their
+    /// resource is unfilterable, and the config is the only place the mistake
+    /// is visible.
+    fn validate_discovery_metadata(&self) -> Result<()> {
+        const MAX_FIELD: usize = 32;
+        const MAX_TAGS: usize = 5;
+        const MAX_ICON_URL: usize = 2048;
+
+        if let Some(name) = &self.payment.service_name
+            && (name.len() > MAX_FIELD || !name.is_ascii())
+        {
+            bail!(
+                "payment.service_name must be printable ASCII and at most {MAX_FIELD} \
+                 characters (§5.1.2), got {} characters",
+                name.len()
+            );
+        }
+        if self.payment.tags.len() > MAX_TAGS {
+            bail!(
+                "payment.tags allows at most {MAX_TAGS} entries (§5.1.2), got {}",
+                self.payment.tags.len()
+            );
+        }
+        for tag in &self.payment.tags {
+            if tag.len() > MAX_FIELD || !tag.is_ascii() {
+                bail!(
+                    "payment.tags entry {tag:?} must be printable ASCII and at most \
+                     {MAX_FIELD} characters (§5.1.2)"
+                );
+            }
+        }
+        if let Some(icon) = &self.payment.icon_url {
+            if icon.len() > MAX_ICON_URL {
+                bail!("payment.icon_url must be at most {MAX_ICON_URL} characters (§5.1.2)");
+            }
+            if !icon.starts_with("http://") && !icon.starts_with("https://") {
+                bail!("payment.icon_url must be an absolute http(s) URL (§5.1.2), got {icon:?}");
+            }
+        }
+        Ok(())
+    }
+
     /// Warn about prices too small for Sui's gasless stablecoin transfers.
     ///
     /// A warning rather than an error: a sub-cent price is a legitimate choice
@@ -488,17 +589,19 @@ impl Config {
     /// just never be an accident, because the difference is invisible in the
     /// config and expensive at runtime.
     fn warn_if_below_the_gasless_floor(&self) {
-        let scale = 10u128.pow(STABLECOIN_DECIMALS) as f64;
-        for (name, amount) in self.priced_policies() {
+        for (name, amount, decimals) in self.priced_policies() {
+            let floor = gasless_minimum_base_units(decimals);
+            let scale = 10u128.saturating_pow(decimals) as f64;
             let Ok(value) = amount.parse::<u128>() else {
                 continue;
             };
-            if value > 0 && value < GASLESS_MINIMUM_BASE_UNITS {
+            if value > 0 && value < floor {
                 tracing::warn!(
                     policy = %name,
                     amount = %amount,
-                    price = format!("{:.6}", value as f64 / scale),
-                    floor = format!("{:.2}", GASLESS_MINIMUM_BASE_UNITS as f64 / scale),
+                    decimals,
+                    price = format!("{:.*}", decimals as usize, value as f64 / scale),
+                    floor = format!("{:.2}", floor as f64 / scale),
                     "price is below the gasless stablecoin minimum; payers will need SUI \
                      for gas and the payment will pin a coin object. Charge at least the \
                      floor and sell a session to keep the effective per-request price low."
@@ -508,15 +611,22 @@ impl Config {
     }
 
     /// Every policy's effective price, including the default terms.
-    fn priced_policies(&self) -> Vec<(String, &str)> {
+    /// Every policy's effective price *and the decimals it is priced in*.
+    ///
+    /// Both, because a policy can override the asset. Checking a per-policy
+    /// price against the global scale is the same mistake as hardcoding the
+    /// scale, one level down.
+    fn priced_policies(&self) -> Vec<(String, &str, u32)> {
         std::iter::once((
             DEFAULT_POLICY_LABEL.to_string(),
             self.payment.amount.as_str(),
+            self.payment.asset_decimals,
         ))
         .chain(self.policies.iter().map(|(name, over)| {
             (
                 name.clone(),
                 over.amount.as_deref().unwrap_or(&self.payment.amount),
+                over.asset_decimals.unwrap_or(self.payment.asset_decimals),
             )
         }))
         .collect()
@@ -699,14 +809,149 @@ paid_tier:
                     .trim_matches('"')
                     .parse()
                     .expect("amount is an integer");
+                // Every tracked config bills 6-decimal USDC, so the floor is
+                // the default one. A config that changes `asset_decimals` would
+                // need its own floor here.
+                let floor = gasless_minimum_base_units(DEFAULT_ASSET_DECIMALS);
                 assert!(
-                    amount >= GASLESS_MINIMUM_BASE_UNITS,
-                    "{}: amount {amount} is below the gasless floor of {}",
+                    amount >= floor,
+                    "{}: amount {amount} is below the gasless floor of {floor}",
                     full.display(),
-                    GASLESS_MINIMUM_BASE_UNITS
                 );
             }
         }
+    }
+
+    /// The §5.1.2 bounds are refused at startup rather than truncated on the
+    /// wire, because a silently-dropped tag leaves a resource unfilterable with
+    /// nothing to point at.
+    #[test]
+    fn discovery_metadata_outside_the_spec_bounds_is_refused() {
+        let over_long = "x".repeat(33);
+        let cases = [
+            (format!("  service_name: \"{over_long}\"\n"), "service_name"),
+            (
+                "  tags: [\"a\", \"b\", \"c\", \"d\", \"e\", \"f\"]\n".to_string(),
+                "tags",
+            ),
+            (
+                format!("  tags: [\"{over_long}\"]\n"),
+                "an over-long tag entry",
+            ),
+            (
+                "  icon_url: \"not-a-url\"\n".to_string(),
+                "a relative icon_url",
+            ),
+        ];
+        for (fragment, what) in cases {
+            let yaml = base_yaml().replace("  description: \"test\"\n", &{
+                let mut s = String::from("  description: \"test\"\n");
+                s.push_str(&fragment);
+                s
+            });
+            let err = parse(&yaml)
+                .expect_err(&format!("{what} should be refused at startup"))
+                .to_string();
+            // Assert on the reason, not just on failure: a typo in the YAML
+            // fragment above would also fail to parse and would make this test
+            // pass while checking nothing.
+            assert!(
+                err.contains("§5.1.2"),
+                "{what} was rejected for the wrong reason: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn discovery_metadata_within_the_bounds_loads() {
+        let yaml = base_yaml().replace(
+            "  description: \"test\"\n",
+            "  description: \"test\"\n  service_name: \"Sui Testnet Gateway\"\n  \
+             tags: [\"rpc\", \"sui\"]\n  icon_url: \"https://example.com/icon.png\"\n",
+        );
+        let config = parse(&yaml).expect("valid discovery metadata should load");
+        assert_eq!(
+            config.payment.service_name.as_deref(),
+            Some("Sui Testnet Gateway")
+        );
+        assert_eq!(config.payment.tags, vec!["rpc", "sui"]);
+    }
+
+    /// Verification compares `change.coin_type` against `requirements.asset` as
+    /// an opaque string, so billing a route in a different coin needs nothing
+    /// but the terms to say so.
+    #[test]
+    fn a_policy_can_bill_in_a_different_coin_than_the_default() {
+        let yaml = format!(
+            "{}\npolicies:\n  sui_route:\n    amount: \"20000000\"\n    \
+             asset: \"0x2::sui::SUI\"\n    asset_decimals: 9\n",
+            base_yaml()
+        );
+        let config = parse(&yaml).expect("per-policy asset should parse");
+
+        let resolved = config.policy_for("/anything", Some("sui_route"));
+        assert_eq!(resolved.payment.asset, "0x2::sui::SUI");
+        assert_eq!(resolved.payment.asset_decimals, 9);
+
+        // The default policy is untouched by the override.
+        let default = config.policy_for("/anything", None);
+        assert!(default.payment.asset.ends_with("::usdc::USDC"));
+        assert_eq!(default.payment.asset_decimals, DEFAULT_ASSET_DECIMALS);
+    }
+
+    /// The floor warning has to use each policy's own scale. 20000000 base
+    /// units of a 9-decimal coin is 0.02 SUI — above the floor — while the same
+    /// number judged at 6 decimals would be read as 20 whole units. Checking a
+    /// per-policy price against the global scale is the hardcoded-decimals bug
+    /// one level down.
+    #[test]
+    fn the_floor_check_uses_each_policys_own_decimals() {
+        let yaml = format!(
+            "{}\npolicies:\n  sui_route:\n    amount: \"20000000\"\n    \
+             asset: \"0x2::sui::SUI\"\n    asset_decimals: 9\n",
+            base_yaml()
+        );
+        let config = parse(&yaml).expect("parses");
+        let priced = config.priced_policies();
+
+        let (_, amount, decimals) = priced
+            .iter()
+            .find(|(name, _, _)| name == "sui_route")
+            .expect("the policy is listed");
+        assert_eq!(*decimals, 9);
+        assert!(
+            amount.parse::<u128>().unwrap() >= gasless_minimum_base_units(*decimals),
+            "0.02 SUI is above the 9-decimal floor and must not warn"
+        );
+    }
+
+    /// The floor is 0.01 *of the asset*, so it moves with the asset's decimals.
+    /// Hardcoding 10_000 was right only while the sole asset was 6-decimal
+    /// USDC; for a 9-decimal coin it is 1000x too small, and too small in the
+    /// direction that lets a mispriced policy through the check.
+    #[test]
+    fn the_gasless_floor_tracks_the_assets_decimals() {
+        assert_eq!(gasless_minimum_base_units(6), 10_000);
+        assert_eq!(gasless_minimum_base_units(9), 10_000_000);
+        // SUI is 9-decimal. A policy priced at the 6-decimal floor is a
+        // hundred-thousandth of a SUI, far below what would actually execute.
+        assert!(gasless_minimum_base_units(9) > 10_000);
+    }
+
+    /// Configs that predate the field must keep loading and keep meaning what
+    /// they meant, so the default has to be the value that used to be hardcoded.
+    #[test]
+    fn asset_decimals_defaults_to_six_when_a_config_omits_it() {
+        let raw = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("config.example.yaml"),
+        )
+        .expect("config.example.yaml is readable");
+        let config: Config = serde_norway::from_str(&raw).expect("config.example.yaml parses");
+        assert_eq!(config.payment.asset_decimals, DEFAULT_ASSET_DECIMALS);
+        assert_eq!(
+            gasless_minimum_base_units(config.payment.asset_decimals),
+            10_000
+        );
     }
 
     #[test]
