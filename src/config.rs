@@ -398,7 +398,17 @@ pub struct Config {
     /// Sui fullnode gRPC endpoint used for verification and settlement.
     pub sui_grpc_url: String,
     /// Chain the fullnode is expected to be serving (`testnet`, `mainnet`, …).
-    /// Cross-checked against the node at startup in `sui-grpc` mode.
+    ///
+    /// Cross-checked against the node's own `GetServiceInfo` at startup in
+    /// `sui-grpc` mode, and a mismatch **refuses to start**. Nothing else
+    /// notices a fullnode URL pointing at the wrong chain, and one direction of
+    /// that mistake is expensive: mainnet terms served by a testnet node sells
+    /// real access for worthless funds, with every payment verifying and
+    /// settling successfully. A node that reports no chain name degrades to a
+    /// warning rather than blocking startup.
+    ///
+    /// A bare chain name, not the CAIP-2 form — `testnet`, not `sui:testnet`.
+    /// That spelling lives in `payment.network`.
     pub sui_chain: String,
     /// How payments are verified.
     pub verification_mode: VerificationMode,

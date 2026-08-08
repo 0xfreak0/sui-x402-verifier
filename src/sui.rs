@@ -378,6 +378,138 @@ fn assert_credits(
     Ok(())
 }
 
+/// Result of comparing the configured chain against what the node reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChainCheck {
+    /// The node is serving the chain the config expects.
+    Matches,
+    /// The node did not report a chain name. Not every node populates it, and
+    /// an unstartable gateway is worse than an unverified assumption.
+    NotReported,
+}
+
+/// Compare the chain a node reports against the one the config expects.
+///
+/// Split from the RPC call so the comparison is testable without a fullnode —
+/// the decision this makes is the part worth getting right.
+///
+/// Matching is case-insensitive and ignores surrounding whitespace. It is not
+/// otherwise lenient: `sui:testnet` does not match `testnet`, because the
+/// config field holds a bare chain name and accepting both spellings here would
+/// hide a genuinely wrong value.
+pub fn check_chain(
+    configured: &str,
+    reported: Option<&str>,
+) -> Result<ChainCheck, FacilitatorError> {
+    let Some(reported) = reported.map(str::trim).filter(|c| !c.is_empty()) else {
+        return Ok(ChainCheck::NotReported);
+    };
+    if reported.eq_ignore_ascii_case(configured.trim()) {
+        return Ok(ChainCheck::Matches);
+    }
+    Err(FacilitatorError::ChainMismatch {
+        reported: reported.to_string(),
+        configured: configured.to_string(),
+    })
+}
+
+impl SuiVerifier {
+    /// Ask the node which chain it is actually serving.
+    ///
+    /// # Why this runs at startup
+    ///
+    /// Nothing else notices a fullnode URL pointing at the wrong chain, and one
+    /// direction of that mistake loses money: terms advertising `sui:mainnet`
+    /// served by a testnet node means real service sold for worthless testnet
+    /// funds, with every payment verifying and settling successfully. The
+    /// opposite direction merely fails confusingly.
+    ///
+    /// Checked once at boot rather than per request — a node does not change
+    /// chains underneath a running process.
+    pub async fn reported_chain(&self) -> Result<Option<String>, FacilitatorError> {
+        let mut client = self.client.clone();
+        let info = client
+            .ledger_client()
+            .get_service_info(pb::GetServiceInfoRequest::default())
+            .await
+            .map_err(|e| FacilitatorError::Rpc {
+                detail: format!("GetServiceInfo: {e}"),
+            })?
+            .into_inner();
+        Ok(info.chain)
+    }
+}
+
+#[cfg(test)]
+mod chain_tests {
+    use super::*;
+
+    /// The expensive direction. A gateway configured for mainnet but pointed at
+    /// a testnet node sells real access and settles in worthless funds, and
+    /// every payment along the way verifies and settles successfully — there is
+    /// no failure anywhere to notice. This check is the only thing that catches
+    /// it, so it must be fatal rather than a warning.
+    #[test]
+    fn mainnet_terms_served_by_a_testnet_node_is_refused() {
+        let err = check_chain("mainnet", Some("testnet")).expect_err("must not start");
+        assert!(matches!(err, FacilitatorError::ChainMismatch { .. }));
+        // Must not read as a payment problem. This is a config problem, and the
+        // operator reading the log is the one who can fix it.
+        let msg = err.to_string();
+        assert!(msg.contains("fullnode reports"), "{msg}");
+        assert!(msg.contains("sui_chain"), "{msg}");
+    }
+
+    #[test]
+    fn the_reverse_mismatch_is_refused_too() {
+        assert!(check_chain("testnet", Some("mainnet")).is_err());
+    }
+
+    #[test]
+    fn a_matching_chain_passes() {
+        assert_eq!(
+            check_chain("testnet", Some("testnet")).unwrap(),
+            ChainCheck::Matches
+        );
+    }
+
+    /// Node output is not a controlled vocabulary, so casing and stray
+    /// whitespace must not fail a correct deployment at boot.
+    #[test]
+    fn matching_ignores_case_and_surrounding_whitespace() {
+        assert_eq!(
+            check_chain("testnet", Some("  Testnet ")).unwrap(),
+            ChainCheck::Matches
+        );
+        assert_eq!(
+            check_chain(" Mainnet", Some("mainnet")).unwrap(),
+            ChainCheck::Matches
+        );
+    }
+
+    /// Deliberately strict: `sui_chain` holds a bare chain name, and accepting
+    /// the CAIP-2 spelling here would let a genuinely wrong value through.
+    #[test]
+    fn the_caip2_spelling_is_not_accepted_as_a_match() {
+        assert!(check_chain("sui:testnet", Some("testnet")).is_err());
+    }
+
+    /// Not every node populates the field. Refusing to start on a missing value
+    /// would make the gateway unrunnable against an otherwise fine endpoint, so
+    /// this degrades to an unverified assumption that main.rs warns about.
+    #[test]
+    fn a_node_that_reports_no_chain_does_not_block_startup() {
+        assert_eq!(
+            check_chain("testnet", None).unwrap(),
+            ChainCheck::NotReported
+        );
+        assert_eq!(
+            check_chain("testnet", Some("   ")).unwrap(),
+            ChainCheck::NotReported
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

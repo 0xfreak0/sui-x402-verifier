@@ -96,6 +96,34 @@ async fn main() -> Result<()> {
         config.payment.network.clone(),
     )
     .with_context(|| format!("connecting to the Sui fullnode at {}", config.sui_grpc_url))?;
+
+    // Confirm the node is serving the chain the config claims, before anything
+    // can be sold. Nothing else notices a fullnode URL pointing at the wrong
+    // chain, and one direction of that mistake is expensive: terms advertising
+    // mainnet served by a testnet node sells real access for worthless funds,
+    // with every payment verifying and settling successfully.
+    match facilitator.verify_chain(&config.sui_chain).await {
+        Ok(sui::ChainCheck::Matches) => {
+            tracing::info!(chain = %config.sui_chain, "fullnode is serving the expected chain");
+        }
+        Ok(sui::ChainCheck::NotReported) => {
+            if config.verification_mode == VerificationMode::SuiGrpc {
+                tracing::warn!(
+                    chain = %config.sui_chain,
+                    "the fullnode did not report which chain it serves; sui_chain is \
+                     unverified. Confirm the endpoint by hand."
+                );
+            }
+        }
+        Err(e) => {
+            return Err(anyhow::anyhow!(
+                "the fullnode at {} is not serving the configured chain: {e}. \
+                 Fix sui_grpc_url or sui_chain — serving mainnet terms from a testnet \
+                 node sells real access for worthless funds.",
+                config.sui_grpc_url
+            ));
+        }
+    }
     // Connect the state store up front so a bad Redis URL fails at boot rather
     // than on the first paying request.
     let (sessions, limiter) = match config.store.backend {

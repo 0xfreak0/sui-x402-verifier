@@ -361,6 +361,15 @@ pub enum FacilitatorError {
     SchemeMismatch { got: String, expected: String },
     #[error("network mismatch: payment is {got:?}, resource requires {expected:?}")]
     NetworkMismatch { got: String, expected: String },
+    /// Startup only: the fullnode is serving a different chain than configured.
+    /// Distinct from `NetworkMismatch`, which is about a client's payment —
+    /// reusing it here produced "payment is testnet, resource requires mainnet"
+    /// for a problem involving neither a payment nor a resource.
+    #[error("the fullnode reports it is serving {reported:?}, but sui_chain says {configured:?}")]
+    ChainMismatch {
+        reported: String,
+        configured: String,
+    },
     #[error("amount mismatch: payment offers {got:?}, resource costs {expected:?}")]
     AmountMismatch { got: String, expected: String },
     #[error("asset mismatch: payment is in {got:?}, resource requires {expected:?}")]
@@ -422,6 +431,9 @@ impl FacilitatorError {
             FacilitatorError::VersionMismatch { .. } => "invalid_x402_version",
             FacilitatorError::SchemeMismatch { .. } => "invalid_scheme",
             FacilitatorError::NetworkMismatch { .. } => "invalid_network",
+            // Startup-only, so this never reaches a client — the process exits
+            // before it can serve anything. Mapped for exhaustiveness.
+            FacilitatorError::ChainMismatch { .. } => "invalid_network",
             // No Sui analogue of invalid_exact_evm_payload_value_mismatch or
             // _recipient_mismatch exists, so these fall back to the generic
             // "the requirements you accepted are not the ones we advertised".
@@ -498,6 +510,21 @@ impl Facilitator {
             )?),
         };
         Ok(Self { mode, network, sui })
+    }
+
+    /// Confirm the fullnode is serving the chain the config names.
+    ///
+    /// A no-op in stub mode, where there is no node to ask. See
+    /// [`crate::sui::check_chain`] for why a mismatch is fatal.
+    pub async fn verify_chain(
+        &self,
+        expected: &str,
+    ) -> Result<crate::sui::ChainCheck, FacilitatorError> {
+        let Some(sui) = &self.sui else {
+            return Ok(crate::sui::ChainCheck::NotReported);
+        };
+        let reported = sui.reported_chain().await?;
+        crate::sui::check_chain(expected, reported.as_deref())
     }
 
     /// Validate a payment and, on success, move funds.

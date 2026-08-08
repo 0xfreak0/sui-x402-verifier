@@ -6,8 +6,10 @@ Sell API access for stablecoin, at the gateway, without accounts or API keys.
 > real infrastructure actually costs. The most useful thing it produced is the
 > list of things that broke.
 >
-> Unmaintained, unaudited, testnet only. Do not run it in production. No support,
-> no roadmap. It is public so the findings and the code can be read together.
+> Unmaintained, unaudited, and **only ever tested on testnet** — nothing in the
+> code restricts it to one, so pointing it at mainnet is a configuration away
+> and entirely untried. No support, no roadmap. It is public so the findings and
+> the code can be read together.
 
 An [x402](https://github.com/x402-foundation/x402) payment gate written in Rust. It sits
 beside an Envoy proxy and decides, per request, whether the caller is on the free

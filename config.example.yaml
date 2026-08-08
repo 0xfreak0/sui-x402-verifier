@@ -24,6 +24,13 @@ listen_addr: "127.0.0.1:50051"
 # NOTE: Sui has deprecated JSON-RPC in favour of gRPC (sui.rpc.v2.*), which is
 # why this is a gRPC URL.
 sui_grpc_url: "https://fullnode.testnet.sui.io:443"
+
+# Chain the node above is expected to be serving. Checked against the node's own
+# GetServiceInfo at startup, and a mismatch REFUSES TO START — pointing mainnet
+# terms at a testnet node would sell real access for worthless funds, and every
+# payment would verify and settle successfully while it happened.
+#
+# A bare chain name, not the CAIP-2 form. `payment.network` below carries that.
 sui_chain: "testnet"
 
 # How payments are checked. Two values:
