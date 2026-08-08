@@ -6,7 +6,7 @@ Sell API access for stablecoin, at the gateway, without accounts or API keys.
 > real infrastructure actually costs. The most useful thing it produced is the
 > list of things that broke.
 >
-> Unmaintained, unaudited, and **only ever tested on testnet** — nothing in the
+> Unmaintained, unaudited, and **only ever tested on testnet**. Nothing in the
 > code restricts it to one, so pointing it at mainnet is a configuration away
 > and entirely untried. No support, no roadmap. It is public so the findings and
 > the code can be read together.
@@ -68,7 +68,7 @@ confusion:
    exchange. The §7 HTTP API is a separate entrance, for *other people's*
    resource servers.
 2. **Settlement happens on the response**, after the upstream has succeeded
-   (step 8). That is the entire reason `ext_proc` is preferred over `ext_authz`.
+   (step 8), which is the whole reason `ext_proc` is preferred over `ext_authz`.
 
 A Graphviz version, including the `ext_authz` fallback path, is in
 `docs/architecture.dot`.
@@ -79,7 +79,7 @@ Sui-specific.
 
 ## What this found
 
-The code is a prototype. These are the parts worth taking somewhere else.
+The code is a prototype. The findings below apply outside it.
 
 ### Simulating a payment does not prove it can still execute
 
@@ -96,40 +96,40 @@ on testnet before the fix:
 
 No race required. Spend the coin first, present the dead authorization, get
 verified, get served, watch settlement fail. **Any facilitator that verifies by
-simulating alone has this.** The fix reads every pinned input — owned and
-receiving inputs plus gas objects — and confirms each still exists at its pinned
-version, treating `NotFound` as spent rather than as an RPC error. Shared inputs
+simulating alone has this.** The fix reads every pinned input (owned and
+receiving inputs, plus gas objects) and confirms each still exists at its pinned
+version, treating `NotFound` as spent instead of as an RPC error. Shared inputs
 are skipped, since consensus versions those at execution.
 
-Honest limit: a gasless payment pins nothing, so the check is a no-op on the
-path this gateway is normally paid through. The finding is true of the scheme as
-written. [`sui-scheme-conformance.md`](docs/sui-scheme-conformance.md)
+One limit worth stating: a gasless payment pins nothing, so the check does
+nothing on the path this gateway is normally paid through. The finding still
+holds against the scheme as written.
+[`sui-scheme-conformance.md`](docs/sui-scheme-conformance.md)
 
-### "Gasless" has a cold start that the word hides
+### Gasless payments have a cold start
 
-Sui's address balances make a payment cost zero gas — but only once funds are
-*in* the address balance, and USDC from a faucet, an exchange or an ordinary
-transfer arrives as coin objects. Moving it across costs gas. So a payer holding
-only stablecoins cannot make their first gasless payment, which is precisely the
-agent case the whole approach is aimed at.
+Sui's address balances make a payment cost zero gas, but only once funds are
+already *in* the address balance. USDC from a faucet, an exchange or an ordinary
+transfer arrives as coin objects, and moving it across costs gas. So a payer
+holding only stablecoins cannot make their first gasless payment, which is the
+agent case this whole approach is aimed at.
 
-Selecting the gasless path on price alone therefore builds a transaction that
-cannot execute. The client now probes the address balance and falls through to
-coin objects, and reports what every path needed when none work.
+Choosing the gasless path on price alone therefore builds a transaction that
+cannot execute. The client now probes the address balance, falls through to coin
+objects, and reports what each path needed when none of them work.
 [`deployment-architecture.md`](docs/deployment-architecture.md)
 
 ### The spec's ordering rules out a whole class of gateway
 
 x402 sequences payment as verify → do the work → settle, so a client is only
 charged once the resource exists. That silently excludes every pre-upstream
-authorization filter — Envoy's `ext_authz`, NGINX `auth_request`, most gateway
-plugin models — because none of them can observe the response.
+authorization filter (Envoy's `ext_authz`, NGINX `auth_request`, most gatewayplugin models) because none of them can observe the response.
 
 An implementer reaching for one produces a conformant-*looking* service with the
 payment ordering inverted and no indication anything is wrong. `ext_proc` is the
 way out: one bidirectional stream per request, so a verified payment is held as
 stream-local state and settled on the way out. Proved by a route that always
-returns 503 — payment verified, nothing charged.
+returns 503: payment verified, nothing charged.
 [`spec-gaps.md`](docs/spec-gaps.md)
 
 ### The spec is chain-agnostic in shape and EVM-shaped in content
@@ -137,7 +137,7 @@ returns 503 — payment verified, nothing charged.
 Six of the fifteen standard error codes are named
 `invalid_exact_evm_payload_*`. There is no non-EVM equivalent for any of them,
 so a Sui or Solana facilitator rejecting a bad signature has no standard code
-for it — everything collapses into `invalid_payload`. §10's replay protection
+for it, so everything collapses into `invalid_payload`. §10's replay protection
 leans on EIP-3009 contracts enforcing nonce non-reuse on chain, which does not
 generalise either. And `maxTimeoutSeconds` has no on-chain expression on Sui,
 whose finest expiry is one epoch (~24h).
@@ -148,18 +148,19 @@ whose finest expiry is one epoch (~24h).
 The spec defines HTTP, MCP and A2A transports and says nothing about gRPC, where
 a non-200 status collapses into an opaque transport error. Denials here are
 trailers-only responses carrying `grpc-status: 8`, with `grpc-timeout` injected
-so a paid stream cannot outlive its session. Chosen rather than followed.
+so a paid stream cannot outlive its session. Every part of that framing was a
+choice, since the spec offered none to follow.
 
-### Measured, not estimated
+### The measurements, and their limits
 
 Settlement lands on the response path: three payments verified against a 503
 upstream left the payee balance unchanged. Live traffic shows verification at
-~22ms mean and settlement at ~439ms — which is why one payment buys a session
-rather than a request.
+~22ms mean and settlement at ~439ms, which is why one payment buys a session
+instead of a single request.
 
-The gate's own decision measures 0.3–0.5ms, but **that is a single-host figure**:
+The gate's own decision measures 0.3–0.5ms, but **that is a single-host figure**.
 Envoy, the verifier and Redis share a network namespace on the demo box, so
-every internal hop is loopback and the Envoy↔verifier transit is not in the
+every internal hop is loopback and the Envoy-to-verifier transit is not in the
 number at all. Isolating true gate cost needs a bypass route under identical
 load, which has not been done.
 [`deployment-architecture.md`](docs/deployment-architecture.md)
@@ -167,29 +168,29 @@ load, which has not been done.
 ## Why a gateway
 
 Most x402 implementations are **middleware you import into an app you control**
-— Express, Hono, Next.js, FastAPI, Axum. That only monetizes code you can modify
+like Express, Hono, Next.js, FastAPI or Axum. That only monetizes code you can modify
 and redeploy.
 
 Standalone x402 gateways and reverse proxies do exist, and several are further
 along than this one on features like dashboards and provider catalogues. What is
-different here is narrower, and worth stating precisely rather than claiming a
+different here is narrower, and worth stating precisely instead of claiming a
 category:
 
 - **It plugs into a proxy you already run.** `ext_authz`
   and `ext_proc` are standard interfaces, so the same implementation works under
-  Envoy and anything whose data plane *is* Envoy — Istio, Gloo, Consul, Envoy
+  Envoy and anything whose data plane *is* Envoy: Istio, Gloo, Consul, Envoy
   Gateway, Emissary. Not Kong or APISIX; those are OpenResty-based and have
-  their own plugin models rather than these protocols. For anyone running the
+  their own plugin models and support neither protocol. For anyone running the
   former, the
-  difference is adding a filter config rather than adopting another hop.
+  difference is adding a filter config instead of another hop.
 - **Settlement happens on the response path.** `ext_proc` gives a bidirectional
   stream per request, so the payment is verified on the way in and broadcast
-  only after the upstream returns 2xx — the ordering the spec asks for. A
+  only after the upstream returns 2xx, which is the ordering the spec asks for. A
   reverse proxy could buffer to achieve the same thing; as of August 2026 none
   that I could find does.
 - **gRPC and grpc-web are gated too.** The spec defines HTTP, MCP and A2A
-  transports and nothing for gRPC, so the framing here — trailers-only denials
-  carrying `grpc-status: 8` — had to be chosen rather than followed. As of
+  transports and nothing for gRPC, so the framing here, trailers-only denials
+  carrying `grpc-status: 8`, had to be invented. As of
   August 2026 a public search turned up no other x402 implementation handling
   gRPC; that is a point-in-time observation and the sort of claim that expires.
 - **Sui.** Upstream has a Sui *scheme document* and no Sui implementation. This
@@ -224,7 +225,7 @@ scripts/e2e-test.sh --real                   # 14 checks, real on-chain payment
 ```
 
 `--real` builds and signs a transaction with your local `sui` CLI wallet, which
-is what `verification_mode: sui-grpc` requires, and **it settles** — real testnet
+is what `verification_mode: sui-grpc` requires, and **it settles**: real testnet
 USDC moves. Without the flag the script sends placeholder bytes, which only a
 verifier running `stub-accept-all` will accept; against a `sui-grpc` verifier
 the payment steps will fail, correctly.
@@ -239,7 +240,7 @@ scripts/run-local.sh            # builds, starts the verifier + Envoy
 scripts/e2e-test.sh             # in another shell
 ```
 
-By hand — the first five succeed, the sixth is challenged:
+By hand, the first five succeed, the sixth is challenged:
 
 ```bash
 curl -i -X POST localhost:10000/graphql \
@@ -260,7 +261,7 @@ Base64-decode that header for the terms: `payTo`, `amount`, `asset`, `network`,
 When this was written there was no Sui x402 client: the official SDK ships
 mechanisms for aptos, avm, evm, stellar and svm, and a GitHub search for x402 +
 sui turned up nothing, so a conformant Sui *server* had nothing that could pay
-it. That was a point-in-time observation and it has since expired — see the live
+it. That was a point-in-time observation and it has since expired; see the live
 Sui facilitator linked above.
 
 ```bash
@@ -284,8 +285,8 @@ retrying with payment…
 {"data":{"chainIdentifier":"69WiPg3DAQiwdxfncX6wYQ2siKwAe6L9BZthQea3JNMD"}}
 ```
 
-It does the whole protocol — request, decode the challenge, build a PTB paying
-exactly the advertised amount, sign locally, resend — with no `sui` CLI
+It does the whole protocol: request, decode the challenge, build a PTB paying
+exactly the advertised amount, sign locally, resend, with no `sui` CLI
 involved. Keys come from `X402_SUI_PRIVATE_KEY` (a `suiprivkey1…` string) or the
 standard CLI keystore, and never leave the machine; only the signature is sent.
 `--dry-run` builds and signs without sending.
@@ -314,15 +315,15 @@ everything is derived at runtime.
 | Your address | `sui client active-address` |
 
 **You need a little SUI once, then never again.** Payments at or above 0.01 USDC
-take the gasless path and cost no SUI — but gasless spends from your *address
+take the gasless path and cost no SUI, but gasless spends from your *address
 balance*, and faucet USDC arrives as coin objects. Moving it across is the
 one-off below, and it costs gas.
 
 `x402-pay` handles the case where you have not done that yet: it probes the
-address balance and falls back to coin objects rather than building a
+address balance and falls back to coin objects instead of building a
 transaction that cannot execute. That fallback needs SUI for gas, so doing the
 one-off is still the better setup. `--payment-paths` pins a single path if you
-want to see one fail rather than fall through.
+want to see one fail instead of falling through.
 
 ```bash
 # Gasless payments spend from the address balance, not from coin objects.
@@ -337,7 +338,7 @@ sui client ptb \
 sui client balance    # `balance` is the total; `coinBalance` is only the coin objects
 ```
 
-Verified end to end on testnet — a 0.00001 USDC payment through Envoy, settled
+Verified end to end on testnet with a 0.00001 USDC payment through Envoy, settled
 only after the upstream succeeded:
 
 ```
@@ -353,7 +354,7 @@ cargo run --bin x402-demo               # then open localhost:8402
 ```
 
 The page calls `/targets`, `/send`, `/balances` and `/policies` on its own
-origin, so it has to be served by `x402-demo` rather than by a static file
+origin, so it has to be served by `x402-demo`; a static file
 server — and `x402-demo` is what holds the hot testnet wallet that pays on a
 visitor's behalf. It needs Envoy and the verifier already running; see
 `scripts/run-local.sh`.
@@ -405,8 +406,8 @@ export X402_PAY_TO=0x<your 64-hex-char Sui address>
 ```
 
 The example config ships the **zero address**, and the service **refuses to
-start** with it — settling there would burn funds, so an unconfigured deployment
-fails loudly rather than paying into a hole.
+start** with it, since settling there would burn funds. An unconfigured deployment
+fails loudly at boot.
 
 > Full setup reference, including the settings where a plausible mistake gives
 > away the paid tier and how to check each one: **[docs/configuring.md](docs/configuring.md)**.
@@ -443,7 +444,7 @@ store:
   # redis_url: "redis://127.0.0.1:6379"
 ```
 
-`memory` is per-process — **run exactly one replica**, or the effective rate
+`memory` is per-process, so **run exactly one replica**, or the effective rate
 limit becomes N× the configured value and sessions become replica-affine.
 `redis` shares state properly; quota spend, replay claims and rate-limit windows
 are all Lua scripts, so they stay atomic across replicas. Both fail **closed**.
@@ -510,7 +511,7 @@ upstream did not succeed; discarding the verified payment unsettled  status=404
 ```
 
 An unsettled payment also has its replay claim **released**, so the client can
-retry with the same signed transaction rather than being made to sign a new one
+retry with the same signed transaction instead of having to sign a new one
 for a failure that was not theirs.
 
 ### What this costs you
@@ -521,7 +522,7 @@ could spend those coins during the window and leave you having served the
 resource for nothing.
 
 That window is small, and it is only small because verification rejects
-already-dead authorizations — simulation alone does **not** catch spent inputs,
+already-dead authorizations. Simulation alone does **not** catch spent inputs,
 so verification separately checks that every pinned input still exists at its
 pinned version. Without that check there was no race at all: spend the coin
 first, present the dead payment, get served for free. With it, invalidating a
@@ -532,10 +533,10 @@ chain finality.
 `x402_settlement_after_serve_failures_total` counts this if it ever happens.
 
 **If you would rather not carry that risk at all**, switch to `ext_authz`, which
-settles before the upstream runs. There is then no window — the client instead
+settles before the upstream runs. There is then no window; the client instead
 bears the risk of being charged for a request that later errors, which is how
 most paid APIs already behave. Both modes are implemented; `envoy.yaml` selects
-between them. That is deliberate.
+between them, and keeping both is deliberate.
 
 Note that the exposure is a property of the **spec's ordering**, not of running
 at a gateway: in-app middleware doing verify → work → settle has exactly the same
@@ -544,17 +545,17 @@ window.
 ## The facilitator API
 
 `POST /verify`, `POST /settle`, `GET /supported` (spec §7), plus a non-spec
-`GET /policies` that reports what each route costs — **disabled unless
+`GET /policies` that reports what each route costs. **Disabled unless
 `facilitator_api_listen_addr` is set**.
 
 Envoy never calls these. It uses the gateway path above, where verification and
 settlement happen as in-process calls. §7 exists so *other people's* resource
-servers can delegate Sui work to this service — which is exactly why a facilitator
+servers can delegate Sui work to this service, which is exactly why a facilitator
 must never sit in their data path.
 
 Running both roles in one process makes this **self-facilitating**: legitimate,
 but there is no trust boundary between the halves. The endpoints are
-unauthenticated — bind them to loopback or a private interface. `/settle` is the
+unauthenticated, so bind them to loopback or a private interface. `/settle` is the
 one that moves money.
 
 ## Observability
@@ -585,10 +586,10 @@ The last two are the ones worth alerting on. Everything else is throughput.
   the client already signed. `/supported` reports an empty `signers` map, which is
   how you can verify that claim.
 - **The payer is recovered from the signature**, never taken from a client-supplied
-  field — which is why the wire type has no `payer`.
+  field, which is why the wire type has no `payer`.
 - **`use_remote_address: true` is load-bearing.** With Envoy's default the
   downstream address is derived from `x-forwarded-for`, which is the address the
-  free tier meters on — any client could rotate the header for an unlimited free
+  free tier meters on, so any client could rotate the header for an unlimited free
   tier.
 - **Identity headers overwrite, never append.** Otherwise a client sends
   `x-x402-tier: paid` and self-promotes.
@@ -598,7 +599,7 @@ The last two are the ones worth alerting on. Everything else is throughput.
   mint fresh keys.
 - **Session tokens are `payer:expires:session_id:hmac`**, verified in constant
   time before any field is trusted.
-- **Requests with no resolvable source address are denied** — an unmeterable free
+- **Requests with no resolvable source address are denied**, since an unmeterable free
   tier is an unmetered one.
 - **IPv6 is metered per /64**, since a host delegated a /64 can otherwise iterate
   addresses for an unlimited free tier.
@@ -608,7 +609,7 @@ The last two are the ones worth alerting on. Everything else is throughput.
 - **Streaming RPCs are effectively unmetered.** A filter fires once per *stream*,
   at headers time. A 20-second `SubscribeCheckpoints` delivering 53 messages cost
   2 authorization checks; a stream held open for hours costs one. The intended fix
-  is to price streams by time period rather than per message — per-message
+  is to price streams by time period instead of per message; per-message
   metering would put the verifier in the data path of every chunk.
 - **gRPC reflection and health are not gated.** Clients attach headers to their
   reflection call, so gating it meant the reflection request consumed the payment
@@ -636,17 +637,17 @@ The last two are the ones worth alerting on. Everything else is throughput.
 Wire format follows x402 **v2**, vendored at `docs/spec/upstream/`
 (`x402-foundation/x402`). The spec's own JSON examples are extracted into
 `tests/fixtures/` and round-tripped through the types, so a shape that drifts
-fails CI rather than failing silently against a real client.
+fails CI before it can fail against a real client.
 
 Sessions are exposed as a declared extension (§5.1.2) with an `info` and a JSON
-`schema`, rather than as an undocumented header. The raw `x-payment-session`
+`schema` instead of an undocumented header. The raw `x-payment-session`
 header still works as a deprecated alias.
 
 Conformance against the Sui scheme specifically: `docs/sui-scheme-conformance.md`.
 Gaps found in the spec while implementing: `docs/spec-gaps.md` and
 `docs/upstream-issues/`. Those are written up in issue form because that was the
 clearest way to state them, but nothing there has been or will be filed against
-`x402-foundation/x402` — this is a prototype, and each note says so at the top.
+`x402-foundation/x402`. This is a prototype, and each note says so at the top.
 
 ## Testing
 
